@@ -1356,6 +1356,9 @@ class RegisterEngine:
         self._ss_idx_lock = threading.Lock()
         # 足够覆盖大批量注册；过小会导致「成功 100、可导入只剩 50」
         self.recent_success: deque = deque(maxlen=5000)
+        # Web runtime may inject a non-blocking multi-target auto-import queue.
+        # CLI/standalone modes leave it unset and keep their existing behavior.
+        self.auto_import_callback = None
         self._log_fn = log_fn or (lambda msg, level="info": print(msg))
         # Action ID 缓存：内存 + 磁盘，避免每次/重启都扫 JS（通常 5~20 秒）
         self._action_cache: dict = {
@@ -1439,6 +1442,8 @@ class RegisterEngine:
                     "clean": it.get("clean"),
                     "time": it.get("time"),
                     "imported": bool(it.get("imported")),
+                    "email_provider": it.get("email_provider") or "",
+                    "email_domain": it.get("email_domain") or "",
                 }
                 for it in self.recent_success
             ],
@@ -1727,6 +1732,11 @@ class RegisterEngine:
         auth_token：注册时 device flow 换到的 token，导入上游可直写，免二次换票。
         """
         with self.file_lock:
+            email_meta = (
+                email_service.get_email_metadata(email)
+                if email_service is not None and hasattr(email_service, "get_email_metadata")
+                else {}
+            )
             mode_now = resolve_register_mode(getattr(self, "register_mode", None))
             # same_session 以创邮次数停批；在飞号拿到 CLEAN 仍应进成功列表
             # protocol 旧路径才用 success_count 顶 target
@@ -1742,7 +1752,7 @@ class RegisterEngine:
                         emergency = _BASE_DIR / "keys" / "emergency_sso.txt"
                         with open(emergency, "a", encoding="utf-8") as f:
                             f.write(f"{email}----{sso}\n")
-                        self._write_account_json_unlocked(email=email, sso=sso)
+                        self._write_account_json_unlocked(email=email, sso=sso, **email_meta)
                         self.log(f"{email} 已达目标，SSO 写入 emergency_sso.txt", "warn")
                     except Exception:
                         pass
@@ -1769,7 +1779,7 @@ class RegisterEngine:
 
             # already_written 只表示 TXT 已由紧急落盘写过；JSON 使用 upsert，
             # 因此这里始终再保证一次，避免任一旧调用路径漏掉结构化输出。
-            self._write_account_json_unlocked(email=email, sso=sso)
+            self._write_account_json_unlocked(email=email, sso=sso, **email_meta)
 
             self.success_count += 1
             avg = (time.time() - self.start_time) / max(1, self.success_count)
@@ -1790,6 +1800,8 @@ class RegisterEngine:
                     "clean": None,
                     "time": datetime.now().strftime("%H:%M:%S"),
                     "imported": False,
+                    "email_provider": email_meta.get("email_provider") or "",
+                    "email_domain": email_meta.get("email_domain") or "",
                 }
             )
             extra = f" | {note}" if note else ""
@@ -1908,12 +1920,16 @@ class RegisterEngine:
         email: str,
         sso: str,
         user_id: str = "",
+        email_provider: str = "",
+        email_domain: str = "",
     ) -> bool:
         """调用方持有 file_lock 时，按邮箱/SSO upsert 一条账号记录。"""
         path = self._accounts_json_path()
         email = (email or "").strip()
         sso = (sso or "").strip()
         user_id = (user_id or "").strip()
+        email_provider = (email_provider or "").strip()
+        email_domain = (email_domain or "").strip()
         if path is None or not sso:
             return False
 
@@ -1936,6 +1952,8 @@ class RegisterEngine:
                 break
 
         old_user_id = str((found or {}).get("user_id") or "")
+        old_email_provider = str((found or {}).get("email_provider") or "")
+        old_email_domain = str((found or {}).get("email_domain") or "")
         record = {
             "name": email,
             "email": email,
@@ -1945,6 +1963,12 @@ class RegisterEngine:
             "tier": "basic",
             "cloudflare_cookies": "",
         }
+        resolved_provider = email_provider or old_email_provider
+        resolved_domain = email_domain or old_email_domain
+        if resolved_provider:
+            record["email_provider"] = resolved_provider
+        if resolved_domain:
+            record["email_domain"] = resolved_domain
         if found is None:
             accounts.append(record)
         else:
@@ -1974,12 +1998,16 @@ class RegisterEngine:
         email: str,
         sso: str,
         user_id: str = "",
+        email_provider: str = "",
+        email_domain: str = "",
     ) -> bool:
         with self.file_lock:
             return self._write_account_json_unlocked(
                 email=email,
                 sso=sso,
                 user_id=user_id,
+                email_provider=email_provider,
+                email_domain=email_domain,
             )
 
     def _probe_and_mark_clean(
@@ -2402,7 +2430,7 @@ class RegisterEngine:
                 return
 
         try:
-            email_service = EmailService()
+            email_service = EmailService(log_fn=self.log)
             turnstile_service = TurnstileService()
         except Exception as e:
             self.log(f"服务初始化失败: {e}", "error")
@@ -2564,6 +2592,7 @@ class RegisterEngine:
                 with self._ss_attempt_lock:
                     self.attempt_count = int(self.attempt_count or 0) + 1
                     attempt_i = self.attempt_count
+                email_meta = email_service.get_email_metadata(email)
                 # 注意：额度已占就绝不能因 stop_event 直接删邮 return。
                 # 其它线程「创邮达量」停批时，本号必须继续跑完 risk/落盘。
 
@@ -2584,6 +2613,7 @@ class RegisterEngine:
                     fp.setdefault("accept_language", "")
                 self.log(
                     f"开始注册[same_session]: {email} · "
+                    f"{email_meta.get('email_provider') or '?'} / {email_meta.get('email_domain') or '?'} · "
                     f"[{attempt_i}/{max_attempts}] · "
                     f"{fp['tag']}/{fp['fp_os']}/{fp['timing']} · "
                     f"{fp.get('locale')}/{fp.get('timezone')} · "
@@ -2738,6 +2768,18 @@ class RegisterEngine:
                     # MARKED / 探测失败：已写 _marked，不进成功列表、不换票、不入库
                     # MARKED 只记 marked_count，不再叠 fail_count（避免「目标5却失败7」误解）
                     if clean is False:
+                        callback = getattr(self, "auto_import_callback", None)
+                        if callable(callback):
+                            try:
+                                callback([{
+                                    "id": f"marked_{int(time.time() * 1000)}",
+                                    "email": email,
+                                    "sso": sso,
+                                    "auth_token": None,
+                                    "clean": False,
+                                }])
+                            except Exception as auto_exc:
+                                self.log(f"{email} MARKED 自动导入排队失败: {auto_exc}", "warn")
                         with self._ss_deny_lock:
                             self._ss_consecutive_deny = (
                                 int(self._ss_consecutive_deny or 0) + 1
@@ -2851,7 +2893,7 @@ class RegisterEngine:
                 return
 
         try:
-            email_service = EmailService()
+            email_service = EmailService(log_fn=self.log)
             turnstile_service = TurnstileService()
             castle_service = CastleService()
             # 协议/NSFW 已挪到后台 enrich 池，主线程不再初始化
@@ -2930,7 +2972,12 @@ class RegisterEngine:
                         current_email = None
                         return
 
-                    self.log(f"开始注册: {email}", "info")
+                    email_meta = email_service.get_email_metadata(email)
+                    self.log(
+                        f"开始注册: {email} · {email_meta.get('email_provider') or '?'} / "
+                        f"{email_meta.get('email_domain') or '?'}",
+                        "info",
+                    )
 
                     # 架构：发码/验码/注册 = 纯协议；Turnstile = Camoufox 无头 Solver
                     # Castle 产线 G6 尚未纯协议还原，默认 Camoufox 无头 mint（CASTLE_MODE=skip 可关）
@@ -3349,7 +3396,23 @@ class RegisterEngine:
             except Exception:
                 pass
             # 主流程不自动入库：CLEAN/token 只落盘 + recent_success，
-            # 入库改由页面「导入」手动点（避免跑完就直写 sub2api）
+            # 若 Web 运行时启用了目标，则只排队，不阻塞注册线程。
+            callback = getattr(self, "auto_import_callback", None)
+            if callable(callback):
+                try:
+                    callback([
+                        {
+                            "id": it.get("id"),
+                            "email": it.get("email"),
+                            "sso": it.get("sso"),
+                            "auth_token": it.get("auth_token"),
+                            "clean": it.get("clean"),
+                        }
+                        for it in list(self.recent_success)
+                        if it.get("sso") and it.get("clean") is True
+                    ])
+                except Exception as auto_exc:
+                    self.log(f"自动导入排队失败: {auto_exc}", "warn")
             # same_session 浏览器池收尾
             if resolve_register_mode(getattr(self, "register_mode", None)) == "same_session":
                 try:

@@ -1,4 +1,4 @@
-"""邮箱服务类 - 适配 cloudflare_temp_email / freemail API"""
+"""Unified email provider facade for Outlook, Freemail, YYDS and CF Temp."""
 from __future__ import annotations
 
 import os
@@ -15,6 +15,8 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from .email_config import resolved_email_config
+
 # workers.dev 部分部署证书与主机名不完全匹配时放行
 try:
     import urllib3
@@ -24,25 +26,107 @@ except Exception:
     pass
 
 
+class _ProviderAdapter:
+    name = "base"
+
+    def __init__(self, service):
+        self.service = service
+
+    def create_email(self):
+        raise NotImplementedError
+
+    def fetch_verification_code(self, email, max_attempts=50, stop_event=None):
+        raise NotImplementedError
+
+    def delete_email(self, address):
+        raise NotImplementedError
+
+
+class _OutlookProvider(_ProviderAdapter):
+    name = "outlook"
+
+    def create_email(self):
+        return self.service._create_outlook_alias()
+
+    def fetch_verification_code(self, email, max_attempts=50, stop_event=None):
+        return self.service._fetch_outlook_verification_code(email, max_attempts, stop_event)
+
+    def delete_email(self, address):
+        return self.service._delete_outlook_alias(address)
+
+
+class _FreemailProvider(_ProviderAdapter):
+    name = "freemail"
+
+    def create_email(self):
+        return self.service._create_freemail_legacy()
+
+    def fetch_verification_code(self, email, max_attempts=50, stop_event=None):
+        return self.service._fetch_http_verification_code(email, max_attempts, stop_event)
+
+    def delete_email(self, address):
+        return self.service._delete_freemail(address)
+
+
+class _CloudflareTempProvider(_ProviderAdapter):
+    name = "cloudflare_temp"
+
+    def create_email(self):
+        return self.service._create_cf_temp()
+
+    def fetch_verification_code(self, email, max_attempts=50, stop_event=None):
+        return self.service._fetch_http_verification_code(email, max_attempts, stop_event)
+
+    def delete_email(self, address):
+        return self.service._delete_cf_temp(address)
+
+
+class _YydsProvider(_ProviderAdapter):
+    name = "yyds"
+
+    def create_email(self):
+        return self.service._create_yyds()
+
+    def fetch_verification_code(self, email, max_attempts=50, stop_event=None):
+        return self.service._fetch_yyds_verification_code(email, max_attempts, stop_event)
+
+    def delete_email(self, address):
+        return self.service._delete_yyds(address)
+
+
+PROVIDER_REGISTRY = {
+    cls.name: cls
+    for cls in (_OutlookProvider, _FreemailProvider, _YydsProvider, _CloudflareTempProvider)
+}
+
+
 class EmailService:
-    """
-    优先适配 dreamhunter2333/cloudflare_temp_email：
-      POST /api/new_address
-      POST /admin/new_address（配置 FREEMAIL_ADMIN_KEY 时）
-      GET  /api/mails?limit=&offset=
-      DELETE /api/delete_address
-    FREEMAIL_TOKEN 作为 x-custom-auth（站点密码），不是 JWT。
-    FREEMAIL_ADMIN_KEY 作为 x-admin-auth（管理员密码）。
-    每个邮箱会拿到独立 jwt，内部维护。
-    """
+    """Backward-compatible facade delegating to a registered provider adapter."""
 
     _shared_outlook_usage: dict[str, int] = {}
     _shared_outlook_map: dict[str, dict[str, str]] = {}
+    _outlook_health: dict[str, dict[str, float]] = {}
     _outlook_lock = threading.RLock()
+    _provider_semaphores: dict[str, threading.BoundedSemaphore] = {}
+    _provider_semaphore_sizes: dict[str, int] = {}
+    _provider_semaphore_lock = threading.Lock()
+    _cf_domain_lock = threading.RLock()
+    _cf_domain_cursor = 0
+    _cf_domain_health: dict[str, dict[str, float]] = {}
 
-    def __init__(self):
+    def __init__(self, provider_override: Optional[str] = None, log_fn=None):
         load_dotenv(override=False)
-        self.email_type = (os.getenv("EMAIL_TYPE") or "freemail").strip().lower()
+        self._log_fn = log_fn
+        self.structured_config = resolved_email_config(dict(os.environ))
+        self.provider_name = (provider_override or self.structured_config["provider"]).strip().lower()
+        if self.provider_name not in PROVIDER_REGISTRY:
+            raise ValueError(f"Unsupported email provider: {self.provider_name}")
+        self.email_type = self.provider_name
+        common = self.structured_config["common"]
+        provider_cfg = self.structured_config["providers"][self.provider_name]
+        self.timeout_seconds = int(common["timeout_seconds"])
+        self.tls_verify = bool(common["tls_verify"])
+        self.provider_concurrency = int(provider_cfg.get("concurrency") or 5)
         self.outlook_accounts_raw = (os.getenv("OUTLOOK_ACCOUNTS") or "").strip()
         try:
             self.outlook_alias_limit = max(
@@ -52,26 +136,57 @@ class EmailService:
             self.outlook_alias_limit = 5
 
         self._outlook_accounts = self._parse_outlook_accounts()
+        if self.structured_config["providers"]["outlook"].get("accounts"):
+            self._outlook_accounts = [dict(row) for row in self.structured_config["providers"]["outlook"]["accounts"]]
+        self.outlook_alias_limit = int(
+            self.structured_config["providers"]["outlook"].get("default_alias_limit")
+            or self.outlook_alias_limit
+        )
         self._outlook_token_cache: dict[str, tuple[str, float]] = {}
         self._outlook_token_lock = threading.Lock()
 
-        self.worker_domain = self.normalize_domain(os.getenv("WORKER_DOMAIN") or "")
-        self.freemail_token = (os.getenv("FREEMAIL_TOKEN") or "").strip()
-        self.admin_key = (os.getenv("FREEMAIL_ADMIN_KEY") or "").strip()
-        self.mail_domain = (os.getenv("FREEMAIL_DOMAIN") or "").strip()  # 邮箱后缀，如 kikru.xyz
-        self.random_subdomain = (
-            os.getenv("FREEMAIL_RANDOM_SUBDOMAIN") or ""
-        ).strip().lower() in ("1", "true", "yes", "on")
+        if self.provider_name == "freemail":
+            selected = self.structured_config["providers"]["freemail"]
+            self.freemail_token = str(selected.get("token") or "")
+            self.admin_key = ""
+            self.mail_domain = str(selected.get("domain") or "auto")
+            self.random_subdomain = False
+        elif self.provider_name == "cloudflare_temp":
+            selected = self.structured_config["providers"]["cloudflare_temp"]
+            self.freemail_token = str(selected.get("site_token") or "")
+            self.admin_key = str(selected.get("admin_key") or "")
+            self.mail_domain = "auto"
+            self.random_subdomain = bool(selected.get("random_subdomain"))
+        else:
+            selected = self.structured_config["providers"].get(self.provider_name, {})
+            self.freemail_token = ""
+            self.admin_key = ""
+            self.mail_domain = str(selected.get("domain") or "auto")
+            self.random_subdomain = False
 
-        if self.email_type not in ("outlook", "outlook-hotmail") and not self.worker_domain:
-            raise ValueError("Missing: WORKER_DOMAIN")
-
-        self.base_url = f"https://{self.worker_domain}" if self.worker_domain else ""
+        self.base_url = str(selected.get("base_url") or "").rstrip("/")
+        self.worker_domain = self.normalize_domain(self.base_url)
         self._jwt_by_email: dict[str, str] = {}
+        self._metadata_by_email: dict[str, dict[str, str]] = {}
+        self._yyds_accounts: dict[str, dict[str, str]] = {}
         self._session = self._build_session()
-        # 探测 API 风格：cf_temp | freemail
-        self._api_style = (os.getenv("FREEMAIL_API_STYLE") or "auto").strip().lower()
+        self._api_style = "freemail" if self.provider_name == "freemail" else "cf_temp"
         self._settings_cache: Optional[dict] = None
+        self._provider = PROVIDER_REGISTRY[self.provider_name](self)
+        with EmailService._provider_semaphore_lock:
+            if EmailService._provider_semaphore_sizes.get(self.provider_name) != self.provider_concurrency:
+                EmailService._provider_semaphores[self.provider_name] = threading.BoundedSemaphore(self.provider_concurrency)
+                EmailService._provider_semaphore_sizes[self.provider_name] = self.provider_concurrency
+        self._semaphore = EmailService._provider_semaphores[self.provider_name]
+
+    def _emit(self, message: str, level: str = "info") -> None:
+        if self._log_fn is not None:
+            try:
+                self._log_fn(message, level)
+                return
+            except Exception:
+                pass
+        print(message)
 
     def _parse_outlook_accounts(self) -> list[dict[str, str]]:
         accounts = []
@@ -116,20 +231,29 @@ class EmailService:
             .rstrip("/")
         )
 
-    @staticmethod
-    def _build_session() -> requests.Session:
+    def _build_session(self=None) -> requests.Session:
         s = requests.Session()
-        s.verify = False
-        # 系统代理 7897 常挂起导致超时：默认不信任环境代理；
-        # 需要代理时设 FREEMAIL_USE_SYSTEM_PROXY=1
-        use_proxy = (os.getenv("FREEMAIL_USE_SYSTEM_PROXY") or "").strip() in (
-            "1",
-            "true",
-            "True",
-            "yes",
+        structured = getattr(self, "structured_config", None) or resolved_email_config(dict(os.environ))
+        common = structured["common"]
+        s.verify = bool(common.get("tls_verify", True))
+        proxy_mode = str(common.get("proxy_mode") or "direct")
+        s.trust_env = proxy_mode == "system"
+        proxy_url = str(common.get("proxy_url") or "").strip()
+        if proxy_mode == "custom" and proxy_url:
+            s.proxies.update({"http": proxy_url, "https": proxy_url})
+        elif proxy_mode == "register":
+            register_proxy = str(os.getenv("GROK_PROXY") or "").strip()
+            if register_proxy:
+                if not register_proxy.startswith(("http://", "https://", "socks5://")):
+                    register_proxy = "http://" + register_proxy
+                s.proxies.update({"http": register_proxy, "https": register_proxy})
+        retries = Retry(
+            total=3,
+            backoff_factor=0.5,
+            status_forcelist=(429, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "HEAD", "OPTIONS", "DELETE"}),
+            respect_retry_after_header=True,
         )
-        s.trust_env = use_proxy
-        retries = Retry(total=2, backoff_factor=0.4, status_forcelist=(502, 503, 504))
         adapter = HTTPAdapter(max_retries=retries)
         s.mount("https://", adapter)
         s.mount("http://", adapter)
@@ -146,7 +270,8 @@ class EmailService:
         返回 {ok, domains, default_domains, selected, message, settings}
         """
         load_dotenv(override=True)
-        domain = cls.normalize_domain(worker_domain or os.getenv("WORKER_DOMAIN") or "")
+        raw_worker = str(worker_domain or os.getenv("WORKER_DOMAIN") or "").strip().rstrip("/")
+        domain = cls.normalize_domain(raw_worker)
         auth = (token if token is not None else (os.getenv("FREEMAIL_TOKEN") or "")).strip()
         selected = (os.getenv("FREEMAIL_DOMAIN") or "").strip()
         if not domain:
@@ -160,7 +285,7 @@ class EmailService:
                 "settings": {},
             }
 
-        base = f"https://{domain}"
+        base = raw_worker if raw_worker.startswith(("http://", "https://")) else f"https://{domain}"
         session = cls._build_session()
         headers = {"Content-Type": "application/json"}
         if auth:
@@ -265,22 +390,13 @@ class EmailService:
 
     def create_email(self):
         """创建临时邮箱，返回 (jwt, email)"""
-        if self.email_type in ("outlook", "outlook-hotmail"):
-            return self._create_outlook_alias()
-
-        style = self._api_style
-        if style in ("auto", "cf_temp", "cloudflare"):
-            result = self._create_cf_temp()
-            if result[0] and result[1]:
-                return result
-            if style != "auto":
-                return None, None
-        return self._create_freemail_legacy()
+        with self._semaphore:
+            return self._provider.create_email()
 
     def _create_outlook_alias(self):
         accounts = self._outlook_accounts
         if not accounts:
-            print("[-] 创建邮箱失败(outlook): 未配置 OUTLOOK_ACCOUNTS")
+            self._emit("创建邮箱失败(outlook): 未配置账号", "warn")
             return None, None
 
         with EmailService._outlook_lock:
@@ -290,12 +406,15 @@ class EmailService:
                 if EmailService._shared_outlook_usage.get(
                     acc["email"].lower(), 0
                 )
-                < self.outlook_alias_limit
+                < int(acc.get("alias_limit") or self.outlook_alias_limit)
+                and float(
+                    EmailService._outlook_health.get(acc["email"].lower(), {}).get("cooldown_until") or 0
+                ) <= time.time()
             ]
             if not available:
-                print(
-                    "[-] 创建邮箱失败(outlook): "
-                    f"所有账号已达加号地址上限 ({self.outlook_alias_limit})"
+                self._emit(
+                    f"创建邮箱失败(outlook): 所有账号已达 Alias 上限或处于冷却状态 ({self.outlook_alias_limit})",
+                    "warn",
                 )
                 return None, None
 
@@ -319,7 +438,7 @@ class EmailService:
                 if alias_email.lower() not in EmailService._shared_outlook_map:
                     break
             else:
-                print("[-] 创建邮箱失败(outlook): 无法生成唯一加号地址")
+                self._emit("创建邮箱失败(outlook): 无法生成唯一 Plus Alias", "warn")
                 return None, None
 
             EmailService._shared_outlook_usage[usage_key] = (
@@ -328,6 +447,10 @@ class EmailService:
             EmailService._shared_outlook_map[alias_email.lower()] = {
                 **acc,
                 "main_email": main_email,
+            }
+            self._metadata_by_email[alias_email] = {
+                "email_provider": self.provider_name,
+                "email_domain": domain,
             }
         return alias_email, alias_email
 
@@ -349,7 +472,7 @@ class EmailService:
                     info = {**acc, "main_email": main_email}
                     break
         if not info:
-            print(f"[-] Outlook 收码失败: 未找到 {alias_email} 对应的主账号凭据")
+            self._emit(f"Outlook 收码失败: 未找到 {alias_email} 对应的主账号凭据", "warn")
             return None
 
         main_email = info["main_email"]
@@ -364,14 +487,19 @@ class EmailService:
         import email as email_pkg
 
         seen_msg_ids: set[str] = set()
+        deadline = time.monotonic() + self.timeout_seconds
+        attempt_limit = max_attempts if max_attempts != 50 else 1000000
 
-        for attempt in range(max_attempts):
+        for attempt in range(attempt_limit):
+            if time.monotonic() >= deadline:
+                return None
             if stop_event is not None and stop_event.is_set():
                 return None
 
             try:
                 mail = imaplib.IMAP4_SSL(imap_server, imap_port)
                 self._authenticate_outlook_imap(mail, info)
+                EmailService._outlook_health.pop(main_email.lower(), None)
                 mail.select("INBOX", readonly=True)
 
                 status, data = mail.search(None, "ALL")
@@ -488,7 +616,13 @@ class EmailService:
                     pass
 
             except Exception:
-                pass
+                with EmailService._outlook_lock:
+                    health = dict(EmailService._outlook_health.get(main_email.lower(), {}))
+                    failures = int(health.get("failures") or 0) + 1
+                    health["failures"] = failures
+                    if failures >= 3:
+                        health = {"failures": 0, "cooldown_until": time.time() + 600}
+                    EmailService._outlook_health[main_email.lower()] = health
 
             delay = 0.5 if attempt < 4 else 1.0
             if stop_event is not None:
@@ -604,68 +738,138 @@ class EmailService:
             return None
         return d
 
-    def _create_cf_temp(self):
-        try:
-            mail_domain = self._resolve_mail_domain()
-            use_admin_api = bool(self.admin_key)
-            create_path = "/admin/new_address" if use_admin_api else "/api/new_address"
-            create_headers = self._admin_headers() if use_admin_api else self._auth_headers()
-            for attempt in range(2):
-                name = self._random_name(10 if attempt == 0 else 12)
-                payload: dict = {"name": name}
-                if mail_domain:
-                    payload["domain"] = mail_domain
-                if self.random_subdomain:
-                    payload["enableRandomSubdomain"] = True
+    def _cf_domain_candidates(self) -> list[Optional[str]]:
+        cfg = self.structured_config["providers"]["cloudflare_temp"]
+        domains = [str(v).strip() for v in cfg.get("domains") or [] if str(v).strip()]
+        if cfg.get("auto_domain") or not domains:
+            return [None]
+        now = time.time()
+        with EmailService._cf_domain_lock:
+            start = EmailService._cf_domain_cursor % len(domains)
+            EmailService._cf_domain_cursor = (start + 1) % len(domains)
+            ordered = domains[start:] + domains[:start]
+            ready = []
+            for domain in ordered:
+                health = EmailService._cf_domain_health.get(domain, {})
+                if float(health.get("cooldown_until") or 0) > now:
+                    continue
+                else:
+                    ready.append(domain)
+            return ready
+
+    @classmethod
+    def _record_cf_domain_result(cls, domain: Optional[str], ok: bool) -> None:
+        if not domain:
+            return
+        with cls._cf_domain_lock:
+            if ok:
+                cls._cf_domain_health.pop(domain, None)
+                return
+            health = dict(cls._cf_domain_health.get(domain, {}))
+            failures = int(health.get("failures") or 0) + 1
+            health["failures"] = failures
+            if failures >= 3:
+                health["cooldown_until"] = time.time() + 300
+                health["failures"] = 0
+            cls._cf_domain_health[domain] = health
+
+    def _create_cf_temp_for_domain(self, mail_domain: Optional[str]):
+        use_admin_api = bool(self.admin_key)
+        create_path = "/admin/new_address" if use_admin_api else "/api/new_address"
+        create_headers = self._admin_headers() if use_admin_api else self._auth_headers()
+        # A 400 name collision is the only safe POST replay here.
+        for attempt in range(2):
+            name = self._random_name(10 if attempt == 0 else 12)
+            payload: dict = {"name": name}
+            if mail_domain:
+                payload["domain"] = mail_domain
+            if self.random_subdomain:
+                payload["enableRandomSubdomain"] = True
+            try:
                 res = self._session.post(
                     f"{self.base_url}{create_path}",
                     json=payload,
                     headers=create_headers,
                     timeout=20,
                 )
-                if res.status_code == 200:
-                    data = res.json()
-                    email = data.get("address") or data.get("email")
-                    jwt = data.get("jwt") or data.get("token") or email
-                    if email:
-                        self._jwt_by_email[email] = jwt
-                        self._api_style = "cf_temp"
-                        return jwt, email
-                # 名称冲突再试
-                if res.status_code != 400:
-                    api_kind = "admin" if use_admin_api else "api"
-                    print(
-                        f"[-] 创建邮箱失败(cf {api_kind}): "
-                        f"{res.status_code} - {res.text[:200]}"
-                    )
-                    return None, None
-            print(f"[-] 创建邮箱失败(cf): 重试后仍失败")
+            except requests.RequestException:
+                # The POST may have reached the server; never replay it after
+                # an ambiguous transport failure. The caller may try the next
+                # configured domain as a new logical attempt.
+                return None, None
+            if res.status_code == 200:
+                data = res.json()
+                email = data.get("address") or data.get("email")
+                jwt = data.get("jwt") or data.get("token") or email
+                if email:
+                    self._jwt_by_email[email] = jwt
+                    self._metadata_by_email[email] = {
+                        "email_provider": self.provider_name,
+                        "email_domain": mail_domain or email.rsplit("@", 1)[-1],
+                    }
+                    return jwt, email
+            if res.status_code != 400:
+                return None, None
+        return None, None
+
+    def _create_cf_temp(self):
+        try:
+            for mail_domain in self._cf_domain_candidates():
+                result = self._create_cf_temp_for_domain(mail_domain)
+                ok = bool(result[0] and result[1])
+                self._record_cf_domain_result(mail_domain, ok)
+                if ok:
+                    configured = self.structured_config["providers"]["cloudflare_temp"].get("domains") or []
+                    if mail_domain in configured:
+                        with EmailService._cf_domain_lock:
+                            EmailService._cf_domain_cursor = (configured.index(mail_domain) + 1) % len(configured)
+                    return result
+                if mail_domain:
+                    self._emit(f"Cloudflare Temp 域名失败，切换下一域: {mail_domain}", "warn")
             return None, None
         except Exception as e:
-            print(f"[-] 创建邮箱失败(cf): {e}")
+            self._emit(f"创建邮箱失败(Cloudflare Temp): {e}", "warn")
             return None, None
 
     def _create_freemail_legacy(self):
         """旧 freemail: GET /api/generate + Bearer token"""
         try:
+            params = {}
+            domain = str(self.structured_config["providers"]["freemail"].get("domain") or "auto")
+            if domain.lower() != "auto":
+                discovered = self.discover_domains()
+                names = [str(item.get("domain") if isinstance(item, dict) else item) for item in discovered.get("domains") or []]
+                if domain in names:
+                    params["domainIndex"] = names.index(domain)
             res = self._session.get(
                 f"{self.base_url}/api/generate",
+                params=params,
                 headers=self._auth_headers(),
                 timeout=15,
             )
             if res.status_code == 200:
-                email = res.json().get("email")
+                payload = res.json()
+                inner = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+                email = inner.get("email") or inner.get("address")
                 if email:
                     self._jwt_by_email[email] = self.freemail_token
                     self._api_style = "freemail"
+                    self._metadata_by_email[email] = {
+                        "email_provider": self.provider_name,
+                        "email_domain": email.rsplit("@", 1)[-1],
+                    }
                     return email, email
-            print(f"[-] 创建邮箱失败: {res.status_code} - {res.text[:200]}")
+            self._emit(f"创建邮箱失败(Freemail): {res.status_code} - {res.text[:200]}", "warn")
             return None, None
         except Exception as e:
-            print(f"[-] 创建邮箱失败: {e}")
+            self._emit(f"创建邮箱失败(Freemail): {e}", "warn")
             return None, None
 
     def fetch_verification_code(self, email, max_attempts=50, stop_event=None):
+        with self._semaphore:
+            return self._provider.fetch_verification_code(email, max_attempts, stop_event)
+
+    def _fetch_http_verification_code(self, email, max_attempts=50, stop_event=None):
         """
         轮询收件箱提取验证码。
         Outlook 加号地址走 IMAP；其他邮箱走 freemail API。
@@ -675,16 +879,12 @@ class EmailService:
 
         轮询策略：前几次快扫（0.4s），后面稳定在 0.7s，总窗口约 30s+。
         """
-        if self.email_type in ("outlook", "outlook-hotmail"):
-            return self._fetch_outlook_verification_code(
-                email,
-                max_attempts=max_attempts,
-                stop_event=stop_event,
-            )
-
         jwt = self._jwt_by_email.get(email) or self.freemail_token
         seen_ids: set[str] = set()
-        for attempt in range(max_attempts):
+        deadline = time.monotonic() + self.timeout_seconds
+        for attempt in range(max_attempts if max_attempts != 50 else 1000000):
+            if time.monotonic() >= deadline:
+                return None
             if stop_event is not None and stop_event.is_set():
                 return None
             try:
@@ -939,29 +1139,180 @@ class EmailService:
         # 不再做「任意 \b\d{6}\b」兜底——这正是误取 124002 的根源
         return None
 
+    def _yyds_headers(self, temp_token: str = "") -> dict:
+        cfg = self.structured_config["providers"]["yyds"]
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if cfg.get("api_key"):
+            headers["X-API-Key"] = str(cfg["api_key"])
+        if temp_token:
+            headers["Authorization"] = f"Bearer {temp_token}"
+        return headers
+
+    def _create_yyds(self):
+        cfg = self.structured_config["providers"]["yyds"]
+        payload = {"localPart": self._random_name(12)}
+        if str(cfg.get("domain") or "auto").lower() != "auto":
+            payload["domain"] = str(cfg["domain"])
+        if cfg.get("platform_code"):
+            payload["platformCode"] = str(cfg["platform_code"])
+        try:
+            response = self._session.post(
+                f"{self.base_url}/accounts",
+                json=payload,
+                headers=self._yyds_headers(),
+                timeout=20,
+            )
+            data = response.json() if response.status_code in (200, 201) else {}
+            inner = data.get("data") if isinstance(data.get("data"), dict) else data
+            email = str(inner.get("address") or inner.get("email") or "")
+            account_id = str(inner.get("id") or "")
+            token = str(inner.get("token") or "")
+            if not email:
+                return None, None
+            self._yyds_accounts[email] = {"id": account_id, "token": token}
+            self._jwt_by_email[email] = token or account_id or email
+            self._metadata_by_email[email] = {
+                "email_provider": self.provider_name,
+                "email_domain": email.rsplit("@", 1)[-1],
+            }
+            return token or account_id or email, email
+        except Exception as exc:
+            self._emit(f"创建邮箱失败(YYDS): {exc}", "warn")
+            return None, None
+
+    def _fetch_yyds_verification_code(self, email, max_attempts=50, stop_event=None):
+        deadline = time.monotonic() + self.timeout_seconds
+        account = self._yyds_accounts.get(email, {})
+        while time.monotonic() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return None
+            wait_seconds = max(1, min(30, int(deadline - time.monotonic())))
+            try:
+                response = self._session.get(
+                    f"{self.base_url}/messages/next",
+                    params={"address": email, "wait": wait_seconds},
+                    headers=self._yyds_headers(account.get("token", "")),
+                    timeout=wait_seconds + 5,
+                )
+                if response.status_code == 200:
+                    data = response.json()
+                    inner = data.get("data") if isinstance(data.get("data"), dict) else data
+                    for key in ("verificationCode", "verification_code", "code", "otp"):
+                        code = self._normalize_code(str(inner.get(key) or ""))
+                        if code:
+                            return code
+                    code = self._extract_code_from_mail(inner if isinstance(inner, dict) else {})
+                    if code:
+                        return code
+            except Exception:
+                if stop_event is not None and stop_event.wait(1):
+                    return None
+                time.sleep(1)
+        return None
+
+    def discover_domains(self) -> dict:
+        try:
+            if self.provider_name == "outlook":
+                return {"ok": True, "domains": ["outlook.com", "hotmail.com"], "platforms": [], "message": "Outlook Plus Alias 使用主账号域名"}
+            if self.provider_name == "cloudflare_temp":
+                result = self.fetch_mail_domains(self.base_url, self.freemail_token)
+                result["health"] = dict(EmailService._cf_domain_health)
+                return result
+            if self.provider_name == "freemail":
+                response = self._session.get(f"{self.base_url}/api/domains", headers=self._auth_headers(), timeout=15)
+                data = response.json() if response.status_code == 200 else {}
+                raw = data if isinstance(data, list) else (data.get("domains") or data.get("data") or data.get("results") or [])
+                domains = []
+                for index, item in enumerate(raw if isinstance(raw, list) else []):
+                    name = str(item.get("domain") or item.get("name") or "") if isinstance(item, dict) else str(item)
+                    if name:
+                        domains.append({"domain": name, "index": index})
+                return {"ok": response.status_code == 200, "domains": domains, "message": f"已拉取 {len(domains)} 个域名"}
+            response = self._session.get(f"{self.base_url}/domains", headers=self._yyds_headers(), timeout=15)
+            platforms_response = self._session.get(f"{self.base_url}/platforms", headers=self._yyds_headers(), timeout=15)
+            data = response.json() if response.status_code == 200 else {}
+            platforms_data = platforms_response.json() if platforms_response.status_code == 200 else {}
+            domains = data if isinstance(data, list) else (data.get("data") or data.get("domains") or [])
+            platforms = platforms_data if isinstance(platforms_data, list) else (platforms_data.get("data") or platforms_data.get("platforms") or [])
+            return {"ok": response.status_code == 200, "domains": domains if isinstance(domains, list) else [], "platforms": platforms if isinstance(platforms, list) else [], "message": "YYDS 域名与平台列表已拉取"}
+        except Exception as exc:
+            return {"ok": False, "domains": [], "platforms": [], "message": str(exc)}
+
+    def test_connection(self, test_all_domains: bool = False) -> dict:
+        if self.provider_name == "outlook":
+            if not self._outlook_accounts:
+                return {"ok": False, "message": "未配置 Outlook 账号"}
+            import imaplib
+
+            results = []
+            for raw in self._outlook_accounts:
+                account = {**raw, "main_email": raw["email"]}
+                mail = imaplib.IMAP4_SSL(os.getenv("OUTLOOK_IMAP_SERVER", "outlook.office365.com"), int(os.getenv("OUTLOOK_IMAP_PORT", "993")))
+                try:
+                    self._authenticate_outlook_imap(mail, account)
+                    EmailService._outlook_health.pop(account["main_email"].lower(), None)
+                    results.append({"account": account["main_email"], "ok": True})
+                except Exception as exc:
+                    results.append({"account": account["main_email"], "ok": False, "message": str(exc)[:160]})
+                finally:
+                    try:
+                        mail.logout()
+                    except Exception:
+                        pass
+            ok = bool(results) and all(item["ok"] for item in results)
+            return {"ok": ok, "message": "全部 Outlook 账号认证成功" if ok else "部分 Outlook 账号认证失败", "details": {"accounts": results}}
+
+        if self.provider_name == "cloudflare_temp" and test_all_domains:
+            domains = self.structured_config["providers"]["cloudflare_temp"].get("domains") or [None]
+            results = []
+            for domain in domains:
+                token, email = self._create_cf_temp_for_domain(domain)
+                ok = bool(email)
+                deleted = self._delete_cf_temp(email) if email else False
+                results.append({"domain": domain or "auto", "ok": ok, "deleted": bool(deleted)})
+            all_ok = bool(results) and all(item["ok"] and item["deleted"] for item in results)
+            return {"ok": all_ok, "message": "全部域名测试通过" if all_ok else "部分域名测试失败", "details": {"domains": results}}
+
+        discovered = self.discover_domains()
+        if not discovered.get("ok"):
+            return discovered
+        token, email = self.create_email()
+        if not email:
+            return {"ok": False, "message": "连接成功，但创建测试邮箱失败", "details": discovered}
+        deleted = self.delete_email(email)
+        return {
+            "ok": bool(deleted),
+            "message": "连接、创建与清理测试成功" if deleted else "邮箱创建成功，但清理测试失败",
+            "details": {"email_domain": email.rsplit("@", 1)[-1], "deleted": bool(deleted)},
+        }
+
+    def get_email_metadata(self, address: str) -> dict[str, str]:
+        return dict(self._metadata_by_email.get(str(address or ""), {
+            "email_provider": self.provider_name,
+            "email_domain": str(address or "").rsplit("@", 1)[-1] if "@" in str(address or "") else "",
+        }))
+
     def delete_email(self, address):
         """删除邮箱"""
-        if self.email_type in ("outlook", "outlook-hotmail"):
-            # 加号地址不是服务端创建的真实别名，只释放本次运行的本地占用。
-            alias_key = str(address or "").lower()
-            with EmailService._outlook_lock:
-                info = EmailService._shared_outlook_map.pop(alias_key, None)
-                if info:
-                    usage_key = info["main_email"].lower()
-                    current = EmailService._shared_outlook_usage.get(
-                        usage_key, 0
-                    )
-                    if current <= 1:
-                        EmailService._shared_outlook_usage.pop(usage_key, None)
-                    else:
-                        EmailService._shared_outlook_usage[usage_key] = (
-                            current - 1
-                        )
-            return True
+        with self._semaphore:
+            return self._provider.delete_email(address)
 
+    def _delete_outlook_alias(self, address):
+        alias_key = str(address or "").lower()
+        with EmailService._outlook_lock:
+            info = EmailService._shared_outlook_map.pop(alias_key, None)
+            if info:
+                usage_key = info["main_email"].lower()
+                current = EmailService._shared_outlook_usage.get(usage_key, 0)
+                if current <= 1:
+                    EmailService._shared_outlook_usage.pop(usage_key, None)
+                else:
+                    EmailService._shared_outlook_usage[usage_key] = current - 1
+        return True
+
+    def _delete_cf_temp(self, address):
         jwt = self._jwt_by_email.get(address) or self.freemail_token
         try:
-            # cloudflare_temp_email
             res = self._session.delete(
                 f"{self.base_url}/api/delete_address",
                 headers=self._auth_headers(jwt=jwt),
@@ -971,7 +1322,13 @@ class EmailService:
                 self._jwt_by_email.pop(address, None)
                 return True
 
-            # 旧 freemail
+            return False
+        except Exception:
+            return False
+
+    def _delete_freemail(self, address):
+        jwt = self._jwt_by_email.get(address) or self.freemail_token
+        try:
             res = self._session.delete(
                 f"{self.base_url}/api/mailboxes",
                 params={"address": address},
@@ -984,5 +1341,24 @@ class EmailService:
             if ok:
                 self._jwt_by_email.pop(address, None)
             return bool(ok)
+        except Exception:
+            return False
+
+    def _delete_yyds(self, address):
+        account = self._yyds_accounts.get(address, {})
+        account_id = account.get("id")
+        if not account_id:
+            return False
+        try:
+            response = self._session.delete(
+                f"{self.base_url}/accounts/{account_id}",
+                headers=self._yyds_headers(account.get("token", "")),
+                timeout=15,
+            )
+            ok = response.status_code in (200, 204)
+            if ok:
+                self._yyds_accounts.pop(address, None)
+                self._jwt_by_email.pop(address, None)
+            return ok
         except Exception:
             return False

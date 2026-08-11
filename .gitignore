@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+import_services.json
 
 # Python
 __pycache__/

@@ -64,6 +64,24 @@ class RegisterEngineAccountJsonTests(unittest.TestCase):
             self.assertEqual(len(accounts), 1)
             self.assertEqual(accounts[0]["user_id"], "user-id-123")
 
+    def test_success_adds_optional_email_provider_metadata(self):
+        class FakeEmailService:
+            def get_email_metadata(self, _email):
+                return {"email_provider": "cloudflare_temp", "email_domain": "a.example"}
+
+            def delete_email(self, _email):
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = RegisterEngine(log_fn=lambda *_args: None)
+            engine.output_file = str(Path(tmp) / "result.txt")
+            engine.target_count = 10
+            engine.start_time = 1.0
+            engine._record_success("box@a.example", "sso-value", False, FakeEmailService())
+            accounts = json.loads((Path(tmp) / "result_accounts.json").read_text(encoding="utf-8"))
+        self.assertEqual(accounts[0]["email_provider"], "cloudflare_temp")
+        self.assertEqual(accounts[0]["email_domain"], "a.example")
+
 
 if __name__ == "__main__":
     unittest.main()

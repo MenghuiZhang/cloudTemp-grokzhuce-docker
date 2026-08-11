@@ -3,6 +3,7 @@ beautifulsoup4
 python-dotenv
 requests
 flask
+filelock>=3.13
 # Turnstile Solver（本地）
 quart>=0.19
 rich>=13

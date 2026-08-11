@@ -66,11 +66,11 @@ try:
 except Exception:
     pass
 
-MAIL_DOMAIN = (os.environ.get("STANDALONE_MAIL_DOMAIN") or "edu.valenastra.com").strip()
-if MAIL_DOMAIN.lower() in ("valenastra.com", "valenastra", "auto", ""):
-    MAIL_DOMAIN = "edu.valenastra.com"
-os.environ["FREEMAIL_DOMAIN"] = MAIL_DOMAIN
-os.environ["FREEMAIL_API_STYLE"] = os.environ.get("FREEMAIL_API_STYLE") or "cf_temp"
+MAIL_DOMAIN = (os.environ.get("STANDALONE_MAIL_DOMAIN") or "").strip()
+# Empty means: use the same global provider configuration as the Web app.
+# The legacy override remains available for one-off compatibility runs.
+if MAIL_DOMAIN:
+    os.environ["FREEMAIL_DOMAIN"] = MAIL_DOMAIN
 os.environ["GROK_SAME_SESSION_PROTOCOL"] = "1"
 os.environ["GROK_SAME_SESSION_HEADLESS"] = "camoufox"
 os.environ["GROK_SAME_SESSION_BROWSER"] = "camoufox"
@@ -1476,7 +1476,10 @@ def run_one(idx: int, email_svc: EmailService, ts_svc: TurnstileService, out_fil
             return row
         if "xyz" in email.lower():
             raise RuntimeError(f"禁止 xyz: {email}")
-        if not email.endswith("@" + MAIL_DOMAIN):
+        email_meta = email_svc.get_email_metadata(email)
+        row["email_provider"] = email_meta.get("email_provider") or email_svc.provider_name
+        row["domain"] = email_meta.get("email_domain") or email.rsplit("@", 1)[-1]
+        if MAIL_DOMAIN and not email.endswith("@" + MAIL_DOMAIN):
             log(f"邮箱后缀非预期: {email}（期望 @{MAIL_DOMAIN}）", "warn")
         log(f"注册 {email}", "info")
 
@@ -1768,7 +1771,8 @@ def run_one(idx: int, email_svc: EmailService, ts_svc: TurnstileService, out_fil
                     "elapsed_s": row["elapsed_s"],
                     "elapsed_reg_s": row.get("elapsed_reg_s"),
                     "browser_from_pool": row.get("browser_from_pool"),
-                    "domain": MAIL_DOMAIN,
+                    "domain": row.get("domain") or "",
+                    "email_provider": row.get("email_provider") or "",
                     "steps": ss.get("steps"),
                     "at": datetime.now().isoformat(timespec="seconds"),
                 },
@@ -1849,9 +1853,7 @@ def main() -> int:
             )
     ensure_solver()
 
-    email_svc = EmailService()
-    email_svc.mail_domain = MAIL_DOMAIN
-    os.environ["FREEMAIL_DOMAIN"] = MAIL_DOMAIN
+    email_svc = EmailService(log_fn=log)
     ts_svc = TurnstileService()
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")

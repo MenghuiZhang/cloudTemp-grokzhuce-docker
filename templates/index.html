@@ -415,14 +415,13 @@
               <p id="formMessage" class="text-xs font-mono min-h-[1.1rem] text-ink-700/50"></p>
 
               <div class="rounded-xl bg-paper-100 border border-ink-900/5 p-3 text-xs text-ink-700/70 space-y-1.5">
-                <div class="flex justify-between gap-2"><span>Worker</span><span id="envWorker" class="font-mono text-ink-800 truncate max-w-[58%] text-right">—</span></div>
-                <div class="flex justify-between gap-2"><span>邮箱后缀</span><span id="envMailDomain" class="font-mono text-ink-800">—</span></div>
-                <div class="flex justify-between gap-2"><span>Token</span><span id="envToken" class="font-mono text-ink-800">—</span></div>
+                <div class="flex justify-between gap-2"><span>邮箱服务</span><span id="envWorker" class="font-mono text-ink-800 truncate max-w-[58%] text-right">—</span></div>
+                <div class="flex justify-between gap-2"><span>邮箱状态</span><span id="envMailDomain" class="font-mono text-ink-800">—</span></div>
+                <div class="flex justify-between gap-2"><span>邮箱配置</span><a href="/email-settings" id="envToken" class="font-mono text-brand-600">打开</a></div>
                 <div class="flex justify-between gap-2"><span>验证码</span><span id="envYes" class="font-mono text-ink-800">—</span></div>
                 <div class="flex justify-between gap-2"><span>Solver URL</span><span id="envSolver" class="font-mono text-brand-600">—</span></div>
                 <div class="flex justify-between gap-2"><span>注册代理</span><span id="envProxy" class="font-mono text-ink-800 truncate max-w-[58%] text-right">—</span></div>
-                <div class="flex justify-between gap-2"><span>sub2api Grok</span><span id="envUpstream" class="font-mono text-ink-800 truncate max-w-[58%] text-right">—</span></div>
-                <div class="flex justify-between gap-2"><span>导入分组</span><span id="envGroup" class="font-mono text-ink-800 truncate max-w-[58%] text-right">—</span></div>
+                <div class="flex justify-between gap-2"><span>导入服务</span><a href="/import-services" class="font-mono text-brand-600">打开</a></div>
               </div>
 
               <!-- Turnstile Solver 控制 -->
@@ -462,6 +461,14 @@
               <p id="configMessage" class="text-[11px] font-mono min-h-[1rem] text-ink-700/50 -mt-1"></p>
 
               <form id="configForm" class="space-y-2.5">
+                <div class="cfg-block flex items-center justify-between gap-3">
+                  <div>
+                    <h3 class="cfg-title">邮箱服务</h3>
+                    <p class="hint">邮箱凭据、服务切换、域名池与连接测试已迁移到独立页面。</p>
+                  </div>
+                  <a href="/email-settings" class="btn btn-primary text-[11px] px-3 py-1.5 shrink-0">打开邮箱配置</a>
+                </div>
+                <div class="hidden" aria-hidden="true">
                 <!-- 1. 邮箱 -->
                 <div class="cfg-block">
                   <h3 class="cfg-title">邮箱 freemail</h3>
@@ -540,6 +547,7 @@
                     </div>
                   </div>
                 </div>
+                </div>
 
                 <!-- 2. 代理 -->
                 <div class="cfg-block">
@@ -599,42 +607,7 @@
                   </div>
                 </div>
 
-                <!-- 4. sub2api -->
-                <div class="cfg-block">
-                  <h3 class="cfg-title">sub2api 导入</h3>
-                  <div>
-                    <label class="field-label" for="cfgUpstreamUrl">SUB2API_URL</label>
-                    <input id="cfgUpstreamUrl" class="field font-mono text-sm" placeholder="http://127.0.0.1:9898" autocomplete="off" />
-                  </div>
-                  <div>
-                    <label class="field-label" for="cfgUpstreamEmail">管理员邮箱</label>
-                    <input id="cfgUpstreamEmail" class="field font-mono text-sm" placeholder="admin@…" autocomplete="username" />
-                  </div>
-                  <div>
-                    <label class="field-label" for="cfgUpstreamPwd">管理员密码</label>
-                    <div class="secret-wrap">
-                      <input id="cfgUpstreamPwd" type="password" class="field font-mono text-sm" placeholder="密码" autocomplete="current-password" spellcheck="false" />
-                      <button type="button" class="toggle-eye" data-target="cfgUpstreamPwd" aria-label="显示/隐藏" title="显示/隐藏">
-                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
-                      </button>
-                    </div>
-                  </div>
-                  <div class="grid grid-cols-2 gap-2">
-                    <div>
-                      <label class="field-label" for="cfgGroupName">分组名</label>
-                      <input id="cfgGroupName" class="field font-mono text-sm" placeholder="grok" autocomplete="off" />
-                    </div>
-                    <div>
-                      <label class="field-label" for="cfgGroupId">分组 ID</label>
-                      <input id="cfgGroupId" class="field font-mono text-sm bg-ink-900/5 text-ink-700/70 cursor-not-allowed" placeholder="自动" readonly tabindex="-1" autocomplete="off" />
-                    </div>
-                  </div>
-                  <p id="groupListHint" class="hint min-h-[0.9rem]"></p>
-                  <button type="button" id="btnTestUpstream" class="btn btn-ghost w-full text-[11px] py-1.5">测试 sub2api</button>
-                  <p id="upstreamTestMessage" class="text-[11px] font-mono min-h-[1rem] text-ink-700/50"></p>
-                </div>
-
-                <!-- 5. UI -->
+                <!-- 4. UI -->
                 <div class="cfg-block">
                   <h3 class="cfg-title">控制台监听</h3>
                   <div class="grid grid-cols-2 gap-2">
@@ -706,11 +679,10 @@
             <div class="flex items-center justify-between gap-3 mb-3">
               <div>
                 <h2 class="font-display font-semibold text-ink-900">最近成功</h2>
-                <p id="upstreamHint" class="text-[11px] text-ink-700/45 mt-0.5 font-mono">配置 sub2api 后可导入</p>
+                <p class="text-[11px] text-ink-700/45 mt-0.5 font-mono">导入状态请前往独立导入中心</p>
               </div>
-              <button type="button" id="btnImportAll" class="btn btn-primary text-xs px-3 py-1.5 shrink-0" disabled>全部导入 sub2api</button>
+              <a href="/import-services" class="btn btn-primary text-xs px-3 py-1.5 shrink-0">打开导入中心</a>
             </div>
-            <p id="importMessage" class="text-[11px] font-mono min-h-[1rem] text-ink-700/50 mb-2"></p>
             <div id="successList" class="max-h-64 overflow-y-auto space-y-2 font-mono text-xs">
               <p class="text-ink-700/45">成功账号会显示在这里</p>
             </div>
@@ -734,8 +706,6 @@
       seenLogIds: new Set(),
       seenPostLogIds: new Set(),
       starting: false,
-      importing: false,
-      upstreamConfigured: false,
       pollFailCount: 0,
       serverConnected: false,
       pollTimer: null,
@@ -1151,17 +1121,11 @@
       $('btnSaveConfig').disabled = state.running;
 
       if (data.env) {
-        const okW = data.env.worker_domain_set;
-        const okT = data.env.freemail_token_set;
-        $('envWorker').textContent = okW ? (data.env.worker_domain || '已配置') : '未配置';
-        $('envWorker').className = `font-mono truncate max-w-[58%] text-right ${okW ? 'text-leaf-600' : 'text-rose-500'}`;
-        const md = data.env.freemail_domain || 'auto';
-        const randomSubdomain = !!data.env.freemail_random_subdomain;
-        $('envMailDomain').textContent =
-          (md === 'auto' ? '自动' : md) + (randomSubdomain ? ' · 随机子域' : '');
-        $('envMailDomain').className = 'font-mono text-ink-800';
-        $('envToken').textContent = okT ? '已配置' : '未配置';
-        $('envToken').className = `font-mono ${okT ? 'text-leaf-600' : 'text-rose-500'}`;
+        const emailOk = !!data.env.email_configured;
+        $('envWorker').textContent = data.env.email_provider_label || data.env.email_provider || '未配置';
+        $('envWorker').className = `font-mono truncate max-w-[58%] text-right ${emailOk ? 'text-leaf-600' : 'text-rose-500'}`;
+        $('envMailDomain').textContent = emailOk ? '可用' : '待配置';
+        $('envMailDomain').className = `font-mono ${emailOk ? 'text-leaf-600' : 'text-rose-500'}`;
         $('envYes').textContent = data.env.yescaptcha_set ? 'YesCaptcha' : '本地 Solver';
         $('envYes').className = 'font-mono text-ink-800';
         $('envSolver').textContent = data.env.solver_url || 'http://127.0.0.1:5072';
@@ -1184,45 +1148,16 @@
             $('envProxy').className = 'font-mono truncate max-w-[58%] text-right text-ink-700/55';
           }
         }
-        const upOk = !!data.env.upstream_configured;
-        const upUrl = data.env.upstream_url || '';
-        $('envUpstream').textContent = upOk ? (upUrl || '已配置') : (upUrl ? '待配置' : '未配置');
-        $('envUpstream').className = `font-mono truncate max-w-[58%] text-right ${upOk ? 'text-leaf-600' : 'text-rose-500'}`;
-        const gid = data.env.sub2api_group_id || '';
-        const gname = data.env.sub2api_group_name || '';
-        if ($('envGroup')) {
-          if (gname && gid) $('envGroup').textContent = `${gname} → ${gid}`;
-          else if (gname) $('envGroup').textContent = `${gname}（ID 自动解析）`;
-          else $('envGroup').textContent = '未配置';
-          $('envGroup').className = `font-mono truncate max-w-[58%] text-right ${gname ? 'text-leaf-600' : 'text-rose-500'}`;
-        }
-        if ($('upstreamHint')) {
-          $('upstreamHint').textContent = upOk
-            ? `HTTP sso-to-oauth → ${gname || 'grok'}${gid ? '(' + gid + ')' : ''} · ${upUrl}`
-            : '请在「配置」填写 sub2api URL + 管理员账号 + 分组名称并保存';
-        }
-        state.upstreamConfigured = upOk;
       }
 
       if (data.solver) renderSolver(data.solver);
 
       const list = $('successList');
       const items = data.recent_success || [];
-      const pending = items.filter(it => it.sso && !it.imported);
-      if ($('btnImportAll')) {
-        $('btnImportAll').disabled = !state.upstreamConfigured || pending.length === 0 || state.importing;
-        $('btnImportAll').textContent = pending.length
-          ? `导入未推送 (${pending.length})`
-          : '全部导入 sub2api';
-      }
       if (!items.length) {
         list.innerHTML = '<p class="text-ink-700/45">成功账号会显示在这里</p>';
       } else {
         list.innerHTML = items.map(it => {
-          const canImport = state.upstreamConfigured && it.sso && !it.imported && !state.importing;
-          const importedBadge = it.imported
-            ? '<span class="text-leaf-600">已导入</span>'
-            : (it.sso ? '<span class="text-ink-700/40">未导入</span>' : '');
           let cleanBadge = '<span class="text-ink-700/35">risk…</span>';
           if (it.clean === true) cleanBadge = '<span class="text-leaf-600 font-semibold">CLEAN</span>';
           else if (it.clean === false) cleanBadge = '<span class="text-sun-500 font-semibold">MARKED</span>';
@@ -1234,6 +1169,7 @@
             <div class="min-w-0">
               <div class="text-leaf-600 truncate font-semibold">${escapeHtml(it.email || '')}</div>
               <div class="text-ink-700/45 truncate">${escapeHtml(it.sso_preview || '')}</div>
+              <div class="text-[10px] text-ink-700/40 truncate">${escapeHtml(it.email_provider || '')}${it.email_domain ? ' · ' + escapeHtml(it.email_domain) : ''}</div>
             </div>
             <div class="shrink-0 text-right space-y-1">
               <div class="flex items-center justify-end gap-2">
@@ -1242,13 +1178,6 @@
                 <span class="${it.nsfw ? 'text-brand-600' : 'text-ink-700/35'}">${it.nsfw ? 'NSFW ✓' : 'NSFW ·'}</span>
               </div>
               <div class="text-ink-700/35">${escapeHtml(it.time || '')}</div>
-              <div class="flex items-center justify-end gap-2">
-                ${importedBadge}
-                <button type="button"
-                  class="btn-import-one text-[11px] font-semibold ${canImport ? 'text-brand-600 hover:underline' : 'text-ink-700/30 cursor-not-allowed'}"
-                  data-id="${escapeHtml(it.id || '')}"
-                  ${canImport ? '' : 'disabled'}>导入</button>
-              </div>
             </div>
           </div>`;
         }).join('');
@@ -1438,11 +1367,6 @@
         $('cfgUiHost').value = c.UI_HOST || '127.0.0.1';
         $('cfgUiPort').value = c.UI_PORT || '3333';
         if ($('cfgProxy')) $('cfgProxy').value = c.GROK_PROXY || '';
-        if ($('cfgUpstreamUrl')) $('cfgUpstreamUrl').value = c.SUB2API_URL || c.UPSTREAM_URL || 'http://127.0.0.1:9898';
-        if ($('cfgUpstreamEmail')) $('cfgUpstreamEmail').value = c.UPSTREAM_ADMIN_EMAIL || '';
-        if ($('cfgUpstreamPwd')) $('cfgUpstreamPwd').value = c.UPSTREAM_ADMIN_PASSWORD || '';
-        if ($('cfgGroupName')) $('cfgGroupName').value = c.SUB2API_GROK_GROUP_NAME || 'grok';
-        if ($('cfgGroupId')) $('cfgGroupId').value = c.SUB2API_GROK_GROUP_ID || '';
         const mode = c.YESCAPTCHA_KEY ? 'yescaptcha' : 'local';
         captchaSelect._setValue(mode, true);
         $('yesCaptchaBlock').classList.toggle('hidden', mode !== 'yescaptcha');
@@ -1465,10 +1389,6 @@
         if ($('cfgAliasLimit')) $('cfgAliasLimit').value = c.OUTLOOK_ALIAS_LIMIT || '5';
 
         setMessage($('configMessage'), '已加载当前配置', true);
-        if ($('upstreamTestMessage')) {
-          $('upstreamTestMessage').textContent = '';
-          $('upstreamTestMessage').className = 'text-[11px] font-mono min-h-[1.1rem] text-ink-700/50';
-        }
         if ($('proxyTestMessage')) {
           $('proxyTestMessage').textContent = '';
           $('proxyTestMessage').className = 'text-[11px] font-mono leading-snug text-ink-700/50 break-all';
@@ -1477,14 +1397,7 @@
           $('proxyEgressLine').textContent = '';
           $('proxyEgressLine').classList.add('hidden');
         }
-        // 有 Worker 时自动拉取域名列表
-        if (c.WORKER_DOMAIN) {
-          fetchMailDomains(true).then((r) => {
-            if (r && r.ok) {
-              mailDomainSelect._setValue(savedDomain, true);
-            }
-          });
-        }
+        // 邮箱域名发现已迁移到独立邮箱配置页，此处不再后台请求邮箱 API。
       } catch (e) {
         setMessage($('configMessage'), e.message || '加载失败', false);
       }
@@ -1498,23 +1411,17 @@
           list.innerHTML = '<li class="text-ink-700/50">暂无文件</li>';
           return;
         }
-        list.innerHTML = data.files.map(f => {
-          const canImport = state.upstreamConfigured && !state.importing;
-          return `
+        list.innerHTML = data.files.map(f => `
           <li class="flex items-center justify-between gap-2 rounded-xl border border-ink-900/5 bg-paper-50 px-3 py-2">
             <div class="min-w-0">
               <div class="truncate text-ink-900 font-semibold">${escapeHtml(f.name)}</div>
               <div class="text-ink-700/45">${f.count} keys · ${Math.round(f.size / 1024 * 10) / 10} KB</div>
             </div>
             <div class="shrink-0 flex items-center gap-3">
-              <button type="button"
-                class="btn-import-file text-[11px] font-semibold ${canImport ? 'text-brand-600 hover:underline' : 'text-ink-700/30 cursor-not-allowed'}"
-                data-file="${escapeHtml(f.name)}"
-                ${canImport ? '' : 'disabled'}>导入 sub2api</button>
+              <a class="text-brand-600 hover:underline font-semibold" href="/import-services">导入中心</a>
               <a class="text-brand-600 hover:underline font-semibold" href="/${escapeHtml(f.path)}" download>下载</a>
             </div>
-          </li>`;
-        }).join('');
+          </li>`).join('');
       } catch (e) {
         $('keysList').innerHTML = `<li class="text-rose-500">${escapeHtml(e.message)}</li>`;
       }
@@ -1564,16 +1471,7 @@
     $('configForm').addEventListener('submit', async (ev) => {
       ev.preventDefault();
       const captchaMode = $('captchaMode').value;
-      const emailType = $('cfgEmailType') ? $('cfgEmailType').value : 'freemail';
       const payload = {
-        EMAIL_TYPE: emailType,
-        OUTLOOK_ACCOUNTS: ($('cfgAccountList') && $('cfgAccountList').value.trim()) || '',
-        OUTLOOK_ALIAS_LIMIT: ($('cfgAliasLimit') && $('cfgAliasLimit').value.trim()) || '5',
-        WORKER_DOMAIN: $('cfgWorker').value.trim(),
-        FREEMAIL_TOKEN: $('cfgToken').value.trim(),
-        FREEMAIL_ADMIN_KEY: $('cfgAdminKey').value.trim(),
-        FREEMAIL_DOMAIN: ($('cfgMailDomain').value || 'auto').trim() || 'auto',
-        FREEMAIL_RANDOM_SUBDOMAIN: $('cfgRandomSubdomain').checked ? '1' : '0',
         YESCAPTCHA_KEY: captchaMode === 'yescaptcha' ? $('cfgYes').value.trim() : '',
         SOLVER_URL: $('cfgSolver').value.trim() || 'http://127.0.0.1:5072',
         SOLVER_BROWSER: $('cfgSolverBrowser').value || 'camoufox',
@@ -1581,36 +1479,8 @@
         UI_HOST: $('cfgUiHost').value.trim() || '127.0.0.1',
         UI_PORT: $('cfgUiPort').value.trim() || '3333',
         GROK_PROXY: ($('cfgProxy') && $('cfgProxy').value.trim()) || '',
-        SUB2API_URL: ($('cfgUpstreamUrl') && $('cfgUpstreamUrl').value.trim()) || 'http://127.0.0.1:9898',
-        UPSTREAM_URL: ($('cfgUpstreamUrl') && $('cfgUpstreamUrl').value.trim()) || 'http://127.0.0.1:9898',
-        UPSTREAM_ADMIN_EMAIL: ($('cfgUpstreamEmail') && $('cfgUpstreamEmail').value.trim()) || '',
-        UPSTREAM_ADMIN_PASSWORD: ($('cfgUpstreamPwd') && $('cfgUpstreamPwd').value) || '',
-        SUB2API_GROK_GROUP_NAME: ($('cfgGroupName') && $('cfgGroupName').value.trim()) || 'grok',
         captcha_mode: captchaMode,
       };
-      if (emailType === 'outlook-hotmail' || emailType === 'outlook') {
-        if (!payload.OUTLOOK_ACCOUNTS) {
-          setMessage($('configMessage'), '请填写 Outlook 账号列表', false);
-          return;
-        }
-      } else {
-        if (!payload.WORKER_DOMAIN || !payload.FREEMAIL_TOKEN) {
-          setMessage($('configMessage'), 'WORKER_DOMAIN 与 FREEMAIL_TOKEN 为必填', false);
-          return;
-        }
-        if (payload.FREEMAIL_RANDOM_SUBDOMAIN === '1' && payload.FREEMAIL_DOMAIN === 'auto') {
-          setMessage($('configMessage'), '启用随机子域名时，请先拉取并选择基础域名', false);
-          return;
-        }
-        if (
-          payload.FREEMAIL_RANDOM_SUBDOMAIN === '1'
-          && randomSubdomainDomains.size
-          && !randomSubdomainDomains.has(payload.FREEMAIL_DOMAIN)
-        ) {
-          setMessage($('configMessage'), '所选域名不支持随机子域名，请选择标有“可随机子域”的域名', false);
-          return;
-        }
-      }
       setMessage($('configMessage'), '保存中...', true);
       $('btnSaveConfig').disabled = true;
       const t0 = performance.now();
@@ -1622,23 +1492,6 @@
         });
         const ms = Math.round(performance.now() - t0);
         setMessage($('configMessage'), `${data.message || '已保存'}（${ms}ms）`, true);
-        if (data.upstream_test && $('upstreamTestMessage')) {
-          const ut = data.upstream_test;
-          $('upstreamTestMessage').textContent = ut.message || '';
-          $('upstreamTestMessage').className = `text-[11px] font-mono min-h-[1.1rem] ${ut.ok ? 'text-leaf-600' : 'text-rose-500'}`;
-          if (ut.ok && ut.group) {
-            if ($('cfgGroupId') && ut.group.group_id != null) $('cfgGroupId').value = String(ut.group.group_id);
-            if ($('cfgGroupName') && ut.group.group_name) $('cfgGroupName').value = String(ut.group.group_name);
-          }
-          if ($('groupListHint') && Array.isArray(ut.groups) && ut.groups.length) {
-            $('groupListHint').textContent = '可选: ' + ut.groups.map(g => `${g.name}(${g.id}/${g.platform || '?'})`).join(', ');
-          }
-        }
-        // 解析后的 ID 也可能在 env/config 里
-        const resolvedId = (data.env && data.env.sub2api_group_id)
-          || (data.config && data.config.SUB2API_GROK_GROUP_ID)
-          || '';
-        if ($('cfgGroupId') && resolvedId) $('cfgGroupId').value = String(resolvedId);
         // 用返回的 env 立刻刷新侧栏，不必再等一轮 status（避免与轮询抢请求）
         if (data.env) {
           renderStatus({ ...(state.lastStatus || {}), env: data.env, status: (state.lastStatus && state.lastStatus.status) || 'idle' });
@@ -1649,49 +1502,6 @@
         $('btnSaveConfig').disabled = false;
       }
     });
-
-    async function testUpstream() {
-      const msg = $('upstreamTestMessage');
-      const btn = $('btnTestUpstream');
-      if (btn) btn.disabled = true;
-      if (msg) {
-        msg.textContent = '测试中…';
-        msg.className = 'text-[11px] font-mono min-h-[1.1rem] text-ink-700/50';
-      }
-      try {
-        const data = await fetchJSON('/api/upstream/test', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            SUB2API_URL: ($('cfgUpstreamUrl') && $('cfgUpstreamUrl').value.trim()) || '',
-            UPSTREAM_URL: ($('cfgUpstreamUrl') && $('cfgUpstreamUrl').value.trim()) || '',
-            UPSTREAM_ADMIN_EMAIL: ($('cfgUpstreamEmail') && $('cfgUpstreamEmail').value.trim()) || '',
-            UPSTREAM_ADMIN_PASSWORD: ($('cfgUpstreamPwd') && $('cfgUpstreamPwd').value) || '',
-            SUB2API_GROK_GROUP_NAME: ($('cfgGroupName') && $('cfgGroupName').value.trim()) || '',
-          }),
-        });
-        if (msg) {
-          msg.textContent = data.message || (data.ok ? '连通正常' : '失败');
-          msg.className = `text-[11px] font-mono min-h-[1.1rem] ${data.ok ? 'text-leaf-600' : 'text-rose-500'}`;
-        }
-        if (data.ok && data.group) {
-          if ($('cfgGroupId') && data.group.group_id != null) $('cfgGroupId').value = String(data.group.group_id);
-          if ($('cfgGroupName') && data.group.group_name) $('cfgGroupName').value = String(data.group.group_name);
-        }
-        if ($('groupListHint') && Array.isArray(data.groups) && data.groups.length) {
-          $('groupListHint').textContent = '可选: ' + data.groups.map(g => `${g.name}(${g.id}/${g.platform || '?'})`).join(', ');
-        } else if (!data.ok && Array.isArray(data.groups) && data.groups.length && $('groupListHint')) {
-          $('groupListHint').textContent = '可选: ' + data.groups.map(g => `${g.name}(${g.id}/${g.platform || '?'})`).join(', ');
-        }
-      } catch (e) {
-        if (msg) {
-          msg.textContent = e.message || '测试失败';
-          msg.className = 'text-[11px] font-mono min-h-[1.1rem] text-rose-500';
-        }
-      } finally {
-        if (btn) btn.disabled = false;
-      }
-    }
 
     function _paintProxyEgress(data) {
       const eg = $('proxyEgressLine');
@@ -1785,82 +1595,6 @@
 
     if ($('btnProxyTest')) {
       $('btnProxyTest').addEventListener('click', () => { testProxyConnectivity(); });
-    }
-
-    async function importToUpstream(ids, opts) {
-      if (state.importing) return;
-      if (!state.upstreamConfigured) {
-        setMessage($('importMessage'), '请先在「配置」填写 sub2api 地址并保存', false);
-        return;
-      }
-      opts = opts || {};
-      state.importing = true;
-      if ($('btnImportAll')) $('btnImportAll').disabled = true;
-      const tip = opts.file
-        ? `正在从文件导入 sub2api：${opts.file}…`
-        : '正在导入 sub2api（优先缓存 token 直写 → sso-to-oauth → 本机换票兜底）…';
-      setMessage($('importMessage'), tip, true);
-      try {
-        // 注册流水线 risk 后已前台换票；导入优先缓存直写，sso-to-oauth 次之，本机 device flow 仅兜底
-        // file：从 keys/*.txt 全量导入，不受「最近成功」列表长度限制
-        const body = { merge: true, max_workers: 1 };
-        if (opts.file) body.file = opts.file;
-        else if (ids && ids.length) body.ids = ids;
-        else body.all = true;
-        const data = await fetchJSON('/api/upstream/import', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body),
-        });
-        const src = data.source ? ` · ${data.source}` : '';
-        const submitted = data.submitted != null ? `（提交 ${data.submitted}）` : '';
-        setMessage(
-          $('importMessage'),
-          (data.message || '导入完成') + submitted + src,
-          !!data.ok || (data.success || 0) > 0
-        );
-        state.importing = false;
-        if (data.recent_success) {
-          const next = {
-            ...(state.lastStatus || {}),
-            recent_success: data.recent_success,
-            env: (state.lastStatus && state.lastStatus.env) || undefined,
-            status: (state.lastStatus && state.lastStatus.status) || 'idle',
-          };
-          renderStatus(next);
-        } else {
-          pollOnce();
-        }
-        refreshKeys();
-      } catch (e) {
-        state.importing = false;
-        setMessage($('importMessage'), e.message || '导入失败', false);
-        if (state.lastStatus) renderStatus(state.lastStatus);
-        refreshKeys();
-      }
-    }
-
-    if ($('btnTestUpstream')) {
-      $('btnTestUpstream').addEventListener('click', testUpstream);
-    }
-    if ($('btnImportAll')) {
-      $('btnImportAll').addEventListener('click', () => importToUpstream(null));
-    }
-    if ($('successList')) {
-      $('successList').addEventListener('click', (ev) => {
-        const btn = ev.target.closest('.btn-import-one');
-        if (!btn || btn.disabled) return;
-        const id = btn.getAttribute('data-id');
-        if (id) importToUpstream([id]);
-      });
-    }
-    if ($('keysList')) {
-      $('keysList').addEventListener('click', (ev) => {
-        const btn = ev.target.closest('.btn-import-file');
-        if (!btn || btn.disabled) return;
-        const file = btn.getAttribute('data-file');
-        if (file) importToUpstream(null, { file });
-      });
     }
 
     $('btnReloadConfig').addEventListener('click', loadConfig);

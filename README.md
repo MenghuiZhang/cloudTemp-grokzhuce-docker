@@ -1,15 +1,18 @@
 # Grok 批量注册工具
 
-Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Castle 同页 mint，以及 HTTP 导入 sub2api。
+Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Castle 同页 mint，以及 Sub2API、CLIProxyAPI（CPA）和 grok2api 多目标导入。
 
 ## 功能
 
 - 同页 same-session 注册（Castle mint + 页内 fetch，默认 CLEAN 主路径）
-- 临时邮箱自动建邮 / 收码（[cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)）
+- 独立邮箱配置中心：Outlook Plus Alias、[idinging/freemail](https://github.com/idinging/freemail)、[YYDS Mail](https://vip.215.im/docs)、[cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)
+- Cloudflare Temp 多基础域名顺序轮替、失败切域、冷却与随机子域
 - 本地 Camoufox Turnstile Solver（也可接 YesCaptcha）
 - 多线程并发；主流程 / Risk·Token·NSFW 双栏日志
 - 进度按 CLEAN 成功数计；创邮次数单独展示（数量 = 创邮次数停批）
-- 注册成功后页面「导入」入库 sub2api（HTTP Admin API / sso-to-oauth；`AUTO_IMPORT=1` 可开自动）
+- 独立导入中心：最近成功 / Keys / 注册 JSON / 上传文件，多目标预览、后台任务和失败重试
+- CPA/OIDC 本地生成与 CLIProxyAPI 上传；grok2api 本地池、chenyme Web/Console/Build、jiujiu 兼容
+- 每个下游独立测试、代理和自动导入开关；默认全部关闭
 - 按**分组名称**自动解析 sub2api `group_id`（ID 只读缓存）
 - 配置页支持注册代理格式校验与连通性测试（出口 IP/地区 + accounts.x.ai）
 
@@ -27,6 +30,9 @@ Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Cas
 ├── browser_configs.py
 ├── db_results.py
 ├── templates/index.html        # 控制台前端
+├── templates/email_settings.html # 独立邮箱配置页
+├── templates/import_services.html # 独立导入中心
+├── g/import_services.py        # 导入配置、目标适配器与后台任务
 ├── g/                          # 邮箱 / Turnstile / Castle / 同会话 / 导入
 ├── .env.example
 └── requirements.txt
@@ -43,7 +49,7 @@ Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Cas
 
 - Python 3.10+
 - Windows / Linux 均可（Camoufox Solver 在 Windows 上更常用）
-- 已部署的 [cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email) Worker
+- 至少一种可用邮箱服务（Outlook、Freemail、YYDS 或 Cloudflare Temp）
 - 可选：自建 sub2api 用于账号入库
 
 ## 安装
@@ -66,6 +72,8 @@ docker compose logs -f
 docker compose down
 ```
 
+从旧版本升级时可直接保留原 `.env` 和现有 volume：程序会兼容读取旧邮箱变量；进入邮箱配置页保存后会写入新结构并保留旧变量用于回滚。默认部署是单进程、线程并发；不要用多个 Web worker 或多个容器共享同一 `.env`/`keys` volume。
+
 ### 本地 Python
 
 ```bash
@@ -80,26 +88,30 @@ python setup_solver.py
 cp .env.example .env
 ```
 
-编辑 `.env`（**切勿提交**）：
+推荐启动 Web 后访问 `http://127.0.0.1:3333/email-settings` 配置。邮箱密钥只写不读，页面留空表示保留现值；保存草稿、连接测试和启用服务是三个独立操作。
+
+核心邮箱变量（完整清单见 `.env.example`）：
 
 | 配置项 | 说明 | 默认 |
 |--------|------|------|
-| `WORKER_DOMAIN` | cloudflare_temp_email 的 Worker 域名（不要 `https://`） | — |
-| `FREEMAIL_TOKEN` | 站点密码 / JWT | — |
-| `FREEMAIL_ADMIN_KEY` | `ADMIN_PASSWORDS` 中的管理员密码；填写后通过 `/admin/new_address` 建邮；与站点密码相同时可填 `${FREEMAIL_TOKEN}` | 空 |
-| `FREEMAIL_DOMAIN` | 邮箱后缀；`auto` 用服务端默认 | `auto` |
-| `FREEMAIL_RANDOM_SUBDOMAIN` | `1` 时通过原生 `enableRandomSubdomain` 创建随机子域邮箱 | `0` |
-| `FREEMAIL_API_STYLE` | `auto` / `cf_temp` / `freemail` | `auto` |
-| `EMAIL_TYPE` | `freemail` 或 `outlook-hotmail`（Outlook 加号地址） | `freemail` |
-| `OUTLOOK_ACCOUNTS` | Outlook 账号；每行 `email:应用密码`，或 `email----应用密码----refresh_token----client_id` | 空 |
-| `OUTLOOK_ALIAS_LIMIT` | 每个 Outlook 主账号在一次运行中分配的加号地址上限 | `5` |
+| `EMAIL_PROVIDER` | `outlook` / `freemail` / `yyds` / `cloudflare_temp`；新安装先在页面测试并启用 | 空 |
+| `EMAIL_TIMEOUT_SECONDS` | 收码总超时，范围 30～600 秒 | `120` |
+| `EMAIL_PROXY_MODE` | `direct` / `register` / `custom` / `system` | `direct` |
+| `EMAIL_TLS_VERIFY` | 是否严格验证邮箱 API 的 TLS 证书 | `1` |
+| `EMAIL_OUTLOOK_ACCOUNTS_JSON` | Outlook 账号池 JSON；支持每账号 `alias_limit` | `[]` |
+| `EMAIL_FREEMAIL_BASE_URL` | idinging/freemail API 地址 | 空 |
+| `EMAIL_YYDS_API_KEY` | YYDS Mail 的 `AC-...` API Key | 空 |
+| `EMAIL_CF_TEMP_BASE_URL` | cloudflare_temp_email Worker 地址 | 空 |
+| `EMAIL_CF_TEMP_DOMAINS_JSON` | 按顺序轮替的基础域名 JSON 数组 | `[]` |
+| `EMAIL_CF_TEMP_AUTO_DOMAIN` | `1` 时由服务端自动选域；显式域名池轮替不生效 | `1` |
+| `EMAIL_CF_TEMP_RANDOM_SUBDOMAIN` | 传递原生 `enableRandomSubdomain` | `0` |
 | `YESCAPTCHA_KEY` | 有则走 YesCaptcha；空则本地 Solver | 空 |
 | `SOLVER_URL` | 本地 Solver 地址 | `http://127.0.0.1:5072` |
 | `SOLVER_BROWSER` | `camoufox` / `chromium` | `camoufox` |
 | `SOLVER_THREADS` | Solver 浏览器线程 | `4` |
 | `UI_HOST` / `UI_PORT` | Web 监听 | `127.0.0.1` / `3333` |
 | `GROK_PROXY` | 注册代理；空=直连。支持 `host:port` / URL / `user:pass@host:port` / `host:port:user:pass` | 空 |
-| `SUB2API_URL` | sub2api 根地址 | `http://127.0.0.1:9898` |
+| `SUB2API_URL` | 旧版 sub2api 根地址；首次进入导入中心时用于迁移 | `http://127.0.0.1:9898` |
 | `SUB2API_GROK_GROUP_NAME` | 导入目标分组**名称**（按名称解析 ID） | `grok` |
 | `SUB2API_GROK_GROUP_ID` | 可选缓存；运行时会按名称回写 | 空 |
 | `UPSTREAM_ADMIN_EMAIL` | sub2api 管理员邮箱 | — |
@@ -107,13 +119,16 @@ cp .env.example .env
 
 说明：
 
+- 旧 `EMAIL_TYPE`、`FREEMAIL_*`、`OUTLOOK_*` 会自动读取；新页面首次保存后写入新结构并继续双写兼容变量。
 - Outlook 模式生成 `主账号+随机标签@outlook.com`，邮件仍进入主账号收件箱；这不是微软账户中创建的真实别名。
 - Outlook 收件优先使用 OAuth2；只有账号行未提供 OAuth2 凭据时，才尝试密码或应用密码。使用前需在 Outlook.com 中启用 IMAP。
-- Cloudflare 随机子域模式必须选择 Worker `RANDOM_SUBDOMAIN_DOMAINS` 中的基础域名；Worker 还需配置 `RANDOM_SUBDOMAIN_LENGTH`。Cloudflare DNS 必须为基础域名配置通配 `*` MX 并指向相同邮件路由，否则地址可以创建但无法收件。
-- 页面「配置」里只填**分组名称**；分组 ID 只读显示，保存/测试/导入时自动拉取。
+- Cloudflare Temp 域名池按页面顺序轮询。单域失败会尝试下一域；连续失败 3 次冷却 5 分钟。轮询游标和冷却状态仅在当前进程共享，重启或多实例不会共享。
+- Cloudflare 随机子域模式只应搭配 Worker `RANDOM_SUBDOMAIN_DOMAINS` 中的基础域名；Worker 还需配置 `RANDOM_SUBDOMAIN_LENGTH` 和通配 MX。
+- Sub2API 配置已迁移到独立“导入服务”页面；分组 ID 在测试/导入时按名称自动解析。
 - 名称匹配的是 sub2api **已有**分组（可跨 platform）；新分组请先在 sub2api 后台创建。
 - 导入主路径：`POST /api/v1/admin/grok/sso-to-oauth`（服务端换票）。
-- 默认**不**自动入库；需要自动时在 `.env` 设 `AUTO_IMPORT=1`。
+- 默认**不**自动导入；服务测试通过后，可在导入中心按目标开启注册后自动导入。
+- 导入配置和写入型密钥保存在 `converted_auth/import_services.json`，API 只返回掩码。
 - Token 换票 / 协议 / NSFW 在成功后异步后台跑，不堵注册主路径。
 
 ## 使用
@@ -137,14 +152,30 @@ python start.py
 
 打开：`http://127.0.0.1:3333`
 
-- **配置**：邮箱 / Solver / 注册代理（可测出口与 x.ai）/ sub2api / 分组名称 → 写入 `.env`
+- **邮箱配置**：独立页面管理 provider、凭据、域名池、测试与启用
+- **导入服务**：独立页面管理 Sub2API、CLIProxyAPI 和 grok2api，地址为 `/import-services`
+- **配置**：Solver / 注册代理（可测出口与 x.ai）→ 写入 `.env`
 - **运行**：选择 `same_session`、并发、数量后开始
 - **日志**：左侧主流程（建邮→camoufox→signup→SSO），右侧 Risk / Token / NSFW
-- **Keys**：下载 SSO 文件，一键导入 sub2api
+- **Keys**：下载 SSO 文件；批量导入统一在导入中心执行
 
 same_session 建议并发先 **1～2**（注册浏览器 + Solver 双开）。
 
-### 3. 命令行
+### 3. 导入服务中心
+
+打开 `http://127.0.0.1:3333/import-services`：
+
+1. 在顶部服务卡片中保存并测试 Sub2API、CLIProxyAPI 或 grok2api。
+2. 从最近成功、`keys/*.txt`、`register_sso/*.json` 或本地上传选择来源并预览。
+3. 勾选一个或多个目标，创建后台任务；页面会按“账号 × 目标”显示结果。
+4. 网络/5xx 会有限重试；鉴权和格式错误直接失败，可在任务结束后仅重试失败项。
+
+CPA 文件写入 `converted_auth/cpa/`，grok2api 本地池写入
+`converted_auth/grok2api/token.json`，脱敏任务历史写入 `logs/import_jobs/`。
+Docker 内访问宿主机服务时不要使用 `127.0.0.1`，应填写
+`host.docker.internal` 或 Compose 网络中的服务名。
+
+### 4. 命令行
 
 ```bash
 python grok.py
@@ -152,13 +183,13 @@ python grok.py
 
 成功账号写入 `keys/`。
 
-### 4. 批量导入已有 SSO 文件
+### 5. 批量导入已有 SSO 文件
 
 ```bash
 python import_batch_once.py keys/your_sso.txt
 ```
 
-### 5. 注册 JSON 转 CPA / sub2api JSON
+### 6. 注册 JSON 转 CPA / sub2api JSON
 
 读取 `register_sso/` 中每个 JSON 的 `sso`，完成 xAI OAuth 换票后，同时输出
 CLIProxyAPI（CPA）可加载的 `type=xai` 单账号文件和 sub2api 可导入的合并文件：
@@ -192,6 +223,16 @@ SSO cookie 不能直接作为 CPA OAuth 凭证；正常转换会访问 xAI 完�
 遇到 `rate_limited` 时可将 `--workers` 降为 `4`；如需忽略已有 CPA 缓存并重新换票，
 使用 `--refresh-existing --overwrite`。换票返回 `invalid_grant: Access denied` 时，
 原始账号 JSON 会自动移入 `register_sso/失败/`；可用 `--failed-dir` 指定其他目录。
+
+## 测试
+
+自动化测试不读取真实邮箱密钥，也不调用公网服务：
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+真实凭据与自建实例请在“邮箱服务配置”页面主动点击测试；Cloudflare Temp 可选择逐域创建并清理测试邮箱。
 
 ## 注册路径
 

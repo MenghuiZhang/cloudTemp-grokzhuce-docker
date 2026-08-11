@@ -6,6 +6,9 @@ Grok 注册机 Web 控制台
 import json
 import os
 import re
+import threading
+import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,6 +16,24 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
 from grok import LogBuffer, RegisterEngine
+from g.email_config import (
+    EMAIL_CONFIG_KEYS,
+    EMAIL_DEFAULTS,
+    PROVIDER_LABELS,
+    PROVIDERS,
+    normalize_provider,
+    redact_config,
+    resolved_email_config,
+    serialize_structured_config,
+    validate_provider_config,
+)
+from g.import_services import (
+    ImportConfigStore,
+    ImportJobManager,
+    ImportTargets,
+    TARGET_LABELS,
+    TARGETS,
+)
 import solver_manager
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -120,7 +141,7 @@ CONFIG_KEYS = (
     "EMAIL_TYPE",
     "OUTLOOK_ACCOUNTS",
     "OUTLOOK_ALIAS_LIMIT",
-)
+) + EMAIL_CONFIG_KEYS
 
 DEFAULTS = {
     "WORKER_DOMAIN": "",
@@ -155,6 +176,15 @@ DEFAULTS = {
     "EMAIL_TYPE": "freemail",
     "OUTLOOK_ACCOUNTS": "",
     "OUTLOOK_ALIAS_LIMIT": "5",
+}
+DEFAULTS.update(EMAIL_DEFAULTS)
+
+# Deliberately process-local: a restart makes a provider require a fresh test
+# before it can be newly activated. A migrated already-active provider remains
+# runnable until the user edits or switches it.
+EMAIL_TEST_STATES: dict[str, dict] = {
+    name: {"status": "untested", "message": "尚未测试", "tested_at": ""}
+    for name in PROVIDERS
 }
 
 
@@ -216,6 +246,8 @@ def write_env_file(values: dict) -> None:
             written.add(key)
         else:
             out.append(line)
+            if key in CONFIG_KEYS:
+                written.add(key)
 
     # append missing keys
     for key in CONFIG_KEYS:
@@ -228,6 +260,32 @@ def write_env_file(values: dict) -> None:
     # ensure example comments if file was empty
     if not existing_lines:
         out = [
+            "# 统一邮箱服务（优先读取；旧变量保留用于回滚）",
+            f"EMAIL_PROVIDER={values.get('EMAIL_PROVIDER', EMAIL_DEFAULTS['EMAIL_PROVIDER'])}",
+            f"EMAIL_TIMEOUT_SECONDS={values.get('EMAIL_TIMEOUT_SECONDS', EMAIL_DEFAULTS['EMAIL_TIMEOUT_SECONDS'])}",
+            f"EMAIL_PROXY_MODE={values.get('EMAIL_PROXY_MODE', EMAIL_DEFAULTS['EMAIL_PROXY_MODE'])}",
+            f"EMAIL_PROXY_URL={values.get('EMAIL_PROXY_URL', '')}",
+            f"EMAIL_TLS_VERIFY={values.get('EMAIL_TLS_VERIFY', EMAIL_DEFAULTS['EMAIL_TLS_VERIFY'])}",
+            f"EMAIL_OUTLOOK_ACCOUNTS_JSON={values.get('EMAIL_OUTLOOK_ACCOUNTS_JSON', '[]')}",
+            f"EMAIL_OUTLOOK_DEFAULT_ALIAS_LIMIT={values.get('EMAIL_OUTLOOK_DEFAULT_ALIAS_LIMIT', '5')}",
+            f"EMAIL_OUTLOOK_CONCURRENCY={values.get('EMAIL_OUTLOOK_CONCURRENCY', '5')}",
+            f"EMAIL_FREEMAIL_BASE_URL={values.get('EMAIL_FREEMAIL_BASE_URL', '')}",
+            f"EMAIL_FREEMAIL_TOKEN={values.get('EMAIL_FREEMAIL_TOKEN', '')}",
+            f"EMAIL_FREEMAIL_DOMAIN={values.get('EMAIL_FREEMAIL_DOMAIN', 'auto')}",
+            f"EMAIL_FREEMAIL_CONCURRENCY={values.get('EMAIL_FREEMAIL_CONCURRENCY', '10')}",
+            f"EMAIL_YYDS_BASE_URL={values.get('EMAIL_YYDS_BASE_URL', EMAIL_DEFAULTS['EMAIL_YYDS_BASE_URL'])}",
+            f"EMAIL_YYDS_API_KEY={values.get('EMAIL_YYDS_API_KEY', '')}",
+            f"EMAIL_YYDS_DOMAIN={values.get('EMAIL_YYDS_DOMAIN', 'auto')}",
+            f"EMAIL_YYDS_PLATFORM_CODE={values.get('EMAIL_YYDS_PLATFORM_CODE', 'grok')}",
+            f"EMAIL_YYDS_CONCURRENCY={values.get('EMAIL_YYDS_CONCURRENCY', '5')}",
+            f"EMAIL_CF_TEMP_BASE_URL={values.get('EMAIL_CF_TEMP_BASE_URL', '')}",
+            f"EMAIL_CF_TEMP_SITE_TOKEN={values.get('EMAIL_CF_TEMP_SITE_TOKEN', '')}",
+            f"EMAIL_CF_TEMP_ADMIN_KEY={values.get('EMAIL_CF_TEMP_ADMIN_KEY', '')}",
+            f"EMAIL_CF_TEMP_DOMAINS_JSON={values.get('EMAIL_CF_TEMP_DOMAINS_JSON', '[]')}",
+            f"EMAIL_CF_TEMP_AUTO_DOMAIN={values.get('EMAIL_CF_TEMP_AUTO_DOMAIN', '1')}",
+            f"EMAIL_CF_TEMP_RANDOM_SUBDOMAIN={values.get('EMAIL_CF_TEMP_RANDOM_SUBDOMAIN', '0')}",
+            f"EMAIL_CF_TEMP_CONCURRENCY={values.get('EMAIL_CF_TEMP_CONCURRENCY', '10')}",
+            "",
             "# freemail API 配置",
             f"WORKER_DOMAIN={values.get('WORKER_DOMAIN', '')}",
             f"FREEMAIL_TOKEN={values.get('FREEMAIL_TOKEN', '')}",
@@ -301,6 +359,7 @@ def apply_env_to_process(values: dict) -> None:
 
 def env_snapshot():
     cfg = read_env_file()
+    email_cfg = resolved_email_config(cfg)
     worker = cfg.get("WORKER_DOMAIN", "").strip()
     token = cfg.get("FREEMAIL_TOKEN", "").strip()
     yes = cfg.get("YESCAPTCHA_KEY", "").strip()
@@ -341,9 +400,12 @@ def env_snapshot():
         "upstream_url": sub2_url,
         "upstream_configured": configured,
         "upstream_password_set": bool(admin_password),
-        "email_type": cfg.get("EMAIL_TYPE") or DEFAULTS.get("EMAIL_TYPE", "freemail"),
-        "outlook_accounts": cfg.get("OUTLOOK_ACCOUNTS") or "",
-        "outlook_alias_limit": cfg.get("OUTLOOK_ALIAS_LIMIT") or "5",
+        "email_type": email_cfg["provider"],
+        "email_provider": email_cfg["provider"],
+        "email_provider_label": PROVIDER_LABELS[email_cfg["provider"]],
+        "email_configured": not validate_provider_config(email_cfg),
+        "outlook_accounts": "",
+        "outlook_alias_limit": str(email_cfg["providers"]["outlook"]["default_alias_limit"]),
     }
 
 
@@ -662,12 +724,31 @@ def _entry_to_sub2api_credentials(entry: dict, email_hint: str = "") -> tuple[di
     return credentials, name, auth_key, user_id, email
 
 
+_SUB2_HTTP_CONTEXT = threading.local()
+
+
+def _set_sub2_http_options(
+    *, proxy_mode: str = "direct", proxy_url: str = "", register_proxy: str = "", tls_verify: bool = True
+) -> None:
+    value = ""
+    if proxy_mode == "custom":
+        value = str(proxy_url or "").strip()
+    elif proxy_mode == "register":
+        value = str(register_proxy or "").strip()
+    _SUB2_HTTP_CONTEXT.proxy_url = value
+    _SUB2_HTTP_CONTEXT.tls_verify = bool(tls_verify)
+
+
 def _http_session():
-    """本机/局域网上游请求禁用系统代理，避免 7897 之类代理把内网请求拖死。"""
+    """Create an isolated upstream session with the current service policy."""
     import requests
 
     s = requests.Session()
     s.trust_env = False
+    proxy_url = str(getattr(_SUB2_HTTP_CONTEXT, "proxy_url", "") or "").strip()
+    if proxy_url:
+        s.proxies.update({"http": proxy_url, "https": proxy_url})
+    s.verify = bool(getattr(_SUB2_HTTP_CONTEXT, "tls_verify", True))
     return s
 
 
@@ -1303,6 +1384,12 @@ def import_sso_to_upstream(
     base_url: str | None = None,
     password: str | None = None,
     email: str | None = None,
+    group_name: str | None = None,
+    group_id: str | None = None,
+    proxy_mode: str = "direct",
+    proxy_url: str = "",
+    register_proxy: str = "",
+    tls_verify: bool = True,
     accounts: list[dict] | None = None,
 ) -> dict:
     """
@@ -1324,13 +1411,23 @@ def import_sso_to_upstream(
     )
 
     del max_workers  # 保留参数兼容；HTTP 写串行更稳
-    if base_url:
-        os.environ["SUB2API_URL"] = normalize_upstream_url(base_url)
+    _set_sub2_http_options(
+        proxy_mode=proxy_mode,
+        proxy_url=proxy_url,
+        register_proxy=register_proxy,
+        tls_verify=tls_verify,
+    )
     sub2 = get_sub2api_config()
+    if base_url:
+        sub2["url"] = normalize_upstream_url(base_url)
     if email is not None and str(email).strip():
         sub2["admin_email"] = str(email).strip()
     if password is not None and str(password) != "":
         sub2["admin_password"] = str(password)
+    if group_name is not None and str(group_name).strip():
+        sub2["group_name"] = str(group_name).strip()
+    if group_id is not None:
+        sub2["group_id"] = str(group_id).strip()
 
     items = _normalize_import_accounts(sso_lines=sso_lines, accounts=accounts)
     if not items:
@@ -1776,6 +1873,73 @@ def import_sso_to_upstream(
         "mode": "http_admin_api",
     }
 
+
+def _exchange_import_token(sso: str, timeout: int) -> dict:
+    from grok import sso_device_flow_to_token
+
+    return sso_device_flow_to_token(sso, timeout=timeout, issue_token=True)
+
+
+def _clear_completed_import_tokens(job: dict) -> None:
+    oauth_targets = {"sub2api", "cpa_local", "cpa_remote", "grok2api_build"}
+    rows = {str(item.get("id") or ""): item for item in job.get("accounts") or []}
+    with engine.file_lock:
+        for item in engine.recent_success:
+            row = rows.get(str(item.get("id") or ""))
+            if not row:
+                continue
+            sub2_state = (row.get("targets") or {}).get("sub2api") or {}
+            if sub2_state.get("status") == "success":
+                item["imported"] = True  # old status/API compatibility
+            if oauth_targets.intersection((row.get("targets") or {}).keys()):
+                item["auth_token"] = None
+
+
+IMPORT_CONFIG = ImportConfigStore(BASE_DIR, env_reader=read_env_file)
+IMPORT_TARGETS = ImportTargets(BASE_DIR, IMPORT_CONFIG)
+IMPORT_JOBS = ImportJobManager(
+    BASE_DIR,
+    IMPORT_CONFIG,
+    IMPORT_TARGETS,
+    sub2api_importer=import_sso_to_upstream,
+    token_exchanger=_exchange_import_token,
+    register_proxy_getter=lambda: str(
+        os.environ.get("GROK_PROXY") or read_env_file().get("GROK_PROXY") or ""
+    ).strip(),
+    log=logs.emit,
+    on_job_complete=_clear_completed_import_tokens,
+    source_resolver=lambda source, rows: _resolve_import_retry_source(source, rows),
+)
+IMPORT_PREVIEWS: dict[str, dict] = {}
+IMPORT_PREVIEW_LOCK = threading.RLock()
+
+
+def _queue_configured_auto_import(accounts: list[dict]) -> None:
+    accounts = [item for item in accounts if item.get("sso")]
+    if not accounts:
+        return
+    cfg = IMPORT_CONFIG.load()
+    targets: list[str] = []
+    for service in ("sub2api", "cpa", "grok2api"):
+        targets.extend(cfg["services"][service].get("auto_targets") or [])
+    targets = list(dict.fromkeys(target for target in targets if target in TARGETS))
+    if accounts and all(item.get("clean") is not True for item in accounts):
+        targets = [target for target in targets if target in ("grok2api_web", "grok2api_console")]
+    if not targets:
+        return
+    IMPORT_JOBS.create_job(
+        accounts,
+        targets,
+        source={"type": "automatic", "registered_at": datetime.now(timezone.utc).isoformat()},
+        force_refresh=False,
+        allow_marked=False,
+        automatic=True,
+    )
+
+
+engine.auto_import_callback = _queue_configured_auto_import
+
+
 def mask_secret(value: str, keep: int = 4) -> str:
     if not value:
         return ""
@@ -1787,6 +1951,16 @@ def mask_secret(value: str, keep: int = 4) -> str:
 @app.get("/")
 def index():
     return render_template("index.html")
+
+
+@app.get("/email-settings")
+def email_settings():
+    return render_template("email_settings.html")
+
+
+@app.get("/import-services")
+def import_services_page():
+    return render_template("import_services.html")
 
 
 @app.get("/api/health")
@@ -1812,8 +1986,9 @@ def get_config():
         "ok": True,
         "config": {
             "WORKER_DOMAIN": cfg.get("WORKER_DOMAIN", ""),
-            "FREEMAIL_TOKEN": cfg.get("FREEMAIL_TOKEN", ""),
-            "FREEMAIL_ADMIN_KEY": cfg.get("FREEMAIL_ADMIN_KEY", ""),
+            # Email credentials moved to /api/email-config and are write-only.
+            "FREEMAIL_TOKEN": "",
+            "FREEMAIL_ADMIN_KEY": "",
             "FREEMAIL_DOMAIN": cfg.get("FREEMAIL_DOMAIN", DEFAULTS["FREEMAIL_DOMAIN"]),
             "FREEMAIL_RANDOM_SUBDOMAIN": cfg.get(
                 "FREEMAIL_RANDOM_SUBDOMAIN",
@@ -1836,14 +2011,14 @@ def get_config():
             "SUB2API_DB_PORT": cfg.get("SUB2API_DB_PORT", DEFAULTS["SUB2API_DB_PORT"]),
             "SUB2API_DB_NAME": cfg.get("SUB2API_DB_NAME", DEFAULTS["SUB2API_DB_NAME"]),
             "SUB2API_DB_USER": cfg.get("SUB2API_DB_USER", DEFAULTS["SUB2API_DB_USER"]),
-            "SUB2API_DB_PASSWORD": cfg.get("SUB2API_DB_PASSWORD", DEFAULTS["SUB2API_DB_PASSWORD"]),
+            "SUB2API_DB_PASSWORD": "",
             "SUB2API_GROK_GROUP_ID": cfg.get("SUB2API_GROK_GROUP_ID", DEFAULTS["SUB2API_GROK_GROUP_ID"]),
             "SUB2API_GROK_GROUP_NAME": cfg.get("SUB2API_GROK_GROUP_NAME", DEFAULTS["SUB2API_GROK_GROUP_NAME"]),
             "UPSTREAM_URL": cfg.get("SUB2API_URL", cfg.get("UPSTREAM_URL", DEFAULTS["SUB2API_URL"])),
             "UPSTREAM_ADMIN_EMAIL": cfg.get("UPSTREAM_ADMIN_EMAIL", ""),
-            "UPSTREAM_ADMIN_PASSWORD": cfg.get("UPSTREAM_ADMIN_PASSWORD", ""),
+            "UPSTREAM_ADMIN_PASSWORD": "",
             "EMAIL_TYPE": cfg.get("EMAIL_TYPE", DEFAULTS["EMAIL_TYPE"]),
-            "OUTLOOK_ACCOUNTS": cfg.get("OUTLOOK_ACCOUNTS", ""),
+            "OUTLOOK_ACCOUNTS": "",
             "OUTLOOK_ALIAS_LIMIT": cfg.get("OUTLOOK_ALIAS_LIMIT", DEFAULTS["OUTLOOK_ALIAS_LIMIT"]),
             "captcha_mode": "yescaptcha" if cfg.get("YESCAPTCHA_KEY", "").strip() else "local",
         },
@@ -1855,6 +2030,154 @@ def get_config():
             "UPSTREAM_ADMIN_PASSWORD": mask_secret(cfg.get("UPSTREAM_ADMIN_PASSWORD", "")),
         },
     })
+
+
+@app.get("/api/email-config")
+def get_email_config():
+    structured = resolved_email_config(read_env_file())
+    try:
+        from g.email_service import EmailService
+        cf_health = dict(EmailService._cf_domain_health)
+        outlook_health = dict(EmailService._outlook_health)
+    except Exception:
+        cf_health = {}
+        outlook_health = {}
+    return jsonify({
+        "ok": True,
+        "config": redact_config(structured, mask_secret),
+        "labels": PROVIDER_LABELS,
+        "test_states": EMAIL_TEST_STATES,
+        "running": engine.is_running(),
+        "runtime": {"cloudflare_domain_health": cf_health, "outlook_account_health": outlook_health},
+        "note": "密钥只写不读；留空表示保留现有值",
+    })
+
+
+@app.post("/api/email-config")
+def save_email_config():
+    if engine.is_running():
+        return jsonify({"ok": False, "message": "任务运行中，请先停止再修改邮箱配置"}), 409
+    body = request.get_json(silent=True) or {}
+    current = read_env_file()
+    before = resolved_email_config(current)
+    active = before["provider"]
+    # Saving is a draft operation; activation has a separate endpoint.
+    body = dict(body)
+    body["provider"] = active
+    try:
+        values = serialize_structured_config(current, body)
+        after = resolved_email_config(values)
+        write_env_file(values)
+        apply_env_to_process(values)
+        common_changed = before["common"] != after["common"]
+        for provider in PROVIDERS:
+            if common_changed or before["providers"][provider] != after["providers"][provider]:
+                EMAIL_TEST_STATES[provider] = {
+                    "status": "untested",
+                    "message": "配置已变化，请重新测试",
+                    "tested_at": "",
+                }
+        logs.emit("邮箱配置已保存", "success")
+        return jsonify({
+            "ok": True,
+            "message": "邮箱配置已保存",
+            "config": redact_config(after, mask_secret),
+            "test_states": EMAIL_TEST_STATES,
+        })
+    except Exception as exc:
+        return jsonify({"ok": False, "message": f"保存邮箱配置失败: {exc}"}), 400
+
+
+@app.post("/api/email-config/test")
+def test_email_config():
+    if engine.is_running():
+        return jsonify({"ok": False, "message": "任务运行中不能测试邮箱配置"}), 409
+    body = request.get_json(silent=True) or {}
+    provider = normalize_provider(body.get("provider"))
+    structured = resolved_email_config(read_env_file())
+    errors = validate_provider_config(structured, provider)
+    if errors:
+        return jsonify({"ok": False, "message": "；".join(errors)}), 400
+    try:
+        from g.email_service import EmailService
+
+        result = EmailService(provider_override=provider).test_connection(
+            test_all_domains=bool(body.get("test_all_domains"))
+        )
+    except Exception as exc:
+        result = {"ok": False, "message": str(exc)}
+    now = datetime.now(timezone.utc).isoformat()
+    EMAIL_TEST_STATES[provider] = {
+        "status": "passed" if result.get("ok") else "failed",
+        "message": str(result.get("message") or "测试失败"),
+        "tested_at": now,
+        "details": result.get("details") or {},
+    }
+    code = 200 if result.get("ok") else 502
+    return jsonify({**result, "provider": provider, "test_state": EMAIL_TEST_STATES[provider]}), code
+
+
+@app.post("/api/email-config/activate")
+def activate_email_config():
+    if engine.is_running():
+        return jsonify({"ok": False, "message": "任务运行中不能切换邮箱服务"}), 409
+    body = request.get_json(silent=True) or {}
+    provider = normalize_provider(body.get("provider"))
+    current = read_env_file()
+    structured = resolved_email_config(current)
+    errors = validate_provider_config(structured, provider)
+    if errors:
+        return jsonify({"ok": False, "message": "；".join(errors)}), 400
+    if EMAIL_TEST_STATES[provider].get("status") != "passed":
+        return jsonify({"ok": False, "message": "请先测试该邮箱服务，测试通过后才能启用"}), 409
+    values = serialize_structured_config(current, {"provider": provider})
+    write_env_file(values)
+    apply_env_to_process(values)
+    logs.emit(f"当前邮箱服务已切换为 {PROVIDER_LABELS[provider]}", "success")
+    return jsonify({"ok": True, "message": f"已启用 {PROVIDER_LABELS[provider]}", "provider": provider})
+
+
+@app.delete("/api/email-config/<provider>")
+def clear_email_provider(provider: str):
+    if engine.is_running():
+        return jsonify({"ok": False, "message": "任务运行中不能清除邮箱配置"}), 409
+    provider = normalize_provider(provider)
+    current = read_env_file()
+    active = resolved_email_config(current)["provider"]
+    if provider == active:
+        return jsonify({"ok": False, "message": "当前启用的服务不能清除，请先切换到其他已验证服务"}), 409
+    resets = {
+        "outlook": {"accounts": [], "default_alias_limit": 5, "concurrency": 5},
+        "freemail": {"base_url": "", "token": "", "domain": "auto", "concurrency": 10},
+        "yyds": {"base_url": EMAIL_DEFAULTS["EMAIL_YYDS_BASE_URL"], "api_key": "", "domain": "auto", "platform_code": "grok", "concurrency": 5},
+        "cloudflare_temp": {"base_url": "", "site_token": "", "admin_key": "", "domains": [], "auto_domain": True, "random_subdomain": False, "concurrency": 10},
+    }
+    clear_markers = {
+        "freemail": ["freemail.token"],
+        "yyds": ["yyds.api_key"],
+        "cloudflare_temp": ["cloudflare_temp.site_token", "cloudflare_temp.admin_key"],
+    }.get(provider, [])
+    values = serialize_structured_config(current, {
+        "provider": active,
+        "providers": {provider: resets[provider]},
+        "clear_secrets": clear_markers,
+    })
+    write_env_file(values)
+    apply_env_to_process(values)
+    EMAIL_TEST_STATES[provider] = {"status": "untested", "message": "配置已清除", "tested_at": ""}
+    return jsonify({"ok": True, "message": f"已清除 {PROVIDER_LABELS[provider]} 配置"})
+
+
+@app.get("/api/email-config/domains")
+def email_config_domains():
+    provider = normalize_provider(request.args.get("provider"))
+    try:
+        from g.email_service import EmailService
+
+        result = EmailService(provider_override=provider).discover_domains()
+        return jsonify(result), (200 if result.get("ok") else 502)
+    except Exception as exc:
+        return jsonify({"ok": False, "domains": [], "message": str(exc)}), 500
 
 
 @app.get("/api/mail-domains")
@@ -1984,7 +2307,15 @@ def save_config():
     sub2api_url = normalize_upstream_url(sub2api_url) or DEFAULTS["SUB2API_URL"]
     upstream_url = sub2api_url
 
-    if email_type in ("outlook", "outlook-hotmail"):
+    legacy_email_update = any(
+        key in body
+        for key in (
+            "EMAIL_TYPE", "OUTLOOK_ACCOUNTS", "OUTLOOK_ALIAS_LIMIT",
+            "WORKER_DOMAIN", "FREEMAIL_TOKEN", "FREEMAIL_ADMIN_KEY",
+            "FREEMAIL_DOMAIN", "FREEMAIL_RANDOM_SUBDOMAIN", "FREEMAIL_API_STYLE",
+        )
+    )
+    if legacy_email_update and email_type in ("outlook", "outlook-hotmail"):
         if not outlook_accounts:
             return jsonify({"ok": False, "message": "邮箱类型为 Outlook 时，必须填写账号列表"}), 400
         if (
@@ -1994,7 +2325,7 @@ def save_config():
             return jsonify(
                 {"ok": False, "message": "Outlook 加号地址上限范围 1-999"}
             ), 400
-    else:
+    elif legacy_email_update:
         if not worker or not token:
             return jsonify({"ok": False, "message": "WORKER_DOMAIN 与 FREEMAIL_TOKEN 为必填"}), 400
         if random_subdomain and mail_domain == "auto":
@@ -2059,11 +2390,7 @@ def save_config():
     try:
         write_env_file(values)
         apply_env_to_process(values)
-        mail_mode = "随机子域" if random_subdomain else "普通域名"
-        logs.emit(
-            f"配置已保存到 .env（邮箱域名: {mail_domain} · {mail_mode}）",
-            "success",
-        )
+        logs.emit("综合配置已保存到 .env", "success")
 
         # 保存后自动测试 sub2api HTTP 通道，并按名称解析 group_id 回写
         upstream_test = None
@@ -2207,15 +2534,16 @@ def start():
     except Exception:
         reg_mode = (mode_raw or "same_session").strip().lower() or "same_session"
 
-    env = env_snapshot()
-    if not env["worker_domain_set"] or not env["freemail_token_set"]:
+    cfg_env = read_env_file()
+    email_cfg = resolved_email_config(cfg_env)
+    email_errors = validate_provider_config(email_cfg)
+    if email_errors:
         return jsonify({
             "ok": False,
-            "message": "请先在「配置」中填写 WORKER_DOMAIN 与 FREEMAIL_TOKEN",
+            "message": "邮箱配置不可用：" + "；".join(email_errors) + "。请前往「邮箱配置」。",
         }), 400
 
     # 本地 Solver 模式：开任务前自动确保 5072 在线（注册机与 Solver 是两个进程）
-    cfg_env = read_env_file()
     use_local_solver = not (cfg_env.get("YESCAPTCHA_KEY") or "").strip()
     solver_info = None
     if use_local_solver:
@@ -2809,6 +3137,412 @@ def _safe_keys_file(name: str) -> Path | None:
 def _read_sso_file_lines(path: Path) -> list[str]:
     text = path.read_text(encoding="utf-8", errors="ignore")
     return [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+
+
+def _safe_register_json(name: str) -> Path | None:
+    raw = str(name or "").strip().replace("\\", "/")
+    if not raw or raw.startswith("/") or ".." in raw.split("/"):
+        return None
+    if raw.lower().startswith("register_sso/"):
+        raw = raw[len("register_sso/") :]
+    if not raw.lower().endswith(".json"):
+        return None
+    root = (BASE_DIR / "register_sso").resolve()
+    path = (root / Path(raw).name).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return None
+    return path if path.is_file() else None
+
+
+def _account_from_json(data: dict, *, source: str = "") -> dict | None:
+    if not isinstance(data, dict):
+        return None
+    sso = str(data.get("sso") or data.get("sso_cookie") or data.get("sso_token") or "").strip()
+    if not sso:
+        return None
+    risk = data.get("risk") if isinstance(data.get("risk"), dict) else {}
+    clean = data.get("clean")
+    if clean is None:
+        clean = risk.get("clean")
+    token = data.get("auth_token") or data.get("token")
+    return {
+        "id": str(data.get("id") or data.get("session_id") or uuid.uuid4().hex),
+        "email": str(data.get("email") or "").strip(),
+        "sso": sso,
+        "auth_token": token if isinstance(token, dict) else None,
+        "clean": clean if isinstance(clean, bool) else None,
+        "source": source,
+    }
+
+
+def _accounts_from_text(text: str, *, source: str) -> tuple[list[dict], list[dict]]:
+    accounts: list[dict] = []
+    errors: list[dict] = []
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip() and not line.strip().startswith("#")]
+    for index, (email, sso) in enumerate(_parse_sso_import_lines(lines), start=1):
+        if not sso:
+            errors.append({"row": index, "error": "缺少 SSO"})
+            continue
+        accounts.append({
+            "id": uuid.uuid4().hex,
+            "email": str(email or "").strip(),
+            "sso": str(sso).strip(),
+            "auth_token": None,
+            "clean": None,
+            "source": source,
+        })
+    return accounts, errors
+
+
+def _accounts_from_json_payload(payload: object, *, source: str) -> tuple[list[dict], list[dict]]:
+    if isinstance(payload, dict) and isinstance(payload.get("accounts"), list):
+        rows = payload["accounts"]
+    elif isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        rows = [payload]
+    else:
+        return [], [{"error": "JSON 顶层必须是账号对象、账号数组或 accounts 包装"}]
+    accounts: list[dict] = []
+    errors: list[dict] = []
+    for index, raw in enumerate(rows, start=1):
+        account = _account_from_json(raw, source=source) if isinstance(raw, dict) else None
+        if account:
+            accounts.append(account)
+        else:
+            errors.append({"row": index, "error": "缺少 sso/sso_cookie/sso_token"})
+    return accounts, errors
+
+
+def _dedupe_preview(accounts: list[dict]) -> tuple[list[dict], list[dict]]:
+    by_sso: dict[str, dict] = {}
+    errors: list[dict] = []
+    for account in accounts:
+        sso = str(account.get("sso") or "").strip()
+        if not sso:
+            errors.append({"source": account.get("source"), "error": "缺少 SSO"})
+            continue
+        current = by_sso.get(sso)
+        if current is None:
+            by_sso[sso] = account
+            continue
+        # Retain the richer duplicate (email/risk/cached OAuth fields).
+        score = lambda item: sum(
+            (bool(item.get("email")), item.get("clean") is not None, isinstance(item.get("auth_token"), dict))
+        )
+        if score(account) > score(current):
+            by_sso[sso] = account
+        errors.append({"source": account.get("source"), "error": "重复 SSO，已合并"})
+    return list(by_sso.values())[:10000], errors
+
+
+def _resolve_import_retry_source(source: dict, rows: list[dict]) -> list[dict]:
+    """Reload a persisted source without ever storing SSO in job history."""
+    source_type = str(source.get("type") or "")
+    recovered: list[dict] = []
+    if source_type == "keys":
+        path = _safe_keys_file(str(source.get("file") or ""))
+        if path:
+            recovered, _ = _accounts_from_text(
+                path.read_text(encoding="utf-8", errors="ignore"), source=f"keys/{path.name}"
+            )
+    elif source_type == "register_sso":
+        for file_name in source.get("files") or []:
+            path = _safe_register_json(str(file_name))
+            if not path:
+                continue
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                found, _ = _accounts_from_json_payload(payload, source=f"register_sso/{path.name}")
+                recovered.extend(found)
+            except Exception:
+                continue
+    elif source_type in ("recent", "automatic"):
+        recovered.extend({**item, "source": "recent_success"} for item in list(engine.recent_success) if item.get("sso"))
+        if not recovered:
+            register_dir = BASE_DIR / "register_sso"
+            for path in sorted(register_dir.glob("*.json")) if register_dir.is_dir() else []:
+                try:
+                    account = _account_from_json(json.loads(path.read_text(encoding="utf-8")), source=f"register_sso/{path.name}")
+                    if account:
+                        recovered.append(account)
+                except Exception:
+                    continue
+    elif source_type == "retry":
+        parent = IMPORT_JOBS.get(str(source.get("job_id") or ""))
+        if parent:
+            return _resolve_import_retry_source(parent.get("source") or {}, rows)
+    if not recovered:
+        return []
+    recovered, _ = _dedupe_preview(recovered)
+    by_id = {str(item.get("id") or ""): item for item in recovered}
+    by_email: dict[str, list[dict]] = {}
+    for item in recovered:
+        by_email.setdefault(str(item.get("email") or "").strip().lower(), []).append(item)
+    output: list[dict] = []
+    used: set[int] = set()
+    for index, row in enumerate(rows):
+        match = by_id.get(str(row.get("id") or ""))
+        if match is None:
+            bucket = by_email.get(str(row.get("email") or "").strip().lower()) or []
+            match = next((item for item in bucket if id(item) not in used), None)
+        if match is None and index < len(recovered):
+            match = recovered[index]
+        if match is None:
+            continue
+        used.add(id(match))
+        output.append({**match, "id": str(row.get("id") or match.get("id")), "clean": row.get("clean")})
+    return output
+
+
+def _preview_public(account: dict) -> dict:
+    sso = str(account.get("sso") or "")
+    return {
+        "id": account.get("id"),
+        "email": account.get("email") or "",
+        "clean": account.get("clean"),
+        "has_token": isinstance(account.get("auth_token"), dict),
+        "sso_preview": (sso[:10] + "…" + sso[-6:]) if len(sso) > 20 else "已读取",
+        "source": account.get("source") or "",
+    }
+
+
+def _store_import_preview(accounts: list[dict], source: dict, errors: list[dict]) -> dict:
+    preview_id = uuid.uuid4().hex
+    now = time.time()
+    with IMPORT_PREVIEW_LOCK:
+        for key, item in list(IMPORT_PREVIEWS.items()):
+            if now - float(item.get("created") or 0) > 1800:
+                IMPORT_PREVIEWS.pop(key, None)
+        if len(IMPORT_PREVIEWS) >= 20:
+            oldest = min(IMPORT_PREVIEWS, key=lambda key: float(IMPORT_PREVIEWS[key].get("created") or 0))
+            IMPORT_PREVIEWS.pop(oldest, None)
+        IMPORT_PREVIEWS[preview_id] = {
+            "created": now,
+            "accounts": accounts,
+            "source": source,
+            "errors": errors,
+        }
+    return {
+        "ok": True,
+        "preview_id": preview_id,
+        "source": source,
+        "total": len(accounts),
+        "errors": errors[:200],
+        "error_count": len(errors),
+        "accounts": [_preview_public(account) for account in accounts],
+    }
+
+
+@app.get("/api/import-services")
+def get_import_services():
+    cfg = IMPORT_CONFIG.load()
+    key_files = []
+    keys_dir = BASE_DIR / "keys"
+    if keys_dir.is_dir():
+        key_files = [path.name for path in sorted(keys_dir.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)]
+    register_files = []
+    register_dir = BASE_DIR / "register_sso"
+    if register_dir.is_dir():
+        register_files = [path.name for path in sorted(register_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)]
+    return jsonify({
+        "ok": True,
+        "config": IMPORT_CONFIG.redacted(cfg),
+        "target_labels": TARGET_LABELS,
+        "targets": list(TARGETS),
+        "sources": {"keys": key_files[:500], "register_sso": register_files[:2000]},
+        "recent": [_preview_public(item) for item in list(engine.recent_success)],
+        "jobs": IMPORT_JOBS.list_jobs(),
+        "note": "密钥只写不读；留空表示保留现有值",
+    })
+
+
+@app.post("/api/import-services/config")
+def save_import_services_config():
+    body = request.get_json(silent=True) or {}
+    try:
+        cfg = IMPORT_CONFIG.save(body.get("config") if isinstance(body.get("config"), dict) else body)
+        return jsonify({"ok": True, "message": "导入服务配置已保存；变化的服务需重新测试", "config": IMPORT_CONFIG.redacted(cfg)})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": f"保存失败: {exc}"}), 400
+
+
+@app.post("/api/import-services/test")
+def test_import_service():
+    body = request.get_json(silent=True) or {}
+    service = str(body.get("service") or "").strip()
+    cfg = IMPORT_CONFIG.load()
+    register_proxy = str(os.environ.get("GROK_PROXY") or read_env_file().get("GROK_PROXY") or "").strip()
+    if service == "sub2api":
+        sub2 = cfg["services"]["sub2api"]
+        _set_sub2_http_options(
+            proxy_mode=str(sub2.get("proxy_mode") or "direct"),
+            proxy_url=str(sub2.get("proxy_url") or ""),
+            register_proxy=register_proxy,
+            tls_verify=bool(sub2.get("tls_verify", True)),
+        )
+        result = test_upstream_connectivity(
+            base_url=str(sub2.get("base_url") or ""),
+            email=str(sub2.get("email") or ""),
+            password=str(sub2.get("password") or ""),
+            group_id=str(sub2.get("group_id") or ""),
+            group_name=str(sub2.get("group_name") or ""),
+        )
+    elif service == "cpa":
+        result = IMPORT_TARGETS.test_cpa(cfg, register_proxy)
+    elif service == "grok2api":
+        result = IMPORT_TARGETS.test_grok2api(cfg, register_proxy)
+    else:
+        return jsonify({"ok": False, "message": "未知导入服务"}), 400
+    cfg = IMPORT_CONFIG.update_test_state(service, result)
+    code = 200 if result.get("ok") else 502
+    return jsonify({**result, "test_state": cfg["test_states"][service]}), code
+
+
+@app.post("/api/import-services/auto-targets")
+def set_import_auto_targets():
+    body = request.get_json(silent=True) or {}
+    try:
+        cfg = IMPORT_CONFIG.set_auto_targets(str(body.get("service") or ""), body.get("targets") or [])
+        return jsonify({"ok": True, "message": "自动导入设置已更新", "config": IMPORT_CONFIG.redacted(cfg)})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 409
+
+
+@app.post("/api/import-services/preview")
+def preview_import_source():
+    if request.content_length and request.content_length > 10 * 1024 * 1024:
+        return jsonify({"ok": False, "message": "上传文件不能超过 10 MB"}), 413
+    body = request.form.to_dict() if request.files else (request.get_json(silent=True) or {})
+    source_type = str(body.get("source") or body.get("type") or "recent").strip()
+    accounts: list[dict] = []
+    errors: list[dict] = []
+    source: dict = {"type": source_type}
+    try:
+        if source_type == "recent":
+            ids_provided = "ids" in body
+            ids = body.get("ids") or []
+            if isinstance(ids, str):
+                ids = [x for x in ids.split(",") if x]
+            id_set = {str(x) for x in ids}
+            for item in list(engine.recent_success):
+                if ids_provided and str(item.get("id") or "") not in id_set:
+                    continue
+                if item.get("sso"):
+                    accounts.append({**item, "source": "recent_success"})
+        elif source_type == "keys":
+            file_name = str(body.get("file") or "")
+            path = _safe_keys_file(file_name)
+            if not path:
+                raise ValueError("无效或不存在的 Keys 文件")
+            source["file"] = path.name
+            parsed, found_errors = _accounts_from_text(path.read_text(encoding="utf-8", errors="ignore"), source=f"keys/{path.name}")
+            accounts.extend(parsed)
+            errors.extend(found_errors)
+        elif source_type == "register_sso":
+            files = body.get("files") or body.get("file") or []
+            if isinstance(files, str):
+                files = [x for x in files.split(",") if x]
+            for file_name in files:
+                path = _safe_register_json(str(file_name))
+                if not path:
+                    errors.append({"file": str(file_name), "error": "无效或不存在"})
+                    continue
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    parsed, found_errors = _accounts_from_json_payload(payload, source=f"register_sso/{path.name}")
+                    accounts.extend(parsed)
+                    errors.extend(found_errors)
+                except Exception as exc:
+                    errors.append({"file": path.name, "error": str(exc)})
+            source["files"] = [Path(str(x)).name for x in files]
+        elif source_type == "upload":
+            uploaded = request.files.get("file")
+            if not uploaded or not uploaded.filename:
+                raise ValueError("请选择 TXT 或 JSON 文件")
+            raw = uploaded.read(10 * 1024 * 1024 + 1)
+            if len(raw) > 10 * 1024 * 1024:
+                raise ValueError("上传文件不能超过 10 MB")
+            text = raw.decode("utf-8-sig", errors="replace")
+            source["file"] = Path(uploaded.filename).name
+            if uploaded.filename.lower().endswith(".json"):
+                payload = json.loads(text)
+                parsed, found_errors = _accounts_from_json_payload(payload, source=f"upload/{source['file']}")
+            elif uploaded.filename.lower().endswith(".txt"):
+                parsed, found_errors = _accounts_from_text(text, source=f"upload/{source['file']}")
+            else:
+                raise ValueError("仅支持 .txt 和 .json")
+            accounts.extend(parsed)
+            errors.extend(found_errors)
+        else:
+            raise ValueError("未知来源")
+    except Exception as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+    accounts, duplicate_errors = _dedupe_preview(accounts)
+    errors.extend(duplicate_errors)
+    if not accounts:
+        return jsonify({"ok": False, "message": "没有可导入的有效账号", "errors": errors[:200]}), 400
+    return jsonify(_store_import_preview(accounts, source, errors))
+
+
+@app.post("/api/import-services/jobs")
+def create_import_job():
+    body = request.get_json(silent=True) or {}
+    preview_id = str(body.get("preview_id") or "")
+    with IMPORT_PREVIEW_LOCK:
+        preview = IMPORT_PREVIEWS.get(preview_id)
+    if not preview or time.time() - float(preview.get("created") or 0) > 1800:
+        return jsonify({"ok": False, "message": "预览已过期，请重新预览来源"}), 409
+    try:
+        job = IMPORT_JOBS.create_job(
+            preview["accounts"],
+            body.get("targets") or [],
+            source=preview["source"],
+            force_refresh=bool(body.get("force_refresh")),
+            allow_marked=bool(body.get("allow_marked")),
+        )
+        return jsonify({"ok": True, "message": "导入任务已创建", "job": job}), 202
+    except Exception as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.get("/api/import-services/jobs")
+def list_import_jobs():
+    return jsonify({"ok": True, "jobs": IMPORT_JOBS.list_jobs()})
+
+
+@app.get("/api/import-services/jobs/<job_id>")
+def get_import_job(job_id: str):
+    job = IMPORT_JOBS.get(job_id)
+    if not job:
+        return jsonify({"ok": False, "message": "任务不存在"}), 404
+    return jsonify({"ok": True, "job": job})
+
+
+@app.post("/api/import-services/jobs/<job_id>/cancel")
+def cancel_import_job(job_id: str):
+    try:
+        return jsonify({"ok": True, "job": IMPORT_JOBS.cancel(job_id)})
+    except KeyError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 404
+
+
+@app.post("/api/import-services/jobs/<job_id>/retry")
+def retry_import_job(job_id: str):
+    try:
+        return jsonify({"ok": True, "message": "重试任务已创建", "job": IMPORT_JOBS.retry(job_id)}), 202
+    except KeyError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 404
+    except Exception as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 409
+
+
+@app.delete("/api/import-services/jobs")
+def clear_import_jobs():
+    count = IMPORT_JOBS.clear_history()
+    return jsonify({"ok": True, "message": f"已清除 {count} 条任务历史", "count": count})
 
 
 def _mark_recent_imported(selected: list[dict] | None, result: dict) -> None:
