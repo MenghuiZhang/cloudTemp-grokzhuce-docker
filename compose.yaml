@@ -1,0 +1,21 @@
+services:
+  grok-web:
+    build:
+      context: .
+    image: cloudtemp-grokzhuce:local
+    container_name: cloudtemp-grokzhuce
+    init: true
+    restart: unless-stopped
+    shm_size: "1gb"
+    ports:
+      - "3333:3333"
+    volumes:
+      - type: bind
+        source: ./.env
+        target: /app/.env
+        bind:
+          create_host_path: false
+      - ./keys:/app/keys
+      - ./logs:/app/logs
+      - ./register_sso:/app/register_sso
+      - ./converted_auth:/app/converted_auth
