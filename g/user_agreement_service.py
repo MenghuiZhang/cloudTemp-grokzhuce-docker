@@ -25,6 +25,7 @@ class UserAgreementService:
         user_agent: Optional[str] = None,
         cf_clearance: Optional[str] = None,
         timeout: int = 15,
+        proxy_spec: str = "",
     ) -> Dict[str, Any]:
         """
         同意 TOS 版本。
@@ -78,6 +79,8 @@ class UserAgreementService:
         )
 
         try:
+            proxy_url = str(proxy_spec or "").strip()
+            proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {"http": "", "https": ""}
             response = requests.post(
                 url,
                 headers=headers,
@@ -85,6 +88,7 @@ class UserAgreementService:
                 data=data,
                 impersonate=impersonate or "chrome120",
                 timeout=timeout,
+                proxies=proxies,
             )
             hex_reply = response.content.hex()
             grpc_status = response.headers.get("grpc-status")

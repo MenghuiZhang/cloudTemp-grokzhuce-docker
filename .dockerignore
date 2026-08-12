@@ -20,6 +20,7 @@ keys
 logs
 register_sso
 converted_auth
+data/proxy_pool.json
 proxies
 proxies*.txt
 *_proxy*.txt

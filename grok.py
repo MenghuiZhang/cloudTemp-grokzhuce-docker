@@ -30,6 +30,7 @@ from g import (
     same_session_register,
     parse_proxy_spec,
 )
+from g.proxy_pool import ProxyLease, get_proxy_pool, parse_proxy_line
 
 try:
     from g import AntibotService
@@ -167,12 +168,55 @@ _SS_RECENT_FP_SIGS: deque = deque(maxlen=48)
 
 
 def _ss_local_proxy_spec() -> str:
-    """Web 同会话代理；GROK_PROXY 为空时显式直连。"""
-    return (
-        os.environ.get("GROK_SAME_SESSION_PROXY")
-        or os.environ.get("GROK_PROXY")
-        or ""
-    ).strip()
+    """仅保留给旧调用方的兼容函数。Web/主 CLI 不再读全局单代理。"""
+    return ""
+
+
+def _proxy_map(proxy_spec: str = "") -> dict[str, str]:
+    raw = str(proxy_spec or "").strip()
+    if not raw:
+        return {"http": "", "https": ""}
+    try:
+        url = parse_proxy_line(raw)["spec"]
+    except Exception:
+        url = raw if "://" in raw else f"http://{raw}"
+    return {"http": url, "https": url}
+
+
+def _is_proxy_network_error(value: object) -> bool:
+    low = str(value or "").lower()
+    return any(
+        marker in low
+        for marker in (
+            "proxy", "socks", "tunnel", "econnreset", "econnrefused",
+            "etimedout", "timed out", "timeout", "curl: (5", "curl: (7",
+            "curl: (28", "curl: (35", "curl: (56", "tls connect",
+            "connection reset", "connection refused", "failed to connect",
+        )
+    )
+
+
+def _safe_to_retry_with_new_proxy(result: dict[str, Any]) -> bool:
+    """只在 signup POST 尚未发生时允许换代理重放。"""
+    if not _is_proxy_network_error(result.get("error")):
+        return False
+    steps = [str(x).lower() for x in (result.get("steps") or [])]
+    return not any(step.startswith("signup") for step in steps)
+
+
+def _protocol_safe_to_retry_with_new_proxy(error: object) -> bool:
+    text = str(error or "")
+    if not _is_proxy_network_error(text):
+        return False
+    low = text.lower()
+    # POST 可能已被服务端接收；这类不确定结果绝不重放。
+    return not any(
+        marker in low
+        for marker in (
+            "提交注册", "注册 http", "set-cookie", "未拿到 sso",
+            "signup", "/sign-up",
+        )
+    )
 
 
 def _ss_fp_sig(fp: dict[str, Any]) -> str:
@@ -536,8 +580,13 @@ def _wait_device_flow_cooldown() -> None:
         time.sleep(min(remain, 120.0))
 
 
-def _proxy_kw() -> dict:
-    """统一代理参数：显式 PROXIES 优先；否则不传，避免误绑死掉的系统代理。"""
+def _proxy_kw(proxy_spec: str | None = None, *, force_direct: bool = False) -> dict:
+    """统一代理参数；账号级显式值优先，空值表示直连。"""
+    if force_direct:
+        return {"proxies": {"http": "", "https": ""}}
+    if proxy_spec is not None:
+        mapped = _proxy_map(proxy_spec)
+        return {"proxies": mapped} if mapped else {"proxies": {"http": "", "https": ""}}
     return {"proxies": PROXIES} if PROXIES else {}
 
 
@@ -624,7 +673,7 @@ def _parse_device_consent_page(html: str, page_url: str = "") -> dict[str, str]:
     return out
 
 
-def _request_device_code(timeout: int = 20) -> dict | None:
+def _request_device_code(timeout: int = 20, *, proxy_spec: str | None = None) -> dict | None:
     """申请 device_code；优先 curl_cffi（与 session 同栈），失败再回落 urllib。"""
     data = {
         "client_id": GROK_CLI_CLIENT_ID,
@@ -648,7 +697,7 @@ def _request_device_code(timeout: int = 20) -> dict | None:
                 headers=headers,
                 impersonate=DEFAULT_IMPERSONATE,
                 timeout=timeout,
-                **_proxy_kw(),
+                **_proxy_kw(proxy_spec),
             )
             if r.status_code == 429 or "rate" in (r.text or "").lower():
                 return {
@@ -663,7 +712,9 @@ def _request_device_code(timeout: int = 20) -> dict | None:
             curl_error = str(e)
             if attempt == 0:
                 time.sleep(0.25)
-    # 回落 urllib
+    # 仅直连时回落 urllib；代理租约不得中途变为直连。
+    if proxy_spec:
+        return {"_error": f"device/code 异常: {curl_error or '代理请求失败'}"}
     try:
         req = urllib.request.Request(
             f"{OIDC_ISSUER}/oauth2/device/code",
@@ -694,6 +745,8 @@ def _poll_device_token(
     interval: int,
     expires_in: int,
     timeout: int = 60,
+    *,
+    proxy_spec: str | None = None,
 ) -> dict | None:
     """
     approve 之后立刻查 token，不再先傻等一个 interval。
@@ -725,7 +778,7 @@ def _poll_device_token(
                 headers=headers,
                 impersonate=DEFAULT_IMPERSONATE,
                 timeout=20,
-                **_proxy_kw(),
+                **_proxy_kw(proxy_spec),
             )
             body_text = r.text or ""
             try:
@@ -817,6 +870,7 @@ def sso_device_flow_to_token(
     impersonate: str | None = None,
     timeout: int = 28,
     issue_token: bool | None = None,
+    proxy_spec: str | None = None,
 ) -> dict[str, Any]:
     """
     与 grokcli-2api sso_to_auth_json.sso_to_token 同路径：
@@ -840,7 +894,7 @@ def sso_device_flow_to_token(
 
     do_token = DEVICE_FLOW_ISSUE_TOKEN if issue_token is None else bool(issue_token)
     payload = decode_jwt_payload(s)
-    proxy_kw = _proxy_kw()
+    proxy_kw = _proxy_kw(proxy_spec)
 
     # 指纹列表：调用方指定的优先，再轮换稳妥指纹
     fps: list[str] = []
@@ -899,7 +953,7 @@ def sso_device_flow_to_token(
                     "payload": payload,
                 }
 
-            dc = _request_device_code(timeout=max(15, int(timeout)))
+            dc = _request_device_code(timeout=max(15, int(timeout)), proxy_spec=proxy_spec)
             if not dc or dc.get("_error"):
                 last_err = (dc or {}).get("_error") or "device/code 申请失败"
                 if _device_flow_error_kind(last_err) == "rate_limited":
@@ -1086,6 +1140,7 @@ def sso_device_flow_to_token(
                 int(dc.get("interval") or 5),
                 int(dc.get("expires_in") or 1800),
                 timeout=45,
+                proxy_spec=proxy_spec,
             )
             if isinstance(token, dict) and token.get("_error"):
                 last_err = (
@@ -1149,6 +1204,7 @@ def validate_sso_cookie(
     require_device_flow: bool = True,
     retries: int = 2,
     issue_token: bool | None = None,
+    proxy_spec: str | None = None,
 ) -> dict[str, Any]:
     """
     校验换到的 sso 是否真正可导入上游。
@@ -1175,7 +1231,7 @@ def validate_sso_cookie(
                 "https://accounts.x.ai/",
                 timeout=timeout,
                 allow_redirects=True,
-                **_proxy_kw(),
+                **_proxy_kw(proxy_spec),
             )
             final_url = (r.url or "").lower()
             if "sign-in" in final_url or "sign-up" in final_url:
@@ -1194,6 +1250,7 @@ def validate_sso_cookie(
             impersonate=None,  # 内部轮换稳妥指纹
             timeout=max(int(timeout or 20), 28),
             issue_token=issue_token,
+            proxy_spec=proxy_spec,
         )
         if result.get("ok"):
             return result
@@ -1321,6 +1378,7 @@ class RegisterEngine:
         self._run_lock = threading.Lock()
         self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._worker_thread: Optional[threading.Thread] = None
+        self.proxy_pool = get_proxy_pool(_BASE_DIR)
         # 注册 POST 起步节流（不包整次 HTTP，允许多线程并行飞）
         self._post_min_interval = 0.25
         self._last_post_start = 0.0
@@ -1723,6 +1781,7 @@ class RegisterEngine:
         *,
         already_written: bool = False,
         auth_token: Optional[dict] = None,
+        proxy_audit: Optional[dict] = None,
     ) -> str:
         """
         写入 SSO 并计入成功。返回 success_id（空串表示未计入成功列表）。
@@ -1779,7 +1838,9 @@ class RegisterEngine:
 
             # already_written 只表示 TXT 已由紧急落盘写过；JSON 使用 upsert，
             # 因此这里始终再保证一次，避免任一旧调用路径漏掉结构化输出。
-            self._write_account_json_unlocked(email=email, sso=sso, **email_meta)
+            self._write_account_json_unlocked(
+                email=email, sso=sso, proxy_audit=proxy_audit, **email_meta
+            )
 
             self.success_count += 1
             avg = (time.time() - self.start_time) / max(1, self.success_count)
@@ -1789,8 +1850,7 @@ class RegisterEngine:
             if isinstance(auth_token, dict) and is_auth_token_usable(auth_token):
                 cached_token = dict(auth_token)
             success_id = f"{int(time.time() * 1000)}_{self.success_count}"
-            self.recent_success.appendleft(
-                {
+            success_item = {
                     "id": success_id,
                     "email": email,
                     "sso": sso,
@@ -1803,7 +1863,9 @@ class RegisterEngine:
                     "email_provider": email_meta.get("email_provider") or "",
                     "email_domain": email_meta.get("email_domain") or "",
                 }
-            )
+            if proxy_audit:
+                success_item.update(dict(proxy_audit))
+            self.recent_success.appendleft(success_item)
             extra = f" | {note}" if note else ""
             attempts = int(getattr(self, "attempt_count", 0) or 0)
             self.log(
@@ -1922,6 +1984,7 @@ class RegisterEngine:
         user_id: str = "",
         email_provider: str = "",
         email_domain: str = "",
+        proxy_audit: Optional[dict] = None,
     ) -> bool:
         """调用方持有 file_lock 时，按邮箱/SSO upsert 一条账号记录。"""
         path = self._accounts_json_path()
@@ -1969,6 +2032,14 @@ class RegisterEngine:
             record["email_provider"] = resolved_provider
         if resolved_domain:
             record["email_domain"] = resolved_domain
+        old_proxy = {
+            key: (found or {}).get(key)
+            for key in ("proxy_mode", "proxy_id", "proxy", "proxy_egress", "proxy_region")
+            if (found or {}).get(key) not in (None, "")
+        }
+        for key, value in (proxy_audit or old_proxy).items():
+            if key in ("proxy_mode", "proxy_id", "proxy", "proxy_egress", "proxy_region") and value not in (None, ""):
+                record[key] = value
         if found is None:
             accounts.append(record)
         else:
@@ -2000,6 +2071,7 @@ class RegisterEngine:
         user_id: str = "",
         email_provider: str = "",
         email_domain: str = "",
+        proxy_audit: Optional[dict] = None,
     ) -> bool:
         with self.file_lock:
             return self._write_account_json_unlocked(
@@ -2008,6 +2080,7 @@ class RegisterEngine:
                 user_id=user_id,
                 email_provider=email_provider,
                 email_domain=email_domain,
+                proxy_audit=proxy_audit,
             )
 
     def _probe_and_mark_clean(
@@ -2029,37 +2102,20 @@ class RegisterEngine:
             if AntibotService is None:
                 self.log(f"{email} risk 跳过：AntibotService 不可用", "warn")
                 return None
-            # 探测走业务代理（与注册出口一致）
-            if proxy_spec:
-                url = ""
-                try:
-                    parsed = parse_proxy_spec(proxy_spec) or {}
-                    url = (
-                        parsed.get("server_url")
-                        or parsed.get("server")
-                        or ""
-                    )
-                except Exception:
-                    url = ""
-                if not url:
-                    raw = (proxy_spec or "").strip()
-                    if raw.startswith("http://") or raw.startswith("https://") or raw.startswith("socks"):
-                        url = raw
-                    elif raw:
-                        url = f"http://{raw}"
-                if url:
-                    os.environ["GROK_PROXY"] = url
-                    os.environ["XAI_PROXY"] = url
             self.log(f"{email} risk 探测开始…", "info")
             t0 = time.time()
             ab = AntibotService()
             # chrome124 经本地代理稳；chrome131 易 curl(35) OPENSSL invalid library
             # probe 内部：多 impersonate + 代理失败后直连兜底
             risk = ab.probe_account_risk(
-                sso, sso_rw=sso_rw or sso, impersonate="chrome124", timeout=20
+                sso,
+                sso_rw=sso_rw or sso,
+                impersonate="chrome124",
+                timeout=20,
+                proxy_spec=proxy_spec,
             )
-            # 仍基建失败：强制直连再打一轮（绕开 7897 TLS 抖动）
-            if AntibotService.is_risk_infra_error(risk):
+            # 直连模式保留稳妥指纹重试；有租约时不得换出口。
+            if not proxy_spec and AntibotService.is_risk_infra_error(risk):
                 self.log(
                     f"{email} risk 基建抖动 · {AntibotService.risk_mark_summary(risk)[:80]} · 直连重试…",
                     "warn",
@@ -2073,6 +2129,7 @@ class RegisterEngine:
                         sso_rw=sso_rw or sso,
                         impersonate="chrome124",
                         timeout=25,
+                        proxy_spec="",
                     )
                 finally:
                     if prev_force is None:
@@ -2223,6 +2280,7 @@ class RegisterEngine:
         user_agent: str = "",
         retries: int = 3,
         async_mode: bool = False,
+        proxy_spec: str = "",
     ) -> Optional[dict]:
         """
         换 token（device flow 发票）。
@@ -2246,6 +2304,7 @@ class RegisterEngine:
                 retries=max(1, int(retries or 3)),
                 timeout=28,
                 issue_token=True,
+                proxy_spec=proxy_spec,
             )
             elapsed = round(time.time() - t0, 1)
             if check.get("ok") and isinstance(check.get("token"), dict):
@@ -2309,6 +2368,7 @@ class RegisterEngine:
         impersonate: str,
         user_agent: str,
         skip_token: bool = False,
+        proxy_lease: Optional[ProxyLease] = None,
     ) -> None:
         """
         SSO 后后台收尾（enrich 池，不堵注册主路径）：
@@ -2331,6 +2391,7 @@ class RegisterEngine:
                     impersonate=impersonate or "chrome131",
                     user_agent=user_agent or "",
                     async_mode=True,
+                    proxy_spec=(proxy_lease.spec if proxy_lease else ""),
                 )
                 if isinstance(auth_token, dict) and is_auth_token_usable(auth_token):
                     note_parts.append("token=async_cached")
@@ -2346,6 +2407,7 @@ class RegisterEngine:
                     sso_rw=sso_rw or "",
                     impersonate=impersonate,
                     user_agent=user_agent,
+                    proxy_spec=(proxy_lease.spec if proxy_lease else ""),
                 )
                 tos_hex = tos_result.get("hex_reply") or ""
                 if not tos_result.get("ok") or not tos_hex:
@@ -2358,6 +2420,7 @@ class RegisterEngine:
                         sso_rw=sso_rw or "",
                         impersonate=impersonate,
                         user_agent=user_agent,
+                        proxy_spec=(proxy_lease.spec if proxy_lease else ""),
                     )
                     nsfw_hex = nsfw_result.get("hex_reply") or ""
                     if not nsfw_result.get("ok") or not nsfw_hex:
@@ -2365,7 +2428,9 @@ class RegisterEngine:
                             f"NSFW失败: {nsfw_result.get('error') or nsfw_result}"
                         )
                     else:
-                        unhinged_result = nsfw_service.enable_unhinged(sso)
+                        unhinged_result = nsfw_service.enable_unhinged(
+                            sso, proxy_spec=(proxy_lease.spec if proxy_lease else "")
+                        )
                         unhinged_ok = unhinged_result.get("ok", False)
                         if not unhinged_ok:
                             note_parts.append("unhinged失败")
@@ -2388,6 +2453,8 @@ class RegisterEngine:
         except Exception as e:
             self.log(f"{email} [后台] enrich 异常: {e}", "warn")
         finally:
+            if proxy_lease is not None:
+                self.proxy_pool.release(proxy_lease, "success")
             with self._enrich_lock:
                 self._enrich_pending = max(0, self._enrich_pending - 1)
 
@@ -2401,6 +2468,7 @@ class RegisterEngine:
         impersonate: str,
         user_agent: str,
         skip_token: bool = False,
+        proxy_lease: Optional[ProxyLease] = None,
     ) -> None:
         with self._enrich_lock:
             self._enrich_pending += 1
@@ -2414,8 +2482,11 @@ class RegisterEngine:
                 impersonate=impersonate,
                 user_agent=user_agent,
                 skip_token=skip_token,
+                proxy_lease=proxy_lease,
             )
         except Exception as e:
+            if proxy_lease is not None:
+                self.proxy_pool.release(proxy_lease, "success", str(e))
             with self._enrich_lock:
                 self._enrich_pending = max(0, self._enrich_pending - 1)
             self.log(f"{email} 调度后台 enrich 失败: {e}", "warn")
@@ -2438,7 +2509,6 @@ class RegisterEngine:
             return
 
         site_key = self.config.get("site_key") or "0x4AAAAAAAhr9JGVDZbrZOo0"
-        proxy_spec_str = _ss_local_proxy_spec()
         current_email = None
         # 数量 N = 创建 N 个邮箱就停（对齐 standalone COUNT）
         # 不再「凑满 N 个 CLEAN 无限补」；失败/MARKED 也各占 1 次创邮额度
@@ -2448,7 +2518,7 @@ class RegisterEngine:
         self.log(
             f"same_session · 数量={max_attempts}（按创邮次数停）"
             f" · 连续MARKED熔断={deny_break_n or 'off'}"
-            f" · 代理={proxy_spec_str or '直连'}",
+            f" · 代理池={self.proxy_pool.summary().get('enabled', 0)} 条",
             "info",
         )
 
@@ -2491,6 +2561,8 @@ class RegisterEngine:
                     return
             fp = _ss_pick_fp(idx)
             email = None
+            proxy_lease: Optional[ProxyLease] = None
+            proxy_handed_off = False
             try:
                 # 每号开始：force 清本线程 Playwright loop，防池线程复用脏 loop
                 try:
@@ -2574,17 +2646,45 @@ class RegisterEngine:
                     target=_ts_prewarm, daemon=True, name=f"ss-ts-{idx}"
                 ).start()
 
+                proxy_lease = self.proxy_pool.acquire(
+                    f"attempt-{idx}", stop_event=self.stop_event, wait=True
+                )
+                if proxy_lease is None:
+                    return
+                if hasattr(email_service, "set_register_proxy"):
+                    email_service.set_register_proxy(proxy_lease.spec)
+                if self.proxy_pool.settings().get("align_geo"):
+                    geo = self.proxy_pool.lease_geo(proxy_lease)
+                    cc = str(geo.get("cc") or "").upper()
+                    matched = [
+                        row for row in _SS_FP_REGIONS
+                        if str(row.get("tag") or "").split("-", 1)[0] == cc
+                    ]
+                    if matched:
+                        region_fp = random.choice(matched)
+                        fp["tag"] = str(region_fp.get("tag") or fp.get("tag"))
+                        fp["locale"] = str(region_fp.get("locale") or fp.get("locale"))
+                        fp["timezone"] = str(geo.get("timezone") or region_fp.get("timezone") or fp.get("timezone"))
+
                 try:
                     _jwt, email = email_service.create_email()
                     current_email = email
                 except Exception as e:
                     # 未真正建邮成功：不占创邮额度、不记过程失败
                     self.log(f"邮箱服务异常（未建邮）: {e}", "warn")
+                    self.proxy_pool.release(
+                        proxy_lease,
+                        "network" if _is_proxy_network_error(e) else "failure",
+                        str(e),
+                    )
+                    proxy_lease = None
                     if self._sleep(2):
                         return
                     continue
                 if not email:
                     self.log("创建邮箱失败（未建邮）", "warn")
+                    self.proxy_pool.release(proxy_lease, "failure", "create email failed")
+                    proxy_lease = None
                     if self._sleep(1):
                         return
                     continue
@@ -2593,6 +2693,12 @@ class RegisterEngine:
                     self.attempt_count = int(self.attempt_count or 0) + 1
                     attempt_i = self.attempt_count
                 email_meta = email_service.get_email_metadata(email)
+                proxy_spec_str = proxy_lease.spec
+                self.log(
+                    f"{email} 分配代理 "
+                    f"{'直连' if proxy_lease.direct else proxy_lease.proxy_id[:8] + ' ' + proxy_lease.masked}",
+                    "info",
+                )
                 # 注意：额度已占就绝不能因 stop_event 直接删邮 return。
                 # 其它线程「创邮达量」停批时，本号必须继续跑完 risk/落盘。
 
@@ -2660,25 +2766,53 @@ class RegisterEngine:
                 def _ss_log_msg(msg: str) -> None:
                     self.log(f"{email} {msg}", "info")
 
-                ss = same_session_register(
-                    email=email,
-                    password=password,
-                    given_name=given,
-                    family_name=family,
-                    fetch_code=fetch_code,
-                    turnstile_token=pre_token,
-                    solve_turnstile=solve_ts,
-                    headless=None,
-                    browser="camoufox",
-                    proxy=proxy_spec_str,
-                    locale=fp["locale"],
-                    timezone_id=fp["timezone"],
-                    fp_os=fp["fp_os"],
-                    timing=fp["timing"],
-                    viewport=fp["viewport"],
-                    humanize=fp.get("humanize", False),
-                    log=_ss_log_msg,
-                )
+                attempted_proxy_ids: set[str] = set()
+                ss: dict[str, Any] = {}
+                for proxy_try in range(1, 4):
+                    if proxy_lease is None:
+                        break
+                    if not proxy_lease.direct:
+                        attempted_proxy_ids.add(proxy_lease.proxy_id)
+                    proxy_spec_str = proxy_lease.spec
+                    ss = same_session_register(
+                        email=email,
+                        password=password,
+                        given_name=given,
+                        family_name=family,
+                        fetch_code=fetch_code,
+                        turnstile_token=pre_token,
+                        solve_turnstile=solve_ts,
+                        headless=None,
+                        browser="camoufox",
+                        proxy=proxy_spec_str,
+                        locale=fp["locale"],
+                        timezone_id=fp["timezone"],
+                        fp_os=fp["fp_os"],
+                        timing=fp["timing"],
+                        viewport=fp["viewport"],
+                        humanize=fp.get("humanize", False),
+                        log=_ss_log_msg,
+                    )
+                    err_now = ss.get("error") or ""
+                    if ss.get("ok") or not _safe_to_retry_with_new_proxy(ss) or proxy_lease.direct:
+                        break
+                    self.proxy_pool.release(proxy_lease, "network", str(err_now))
+                    proxy_lease = self.proxy_pool.acquire(
+                        email,
+                        stop_event=self.stop_event,
+                        exclude=attempted_proxy_ids,
+                        wait=False,
+                    )
+                    if proxy_lease is None:
+                        self.log(f"{email} 无新的健康代理可重试", "warn")
+                        break
+                    if hasattr(email_service, "set_register_proxy"):
+                        email_service.set_register_proxy(proxy_lease.spec)
+                    self.log(
+                        f"{email} 代理网络故障，改用 {proxy_lease.proxy_id[:8]} "
+                        f"重新发码（{proxy_try + 1}/3）",
+                        "warn",
+                    )
 
                 # 注意：创邮达量会 set stop_event，但本号若已在飞（甚至已拿 SSO）
                 # 绝不能直接 return 丢号。先看结果，有 SSO 必须走 risk/落盘。
@@ -2699,6 +2833,13 @@ class RegisterEngine:
                     self._fail_account(
                         email_service, email, f"{email} same_session 失败: {err}"
                     )
+                    if proxy_lease is not None:
+                        self.proxy_pool.release(
+                            proxy_lease,
+                            "network" if _is_proxy_network_error(err) else "failure",
+                            str(err),
+                        )
+                        proxy_lease = None
                     current_email = None
                     # 已停批且本号失败：本线程退出（别再开新邮）
                     if stopped_mid:
@@ -2716,6 +2857,9 @@ class RegisterEngine:
                     self._fail_account(
                         email_service, email, f"{email} same_session 无 sso"
                     )
+                    if proxy_lease is not None:
+                        self.proxy_pool.release(proxy_lease, "failure", "no sso")
+                        proxy_lease = None
                     current_email = None
                     if stopped_mid:
                         return
@@ -2768,6 +2912,9 @@ class RegisterEngine:
                     # MARKED / 探测失败：已写 _marked，不进成功列表、不换票、不入库
                     # MARKED 只记 marked_count，不再叠 fail_count（避免「目标5却失败7」误解）
                     if clean is False:
+                        if proxy_lease is not None:
+                            self.proxy_pool.release(proxy_lease, "marked", "risk MARKED")
+                            proxy_lease = None
                         callback = getattr(self, "auto_import_callback", None)
                         if callable(callback):
                             try:
@@ -2807,6 +2954,9 @@ class RegisterEngine:
                             self.stop_event.set()
                             return
                     else:
+                        if proxy_lease is not None:
+                            self.proxy_pool.release(proxy_lease, "network", "risk infra")
+                            proxy_lease = None
                         reason = f"{email} risk 探测失败，绕过成功列表与导入"
                         self._fail_account(
                             email_service, email, reason, level="warn"
@@ -2838,6 +2988,7 @@ class RegisterEngine:
                     ),
                     already_written=False,
                     auth_token=None,
+                    proxy_audit=self.proxy_pool.lease_audit(proxy_lease),
                 )
                 if sid:
                     self._update_success_meta(
@@ -2856,19 +3007,35 @@ class RegisterEngine:
                         impersonate="chrome131",
                         user_agent=ua,
                         skip_token=False,
+                        proxy_lease=proxy_lease,
                     )
+                    proxy_handed_off = proxy_lease is not None
+                    proxy_lease = None
                 elif stopped_mid:
                     # 目标已满但仍拿到 CLEAN SSO：_record_success 已写 emergency
                     self.log(
                         f"{email} CLEAN 但目标已满 · SSO 已进 emergency（不进成功列表）",
                         "warn",
                     )
+                    if proxy_lease is not None:
+                        self.proxy_pool.release(proxy_lease, "success")
+                        proxy_lease = None
+                elif proxy_lease is not None:
+                    self.proxy_pool.release(proxy_lease, "success")
+                    proxy_lease = None
                 current_email = None
                 # 停批后本号收尾完，退出；不 continue 再开新邮
                 if stopped_mid or self.stop_event.is_set():
                     return
                 continue
             except Exception as e:
+                if proxy_lease is not None and not proxy_handed_off:
+                    self.proxy_pool.release(
+                        proxy_lease,
+                        "network" if _is_proxy_network_error(e) else "failure",
+                        str(e),
+                    )
+                    proxy_lease = None
                 if self.stop_event.is_set():
                     if current_email:
                         try:
@@ -2909,12 +3076,41 @@ class RegisterEngine:
             return
 
         current_email = None
+        protocol_retry: Optional[dict[str, Any]] = None
 
         # 失败只丢弃当前账号；未达目标则继续开新邮箱，直到目标或用户停止
         while not self.stop_event.is_set() and self.success_count < self.target_count:
+            proxy_lease: Optional[ProxyLease] = self.proxy_pool.acquire(
+                str((protocol_retry or {}).get("email") or f"protocol-{uuid.uuid4().hex[:12]}"),
+                stop_event=self.stop_event,
+                exclude=set((protocol_retry or {}).get("attempted_proxy_ids") or set()),
+                wait=protocol_retry is None,
+            )
+            proxy_handed_off = False
+            proxy_outcome = "failure"
+            if proxy_lease is None:
+                if protocol_retry is not None:
+                    self._fail_account(
+                        email_service,
+                        str(protocol_retry.get("email") or ""),
+                        f"{protocol_retry.get('email')} 无新的健康代理可重试",
+                    )
+                    protocol_retry = None
+                    current_email = None
+                    continue
+                return
+            if protocol_retry is not None and not proxy_lease.direct:
+                attempted = set(protocol_retry.get("attempted_proxy_ids") or set())
+                attempted.add(proxy_lease.proxy_id)
+                protocol_retry["attempted_proxy_ids"] = attempted
             try:
+                if hasattr(email_service, "set_register_proxy"):
+                    email_service.set_register_proxy(proxy_lease.spec)
                 impersonate_fingerprint, account_user_agent = get_random_chrome_profile()
-                with requests.Session(impersonate=impersonate_fingerprint, proxies=PROXIES) as session:
+                with requests.Session(
+                    impersonate=impersonate_fingerprint,
+                    proxies=_proxy_map(proxy_lease.spec),
+                ) as session:
                     try:
                         session.get(self.site_url, timeout=8)
                     except Exception:
@@ -2923,7 +3119,7 @@ class RegisterEngine:
                     if self.stop_event.is_set():
                         return
 
-                    password = generate_random_string()
+                    password = str((protocol_retry or {}).get("password") or generate_random_string())
 
                     # 硬规则：Solver 不在线绝不创建邮箱，避免解不出验证码白耗配额
                     if not (turnstile_service.yescaptcha_key or "").strip():
@@ -2949,30 +3145,44 @@ class RegisterEngine:
                                 return
                             continue
 
-                    try:
-                        jwt, email = email_service.create_email()
+                    if protocol_retry is not None:
+                        jwt = protocol_retry.get("jwt")
+                        email = str(protocol_retry.get("email") or "")
                         current_email = email
-                    except Exception as e:
-                        self._fail_account(
-                            email_service, None, f"邮箱服务异常: {e}"
+                        self.log(
+                            f"{email} 旧协议路径改用新代理重新发码 "
+                            f"({len(protocol_retry.get('attempted_proxy_ids') or [])}/3)",
+                            "warn",
                         )
-                        # 邮箱服务抖动：稍等再试，不整任务退出
-                        if self._sleep(2):
-                            return
-                        continue
+                    else:
+                        try:
+                            jwt, email = email_service.create_email()
+                            current_email = email
+                        except Exception as e:
+                            self._fail_account(
+                                email_service, None, f"邮箱服务异常: {e}"
+                            )
+                            # 邮箱服务抖动：稍等再试，不整任务退出
+                            if self._sleep(2):
+                                return
+                            continue
 
-                    if not email:
-                        self._fail_account(email_service, None, "创建邮箱失败")
-                        if self._sleep(1):
-                            return
-                        continue
+                        if not email:
+                            self._fail_account(email_service, None, "创建邮箱失败")
+                            if self._sleep(1):
+                                return
+                            continue
 
                     if self.stop_event.is_set():
                         email_service.delete_email(email)
                         current_email = None
                         return
 
-                    email_meta = email_service.get_email_metadata(email)
+                    email_meta = (
+                        dict(protocol_retry.get("email_meta") or {})
+                        if protocol_retry is not None
+                        else email_service.get_email_metadata(email)
+                    )
                     self.log(
                         f"开始注册: {email} · {email_meta.get('email_provider') or '?'} / "
                         f"{email_meta.get('email_domain') or '?'}",
@@ -3262,6 +3472,7 @@ class RegisterEngine:
                             note="enrich=pending",
                             already_written=sso_saved,
                             auth_token=None,
+                            proxy_audit=self.proxy_pool.lease_audit(proxy_lease),
                         )
                         if sid:
                             self._schedule_enrich(
@@ -3271,10 +3482,14 @@ class RegisterEngine:
                                 success_id=sid,
                                 impersonate=impersonate_fingerprint,
                                 user_agent=account_user_agent,
+                                proxy_lease=proxy_lease,
                             )
+                            proxy_handed_off = True
                         # SSO 已在盘上：无论是否计入目标，都算本邮箱完成
                         current_email = None
                         signup_ok = True
+                        proxy_outcome = "success"
+                        protocol_retry = None
                         break
 
                     if not signup_ok:
@@ -3287,11 +3502,36 @@ class RegisterEngine:
                                 current_email = None
                             return
                         detail = last_turnstile_err or "Turnstile/注册失败"
+                        if _is_proxy_network_error(detail):
+                            proxy_outcome = "network"
+                        attempted_ids = set((protocol_retry or {}).get("attempted_proxy_ids") or set())
+                        if not proxy_lease.direct:
+                            attempted_ids.add(proxy_lease.proxy_id)
+                        if (
+                            not proxy_lease.direct
+                            and len(attempted_ids) < 3
+                            and _protocol_safe_to_retry_with_new_proxy(detail)
+                        ):
+                            protocol_retry = {
+                                "email": email,
+                                "jwt": jwt,
+                                "password": password,
+                                "email_meta": email_meta,
+                                "attempted_proxy_ids": attempted_ids,
+                            }
+                            current_email = email
+                            self.log(
+                                f"{email} 代理网络故障（signup 尚未提交）· "
+                                "保留邮箱并换代理重新发码",
+                                "warn",
+                            )
+                            continue
                         self._fail_account(
                             email_service,
                             email,
                             f"{email} 重试 3 次后仍失败（{detail}）",
                         )
+                        protocol_retry = None
                         current_email = None
                         # 本账号失败，继续下一封新邮箱，不结束整任务
                         continue
@@ -3300,6 +3540,8 @@ class RegisterEngine:
                     continue
 
             except Exception as e:
+                if _is_proxy_network_error(e):
+                    proxy_outcome = "network"
                 if self.stop_event.is_set():
                     if current_email:
                         try:
@@ -3316,6 +3558,15 @@ class RegisterEngine:
                 if self._sleep(1):
                     return
                 continue
+            finally:
+                if proxy_lease is not None and not proxy_handed_off:
+                    self.proxy_pool.release(proxy_lease, proxy_outcome)
+
+        if protocol_retry is not None and current_email:
+            try:
+                email_service.delete_email(current_email)
+            except Exception:
+                pass
 
     def _run_workers(self, workers: int):
         try:

@@ -420,7 +420,7 @@
                 <div class="flex justify-between gap-2"><span>邮箱配置</span><a href="/email-settings" id="envToken" class="font-mono text-brand-600">打开</a></div>
                 <div class="flex justify-between gap-2"><span>验证码</span><span id="envYes" class="font-mono text-ink-800">—</span></div>
                 <div class="flex justify-between gap-2"><span>Solver URL</span><span id="envSolver" class="font-mono text-brand-600">—</span></div>
-                <div class="flex justify-between gap-2"><span>注册代理</span><span id="envProxy" class="font-mono text-ink-800 truncate max-w-[58%] text-right">—</span></div>
+                <div class="flex justify-between gap-2"><span>注册代理</span><a href="/proxy-settings" id="envProxy" class="font-mono text-brand-600 truncate max-w-[58%] text-right">打开</a></div>
                 <div class="flex justify-between gap-2"><span>导入服务</span><a href="/import-services" class="font-mono text-brand-600">打开</a></div>
               </div>
 
@@ -549,24 +549,7 @@
                 </div>
                 </div>
 
-                <!-- 2. 代理 -->
-                <div class="cfg-block">
-                  <h3 class="cfg-title">注册代理</h3>
-                  <div>
-                    <label class="field-label" for="cfgProxy">GROK_PROXY</label>
-                    <input id="cfgProxy" type="text" class="field font-mono text-sm" placeholder="空=直连 · 127.0.0.1:7897" autocomplete="off" spellcheck="false" />
-                    <p class="hint">host:port · http/socks5:// · user:pass@host:port · host:port:user:pass</p>
-                    <div class="mt-1.5 flex items-start gap-2">
-                      <button type="button" id="btnProxyTest" class="btn btn-ghost text-[11px] px-2.5 py-1 shrink-0">测试代理</button>
-                      <div class="flex-1 min-w-0 space-y-0.5">
-                        <p id="proxyEgressLine" class="text-[11px] font-mono leading-snug text-ink-700/45 break-all hidden"></p>
-                        <p id="proxyTestMessage" class="text-[11px] font-mono leading-snug text-ink-700/50 break-all"></p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-
-                <!-- 3. Solver -->
+                <!-- 2. Solver -->
                 <div class="cfg-block">
                   <h3 class="cfg-title">Turnstile / Solver</h3>
                   <div>
@@ -1130,23 +1113,9 @@
         $('envYes').className = 'font-mono text-ink-800';
         $('envSolver').textContent = data.env.solver_url || 'http://127.0.0.1:5072';
         if ($('envProxy')) {
-          const px = (data.env.grok_proxy || '').trim();
-          if (px) {
-            // 侧栏脱敏：有账号只显示 host 段
-            let show = px;
-            try {
-              if (px.includes('@')) show = px.split('@').pop();
-              else if ((px.match(/:/g) || []).length >= 3) {
-                const parts = px.split(':');
-                show = parts.slice(0, 2).join(':') + ':***';
-              }
-            } catch (_) {}
-            $('envProxy').textContent = show;
-            $('envProxy').className = 'font-mono truncate max-w-[58%] text-right text-leaf-600';
-          } else {
-            $('envProxy').textContent = '直连';
-            $('envProxy').className = 'font-mono truncate max-w-[58%] text-right text-ink-700/55';
-          }
+          const ps = data.proxy_pool || data.env.proxy_pool || {};
+          $('envProxy').textContent = Number(ps.total || 0) ? `${ps.enabled || 0}/${ps.total} 条` : '直连 · 配置';
+          $('envProxy').className = 'font-mono truncate max-w-[58%] text-right text-brand-600';
         }
       }
 
@@ -1366,7 +1335,6 @@
         solverBrowserSelect._setValue(c.SOLVER_BROWSER || 'camoufox', true);
         $('cfgUiHost').value = c.UI_HOST || '127.0.0.1';
         $('cfgUiPort').value = c.UI_PORT || '3333';
-        if ($('cfgProxy')) $('cfgProxy').value = c.GROK_PROXY || '';
         const mode = c.YESCAPTCHA_KEY ? 'yescaptcha' : 'local';
         captchaSelect._setValue(mode, true);
         $('yesCaptchaBlock').classList.toggle('hidden', mode !== 'yescaptcha');
@@ -1478,7 +1446,6 @@
         SOLVER_THREADS: $('cfgSolverThreads').value.trim() || '2',
         UI_HOST: $('cfgUiHost').value.trim() || '127.0.0.1',
         UI_PORT: $('cfgUiPort').value.trim() || '3333',
-        GROK_PROXY: ($('cfgProxy') && $('cfgProxy').value.trim()) || '',
         captcha_mode: captchaMode,
       };
       setMessage($('configMessage'), '保存中...', true);
@@ -1572,8 +1539,7 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            // 用输入框当前值（可先测再保存）；空=直连
-            GROK_PROXY: ($('cfgProxy') && $('cfgProxy').value.trim()) || '',
+            proxy: '',
           }),
         });
         _paintProxyEgress(data);

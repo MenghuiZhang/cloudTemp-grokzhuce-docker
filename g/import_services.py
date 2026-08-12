@@ -346,14 +346,12 @@ class ImportConfigStore:
 
 
 def _proxy_kwargs(service: dict, register_proxy: str = "") -> dict:
-    mode = str(service.get("proxy_mode") or "direct")
-    value = ""
-    if mode == "custom":
-        value = str(service.get("proxy_url") or "").strip()
-    elif mode == "register":
-        value = str(register_proxy or "").strip()
-    proxies = {"http": value, "https": value} if value else {}
-    return {"proxies": proxies, "verify": bool(service.get("tls_verify", True))}
+    # 已确认的运行规则：下游测试/换票/上传强制直连，
+    # 不得复用注册代理，也不继承系统环境代理。
+    return {
+        "proxies": {"http": "", "https": ""},
+        "verify": bool(service.get("tls_verify", True)),
+    }
 
 
 class ImportTargets:

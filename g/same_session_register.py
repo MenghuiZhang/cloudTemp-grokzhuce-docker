@@ -47,6 +47,19 @@ from .castle_service import (
 _BASE = Path(__file__).resolve().parents[1]
 DEFAULT_PROFILE_ROOT = _BASE / "logs" / "same_session_profiles"
 
+
+def _browser_env_without_proxies() -> dict[str, str]:
+    env = dict(os.environ)
+    for key in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+        "GROK_PROXY", "XAI_PROXY", "SAME_SESSION_PROXY",
+    ):
+        env.pop(key, None)
+    env["NO_PROXY"] = "*"
+    env["no_proxy"] = "*"
+    return env
+
 # 日志里别再喷 JWT / Playwright Call log
 _JWT_RE = re.compile(
     r"eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{8,}"
@@ -268,7 +281,12 @@ def _acquire_camoufox_pooled(
     device_fp：WebGL/屏幕/CPU/媒体等设备上下文（一号一换）。
     """
     proxy_server = (pw_proxy or {}).get("server") if pw_proxy else None
-    proxy_s = (proxy_server or "direct").strip()
+    if pw_proxy:
+        from .proxy_pool import proxy_identity
+
+        proxy_s = proxy_identity(json.dumps(pw_proxy, sort_keys=True, ensure_ascii=False))
+    else:
+        proxy_s = "direct"
     lang_pack = locale_language_pack(locale)
     locale = lang_pack["locale"]
     al_header = (accept_language or lang_pack["accept_language"]).strip()
@@ -399,6 +417,7 @@ def _acquire_camoufox_pooled(
         "block_webrtc": True,
         "block_webgl": False,
     }
+    fox_kwargs["env"] = _browser_env_without_proxies()
     # 富设备指纹：WebGL / screen / hardware / media / canvas / audio
     try:
         fox_kwargs.update(device_fp_camoufox_kwargs(device_fp))
@@ -709,6 +728,8 @@ def parse_proxy_spec(spec: str) -> Optional[dict[str, str]]:
 
     # 完整 URL
     if "://" in s:
+        from urllib.parse import unquote
+
         # http://user:pass@host:port
         m = re.match(
             r"^(?P<scheme>https?|socks5h?|socks4)://"
@@ -724,8 +745,8 @@ def parse_proxy_spec(spec: str) -> Optional[dict[str, str]]:
             m.group("scheme"),
             m.group("host"),
             m.group("port"),
-            m.group("user") or "",
-            m.group("pass") or "",
+            unquote(m.group("user") or ""),
+            unquote(m.group("pass") or ""),
         )
 
     # user:pass@host:port
@@ -2070,27 +2091,9 @@ def same_session_register(
     profile_dir.mkdir(parents=True, exist_ok=True)
     out["profile"] = str(profile_dir)
 
-    # 只清系统杂代理，保留 GROK_PROXY/XAI_PROXY（多账号时下一号还要用）
-    _saved_biz = {
-        k: os.environ.get(k)
-        for k in ("GROK_PROXY", "XAI_PROXY", "SAME_SESSION_PROXY")
-        if os.environ.get(k)
-    }
-    for k in (
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ):
-        os.environ.pop(k, None)
-    # Playwright 走 launch_kwargs.proxy，进程级业务代理先摘掉避免双重代理
-    for k in ("GROK_PROXY", "XAI_PROXY", "SAME_SESSION_PROXY"):
-        os.environ.pop(k, None)
-    os.environ["NO_PROXY"] = "*"
-    os.environ["no_proxy"] = "*"
-    out["steps"].append("env:clear_sys_proxy")
+    # 代理只通过 launch_kwargs.proxy 显式传入。严禁在注册线程中
+    # 改写进程级环境变量，否则多代理并发会相互串线。
+    out["steps"].append("env:isolated")
 
     if proxy_info and proxy_info.get("server"):
         out["proxy_server"] = proxy_info.get("server")
@@ -2223,6 +2226,7 @@ def same_session_register(
                 "channel": "chrome",
                 "headless": use_headless and display_mode == "headless",
                 "args": chrome_args,
+                "env": _browser_env_without_proxies(),
                 **ctx_kw,
             }
             if pw_proxy:
@@ -3105,10 +3109,6 @@ def same_session_register(
             _clear_thread_event_loop(force=True)
     finally:
         out["elapsed_s"] = round(time.time() - t0, 2)
-        # 恢复业务代理环境（多账号循环下一号还要读 GROK_PROXY）
-        for k, v in (_saved_biz or {}).items():
-            if v:
-                os.environ[k] = v
         # 可选清理临时 profile
         if fresh_profile and (os.getenv("GROK_SAME_SESSION_KEEP_PROFILE") or "0") not in (
             "1",

@@ -14,7 +14,7 @@ Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Cas
 - CPA/OIDC 本地生成与 CLIProxyAPI 上传；grok2api 本地池、chenyme Web/Console/Build、jiujiu 兼容
 - 每个下游独立测试、代理和自动导入开关；默认全部关闭
 - 按**分组名称**自动解析 sub2api `group_id`（ID 只读缓存）
-- 配置页支持注册代理格式校验与连通性测试（出口 IP/地区 + accounts.x.ai）
+- 独立“注册代理”页支持最多 10,000 条代理，按账号锁定租约、轮询/随机/最少占用调度、冷却和批量健康检查
 
 ## 目录结构
 
@@ -110,7 +110,7 @@ cp .env.example .env
 | `SOLVER_BROWSER` | `camoufox` / `chromium` | `camoufox` |
 | `SOLVER_THREADS` | Solver 浏览器线程 | `4` |
 | `UI_HOST` / `UI_PORT` | Web 监听 | `127.0.0.1` / `3333` |
-| `GROK_PROXY` | 注册代理；空=直连。支持 `host:port` / URL / `user:pass@host:port` / `host:port:user:pass` | 空 |
+| `data/proxy_pool.json` | 注册代理池的本地私密存储；由 `/proxy-settings` 管理，不提交 Git | 空池（直连） |
 | `SUB2API_URL` | 旧版 sub2api 根地址；首次进入导入中心时用于迁移 | `http://127.0.0.1:9898` |
 | `SUB2API_GROK_GROUP_NAME` | 导入目标分组**名称**（按名称解析 ID） | `grok` |
 | `SUB2API_GROK_GROUP_ID` | 可选缓存；运行时会按名称回写 | 空 |
@@ -154,7 +154,8 @@ python start.py
 
 - **邮箱配置**：独立页面管理 provider、凭据、域名池、测试与启用
 - **导入服务**：独立页面管理 Sub2API、CLIProxyAPI 和 grok2api，地址为 `/import-services`
-- **配置**：Solver / 注册代理（可测出口与 x.ai）→ 写入 `.env`
+- **配置**：Solver 等通用参数 → 写入 `.env`
+- **注册代理**：独立页面管理代理池、调度与健康状态 → 写入 `data/proxy_pool.json`
 - **运行**：选择 `same_session`、并发、数量后开始
 - **日志**：左侧主流程（建邮→camoufox→signup→SSO），右侧 Risk / Token / NSFW
 - **Keys**：下载 SSO 文件；批量导入统一在导入中心执行

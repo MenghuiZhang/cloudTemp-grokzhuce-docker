@@ -67,7 +67,7 @@ def _impersonate_chain(preferred: str = "") -> list[str]:
     return out
 
 
-def _proxy_kwargs(*, force_direct: bool = False) -> dict:
+def _proxy_kwargs(*, force_direct: bool = False, proxy_spec: str | None = None) -> dict:
     # 业务代理优先（与 grok._curl_proxy_kwargs 对齐）
     # force_direct：代理 TLS 炸穿时直连兜底读 risk（不经 7897）
     if force_direct or (os.environ.get("GROK_RISK_FORCE_DIRECT") or "").strip().lower() in (
@@ -76,6 +76,17 @@ def _proxy_kwargs(*, force_direct: bool = False) -> dict:
         "yes",
     ):
         return {"proxies": {"http": "", "https": ""}}
+    if proxy_spec is not None:
+        raw = str(proxy_spec or "").strip()
+        if not raw:
+            return {"proxies": {"http": "", "https": ""}}
+        try:
+            from g.proxy_pool import parse_proxy_line
+
+            url = parse_proxy_line(raw)["spec"]
+        except Exception:
+            url = raw if "://" in raw else f"http://{raw}"
+        return {"proxies": {"http": url, "https": url}}
     for key in ("GROK_PROXY", "XAI_PROXY", "SAME_SESSION_PROXY"):
         raw = (os.environ.get(key) or "").strip()
         if not raw:
@@ -206,6 +217,7 @@ class AntibotService:
         impersonate: str = "chrome131",
         user_agent: Optional[str] = None,
         timeout: int = 15,
+        proxy_spec: str | None = None,
     ) -> dict[str, Any]:
         """
         读 GetUser(grpc) + REST /rest/auth/get-user + session，判定风控。
@@ -260,9 +272,10 @@ class AntibotService:
         path_specs: list[tuple[str, bool]] = [
             (imp, False) for imp in _impersonate_chain(impersonate or "chrome124")
         ]
-        # 代理全挂后直连兜底（只试最稳的几个，避免拖太久）
-        for imp in ("chrome124", "chrome123", "chrome120"):
-            path_specs.append((imp, True))
+        # 账号级代理租约不允许 risk 中途回落直连。
+        if proxy_spec is None:
+            for imp in ("chrome124", "chrome123", "chrome120"):
+                path_specs.append((imp, True))
 
         for imp, direct in path_specs:
             tag = f"{'direct' if direct else 'proxy'}:{imp}"
@@ -275,6 +288,7 @@ class AntibotService:
                     timeout=timeout,
                     base_out=out,
                     force_direct=direct,
+                    proxy_spec=proxy_spec,
                 )
                 if result.get("infra_error"):
                     last_infra_err = str(result.get("error") or "infra")
@@ -331,6 +345,7 @@ class AntibotService:
         timeout: int = 15,
         base_out: Optional[dict[str, Any]] = None,
         force_direct: bool = False,
+        proxy_spec: str | None = None,
     ) -> dict[str, Any]:
         """单次 impersonate 探测；TLS 类异常设 infra_error=True 供外层回退。"""
         rw = (sso_rw or sso or "").strip()
@@ -363,7 +378,9 @@ class AntibotService:
         }
         ua = user_agent or DEFAULT_UA
         try:
-            sess = requests.Session(**_proxy_kwargs(force_direct=force_direct))
+            sess = requests.Session(
+                **_proxy_kwargs(force_direct=force_direct, proxy_spec=proxy_spec)
+            )
             for d in (".x.ai", ".grok.com", "accounts.x.ai", "grok.com"):
                 try:
                     sess.cookies.set("sso", sso, domain=d)

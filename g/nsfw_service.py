@@ -25,6 +25,7 @@ class NsfwSettingsService:
         user_agent: Optional[str] = None,
         cf_clearance: Optional[str] = None,
         timeout: int = 15,
+        proxy_spec: str = "",
     ) -> Dict[str, Any]:
         """
         启用 always_show_nsfw_content。
@@ -81,6 +82,8 @@ class NsfwSettingsService:
         )
 
         try:
+            proxy_url = str(proxy_spec or "").strip()
+            proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {"http": "", "https": ""}
             response = requests.post(
                 url,
                 headers=headers,
@@ -88,6 +91,7 @@ class NsfwSettingsService:
                 data=data,
                 impersonate=impersonate or "chrome120",
                 timeout=timeout,
+                proxies=proxies,
             )
             hex_reply = response.content.hex()
             grpc_status = response.headers.get("grpc-status")
@@ -123,6 +127,7 @@ class NsfwSettingsService:
         impersonate: str = "chrome120",
         user_agent: Optional[str] = None,
         timeout: int = 30,
+        proxy_spec: str = "",
     ) -> Dict[str, Any]:
         """
         使用帖子方法开启 Unhinged 模式（二次验证）。
@@ -146,12 +151,15 @@ class NsfwSettingsService:
         data = b'\x00' + struct.pack('>I', len(payload)) + payload
 
         try:
+            proxy_url = str(proxy_spec or "").strip()
+            proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else {"http": "", "https": ""}
             response = requests.post(
                 url,
                 headers=headers,
                 data=data,
                 impersonate=impersonate,
                 timeout=timeout,
+                proxies=proxies,
             )
             return {
                 "ok": response.status_code == 200,

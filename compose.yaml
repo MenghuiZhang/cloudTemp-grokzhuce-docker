@@ -19,3 +19,4 @@ services:
       - ./logs:/app/logs
       - ./register_sso:/app/register_sso
       - ./converted_auth:/app/converted_auth
+      - ./data:/app/data

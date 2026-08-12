@@ -242,11 +242,8 @@ class EmailService:
         if proxy_mode == "custom" and proxy_url:
             s.proxies.update({"http": proxy_url, "https": proxy_url})
         elif proxy_mode == "register":
-            register_proxy = str(os.getenv("GROK_PROXY") or "").strip()
-            if register_proxy:
-                if not register_proxy.startswith(("http://", "https://", "socks5://")):
-                    register_proxy = "http://" + register_proxy
-                s.proxies.update({"http": register_proxy, "https": register_proxy})
+            # 账号租约在创邮前由 set_register_proxy 显式注入。
+            s.trust_env = False
         retries = Retry(
             total=3,
             backoff_factor=0.5,
@@ -258,6 +255,30 @@ class EmailService:
         s.mount("https://", adapter)
         s.mount("http://", adapter)
         return s
+
+    def set_register_proxy(self, proxy_spec: str = "") -> None:
+        """将当前账号租约注入邮箱 HTTP 会话。
+
+        仅 EMAIL_PROXY_MODE=register 生效；其他模式保持邮箱页面自身配置。
+        """
+        common = self.structured_config["common"]
+        if str(common.get("proxy_mode") or "direct") != "register":
+            return
+        raw = str(proxy_spec or "").strip()
+        try:
+            self._session.trust_env = False
+            self._session.proxies.clear()
+            if raw:
+                try:
+                    from .proxy_pool import parse_proxy_line
+
+                    raw = parse_proxy_line(raw)["spec"]
+                except Exception:
+                    if "://" not in raw:
+                        raw = "http://" + raw
+                self._session.proxies.update({"http": raw, "https": raw})
+        except Exception:
+            pass
 
     @classmethod
     def fetch_mail_domains(

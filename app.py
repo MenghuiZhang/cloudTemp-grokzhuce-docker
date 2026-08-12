@@ -9,6 +9,7 @@ import re
 import threading
 import time
 import uuid
+import concurrent.futures
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -34,10 +35,19 @@ from g.import_services import (
     TARGET_LABELS,
     TARGETS,
 )
+from g.proxy_pool import (
+    MAX_UPLOAD_BYTES,
+    ProxyConfigError,
+    expand_proxy_template,
+    get_proxy_pool,
+    mask_proxy,
+    parse_proxy_lines,
+)
 import solver_manager
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
+proxy_pool = get_proxy_pool(BASE_DIR)
 
 load_dotenv(ENV_PATH)
 
@@ -137,7 +147,6 @@ CONFIG_KEYS = (
     "UPSTREAM_URL",
     "UPSTREAM_ADMIN_EMAIL",
     "UPSTREAM_ADMIN_PASSWORD",
-    "GROK_PROXY",
     "EMAIL_TYPE",
     "OUTLOOK_ACCOUNTS",
     "OUTLOOK_ALIAS_LIMIT",
@@ -171,8 +180,6 @@ DEFAULTS = {
     "UPSTREAM_URL": "http://127.0.0.1:9898",
     "UPSTREAM_ADMIN_EMAIL": "",
     "UPSTREAM_ADMIN_PASSWORD": "",
-    # 注册代理：空=直连；支持 host:port / http://host:port / user:pass@host:port / host:port:user:pass
-    "GROK_PROXY": "",
     "EMAIL_TYPE": "freemail",
     "OUTLOOK_ACCOUNTS": "",
     "OUTLOOK_ALIAS_LIMIT": "5",
@@ -241,6 +248,9 @@ def write_env_file(values: dict) -> None:
             out.append(line)
             continue
         key = stripped.split("=", 1)[0].strip()
+        if key == "GROK_PROXY":
+            # 旧单代理已废弃；不迁移、不保留。
+            continue
         if key in values:
             out.append(f"{key}={_encode_config_value(key, values[key])}")
             written.add(key)
@@ -314,9 +324,6 @@ def write_env_file(values: dict) -> None:
             f"UI_HOST={values.get('UI_HOST', DEFAULTS['UI_HOST'])}",
             f"UI_PORT={values.get('UI_PORT', DEFAULTS['UI_PORT'])}",
             "",
-            "# 注册代理（空=直连）",
-            f"GROK_PROXY={values.get('GROK_PROXY', DEFAULTS.get('GROK_PROXY', ''))}",
-            "",
             "# sub2api Grok（成功账号导入）",
             f"SUB2API_URL={values.get('SUB2API_URL', DEFAULTS['SUB2API_URL'])}",
             f"SUB2API_DOCKER_CONTAINER={values.get('SUB2API_DOCKER_CONTAINER', DEFAULTS['SUB2API_DOCKER_CONTAINER'])}",
@@ -337,13 +344,12 @@ def write_env_file(values: dict) -> None:
 
 
 def _sync_proxy_env_aliases() -> None:
-    """把 GROK_PROXY 同步到注册链路读取的别名；空则全部清掉。"""
-    proxy = (os.environ.get("GROK_PROXY") or "").strip()
+    """清理已废弃的进程级注册代理，防止绕过账号租约。"""
     for alias in ("GROK_PROXY", "XAI_PROXY", "SAME_SESSION_PROXY", "GROK_SAME_SESSION_PROXY"):
-        if proxy:
-            os.environ[alias] = proxy
-        else:
-            os.environ.pop(alias, None)
+        os.environ.pop(alias, None)
+
+
+_sync_proxy_env_aliases()
 
 
 def apply_env_to_process(values: dict) -> None:
@@ -351,9 +357,6 @@ def apply_env_to_process(values: dict) -> None:
         os.environ[k] = v or ""
     # reload dotenv for any other readers
     load_dotenv(ENV_PATH, override=True)
-    # 以最终进程环境为准再同步代理别名（避免 dotenv 覆盖后别名不一致）
-    if "GROK_PROXY" in values:
-        os.environ["GROK_PROXY"] = str(values.get("GROK_PROXY") or "").strip()
     _sync_proxy_env_aliases()
 
 
@@ -388,8 +391,9 @@ def env_snapshot():
         "solver_threads": cfg.get("SOLVER_THREADS") or DEFAULTS["SOLVER_THREADS"],
         "ui_host": cfg.get("UI_HOST") or DEFAULTS["UI_HOST"],
         "ui_port": cfg.get("UI_PORT") or DEFAULTS["UI_PORT"],
-        "grok_proxy": (cfg.get("GROK_PROXY") or "").strip(),
-        "grok_proxy_set": bool((cfg.get("GROK_PROXY") or "").strip()),
+        "grok_proxy": "",
+        "grok_proxy_set": bool(proxy_pool.summary().get("enabled")),
+        "proxy_pool": proxy_pool.summary(),
         "sub2api_url": sub2_url,
         "sub2api_container": sub2["container"],
         "sub2api_group_id": sub2["group_id"],
@@ -730,12 +734,7 @@ _SUB2_HTTP_CONTEXT = threading.local()
 def _set_sub2_http_options(
     *, proxy_mode: str = "direct", proxy_url: str = "", register_proxy: str = "", tls_verify: bool = True
 ) -> None:
-    value = ""
-    if proxy_mode == "custom":
-        value = str(proxy_url or "").strip()
-    elif proxy_mode == "register":
-        value = str(register_proxy or "").strip()
-    _SUB2_HTTP_CONTEXT.proxy_url = value
+    _SUB2_HTTP_CONTEXT.proxy_url = ""
     _SUB2_HTTP_CONTEXT.tls_verify = bool(tls_verify)
 
 
@@ -1903,9 +1902,7 @@ IMPORT_JOBS = ImportJobManager(
     IMPORT_TARGETS,
     sub2api_importer=import_sso_to_upstream,
     token_exchanger=_exchange_import_token,
-    register_proxy_getter=lambda: str(
-        os.environ.get("GROK_PROXY") or read_env_file().get("GROK_PROXY") or ""
-    ).strip(),
+    register_proxy_getter=lambda: "",
     log=logs.emit,
     on_job_complete=_clear_completed_import_tokens,
     source_resolver=lambda source, rows: _resolve_import_retry_source(source, rows),
@@ -1963,6 +1960,11 @@ def import_services_page():
     return render_template("import_services.html")
 
 
+@app.get("/proxy-settings")
+def proxy_settings_page():
+    return render_template("proxy_settings.html")
+
+
 @app.get("/api/health")
 def health():
     return jsonify({"ok": True, "service": "grok-register-ui"})
@@ -1972,6 +1974,7 @@ def health():
 def status():
     data = engine.get_status()
     data["env"] = env_snapshot()
+    data["proxy_pool"] = proxy_pool.summary()
     try:
         data["solver"] = solver_manager.status()
     except Exception as e:
@@ -2004,7 +2007,6 @@ def get_config():
             "SOLVER_DEBUG": cfg.get("SOLVER_DEBUG", DEFAULTS["SOLVER_DEBUG"]),
             "UI_HOST": cfg.get("UI_HOST", DEFAULTS["UI_HOST"]),
             "UI_PORT": cfg.get("UI_PORT", DEFAULTS["UI_PORT"]),
-            "GROK_PROXY": cfg.get("GROK_PROXY", DEFAULTS.get("GROK_PROXY", "")),
             "SUB2API_URL": cfg.get("SUB2API_URL", cfg.get("UPSTREAM_URL", DEFAULTS["SUB2API_URL"])),
             "SUB2API_DOCKER_CONTAINER": cfg.get("SUB2API_DOCKER_CONTAINER", DEFAULTS["SUB2API_DOCKER_CONTAINER"]),
             "SUB2API_DB_HOST": cfg.get("SUB2API_DB_HOST", DEFAULTS["SUB2API_DB_HOST"]),
@@ -2248,11 +2250,6 @@ def save_config():
     solver_debug = str(body.get("SOLVER_DEBUG", current.get("SOLVER_DEBUG", DEFAULTS["SOLVER_DEBUG"]))).strip() or "1"
     ui_host = str(body.get("UI_HOST", current.get("UI_HOST", DEFAULTS["UI_HOST"]))).strip() or "127.0.0.1"
     ui_port = str(body.get("UI_PORT", current.get("UI_PORT", DEFAULTS["UI_PORT"]))).strip() or "3333"
-    # 代理：前端显式传空表示直连；未传则保留已有
-    if "GROK_PROXY" in body:
-        grok_proxy = str(body.get("GROK_PROXY") or "").strip()
-    else:
-        grok_proxy = str(current.get("GROK_PROXY", DEFAULTS.get("GROK_PROXY", "")) or "").strip()
     sub2api_url = str(body.get("SUB2API_URL", body.get("UPSTREAM_URL", current.get("SUB2API_URL", current.get("UPSTREAM_URL", DEFAULTS["SUB2API_URL"]))))).strip()
     sub2api_container = str(body.get("SUB2API_DOCKER_CONTAINER", current.get("SUB2API_DOCKER_CONTAINER", DEFAULTS["SUB2API_DOCKER_CONTAINER"]))).strip() or DEFAULTS["SUB2API_DOCKER_CONTAINER"]
     sub2api_db_host = str(body.get("SUB2API_DB_HOST", current.get("SUB2API_DB_HOST", DEFAULTS["SUB2API_DB_HOST"]))).strip() or DEFAULTS["SUB2API_DB_HOST"]
@@ -2370,7 +2367,6 @@ def save_config():
         "SOLVER_DEBUG": "1" if solver_debug not in ("0", "false", "False") else "0",
         "UI_HOST": ui_host,
         "UI_PORT": ui_port,
-        "GROK_PROXY": grok_proxy,
         "SUB2API_URL": sub2api_url,
         "SUB2API_DOCKER_CONTAINER": sub2api_container,
         "SUB2API_DB_HOST": sub2api_db_host,
@@ -2606,6 +2602,11 @@ def start():
             logs.emit(f"Solver 看门狗启动失败（任务仍继续）: {e}", "warn")
 
     logs.emit(f"注册路径: {reg_mode}", "info")
+    proxy_checks = _start_proxy_pool_health_checks()
+    if proxy_checks:
+        logs.emit(f"代理池后台预检已启动：{proxy_checks} 条", "info")
+    else:
+        logs.emit("代理池为空，本批注册直连", "warn")
     result = engine.start(workers=workers, target=target, blocking=False, mode=reg_mode)
     if not result.get("ok") and use_local_solver:
         try:
@@ -3014,7 +3015,6 @@ def _probe_register_proxy(raw: str, timeout: float = 12.0) -> dict:
         result["via"] = "accounts.x.ai"
         if status and status < 500:
             result["xai_ok"] = True
-            result["ok"] = True
         else:
             xai_err = f"http_{status}"
     except Exception as e:
@@ -3034,9 +3034,15 @@ def _probe_register_proxy(raw: str, timeout: float = 12.0) -> dict:
     else:
         eg_part = "出口未知"
 
-    if result.get("xai_ok"):
+    if result.get("xai_ok") and result.get("egress_ok"):
+        result["ok"] = True
         xai_part = f"xAI OK · HTTP {result.get('xai_status') or result.get('status')} · {result.get('xai_ms') or 0}ms"
         result["message"] = f"{eg_part}  →  {xai_part}"
+        return result
+
+    if result.get("xai_ok") and not result.get("egress_ok"):
+        result["error"] = _short_proxy_err(result.get("egress_error") or "出口探测失败")
+        result["message"] = f"{eg_part}  →  xAI OK，但出口未通过"
         return result
 
     short = _short_proxy_err(xai_err or "xAI 不通")
@@ -3054,19 +3060,14 @@ def _probe_register_proxy(raw: str, timeout: float = 12.0) -> dict:
 def proxy_test():
     """
     测试注册代理：先出口 IP/区域，再 accounts.x.ai 连通性。
-    body.GROK_PROXY / proxy：可传临时值；不传则用当前已保存/进程环境。
+    body.proxy：可传临时值；不传则测试直连。
     空字符串 = 直连探测。
     """
     body = request.get_json(silent=True) or {}
-    if "GROK_PROXY" in body:
-        raw = str(body.get("GROK_PROXY") or "").strip()
-    elif "proxy" in body:
+    if "proxy" in body:
         raw = str(body.get("proxy") or "").strip()
     else:
-        raw = (
-            (os.environ.get("GROK_PROXY") or "").strip()
-            or (read_env_file().get("GROK_PROXY") or "").strip()
-        )
+        raw = ""
     try:
         timeout = float(body.get("timeout") or 12)
     except (TypeError, ValueError):
@@ -3080,6 +3081,205 @@ def proxy_test():
         pass
     code = 200 if result.get("ok") else 502
     return jsonify(result), code
+
+
+@app.get("/api/proxies")
+def proxy_pool_list():
+    try:
+        data = proxy_pool.list_public(
+            page=request.args.get("page", 1, type=int),
+            per_page=request.args.get("per_page", 50, type=int),
+            query=request.args.get("q", "", type=str),
+            status=request.args.get("status", "", type=str),
+        )
+        return jsonify({"ok": True, **data})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.patch("/api/proxies/settings")
+def proxy_pool_settings():
+    body = request.get_json(silent=True) or {}
+    try:
+        settings = proxy_pool.update_settings(body)
+        return jsonify({"ok": True, "settings": settings})
+    except (ProxyConfigError, TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+def _proxy_import_payload() -> tuple[str, str]:
+    if request.files:
+        upload = request.files.get("file")
+        if upload is None:
+            raise ProxyConfigError("缺少上传文件")
+        payload = upload.read(MAX_UPLOAD_BYTES + 1)
+        if len(payload) > MAX_UPLOAD_BYTES:
+            raise ProxyConfigError("代理文件超过 5 MB")
+        try:
+            text = payload.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ProxyConfigError("代理文件必须是 UTF-8 文本") from exc
+        mode = str(request.form.get("mode") or "append")
+        return text, mode
+    body = request.get_json(silent=True) or {}
+    return str(body.get("text") or ""), str(body.get("mode") or "append")
+
+
+@app.post("/api/proxies/preview")
+def proxy_pool_preview():
+    try:
+        text, mode = _proxy_import_payload()
+        rows, errors, duplicates = parse_proxy_lines(
+            text,
+            default_scheme=proxy_pool.settings().get("default_scheme", "http"),
+        )
+        return jsonify({
+            "ok": not errors,
+            "mode": mode,
+            "valid": len(rows),
+            "duplicates": duplicates,
+            "errors": errors[:200],
+            "preview": [
+                {
+                    "line": idx + 1,
+                    "proxy": mask_proxy(row["spec"]),
+                }
+                for idx, row in enumerate(rows[:20])
+            ],
+        }), (200 if not errors else 400)
+    except (ProxyConfigError, TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "message": str(exc), "errors": []}), 400
+
+
+@app.post("/api/proxies/import")
+def proxy_pool_import():
+    try:
+        text, mode = _proxy_import_payload()
+        result = proxy_pool.import_text(text, mode=mode)
+        if not result.get("ok"):
+            return jsonify(result), 400
+        added_ids = list(result.pop("added_ids", []))
+        if added_ids:
+            _start_proxy_pool_health_checks(added_ids)
+        logs.emit(f"注册代理池已导入 {result.get('added', 0)} 条", "success")
+        return jsonify(result)
+    except (ProxyConfigError, TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.patch("/api/proxies/<proxy_id>")
+def proxy_pool_update_entry(proxy_id: str):
+    try:
+        item = proxy_pool.update_entry(proxy_id, request.get_json(silent=True) or {})
+        return jsonify({"ok": True, "item": item})
+    except KeyError:
+        return jsonify({"ok": False, "message": "代理不存在"}), 404
+    except (ProxyConfigError, TypeError, ValueError) as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.post("/api/proxies/delete")
+def proxy_pool_delete():
+    body = request.get_json(silent=True) or {}
+    ids = body.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"ok": False, "message": "请选择要删除的代理"}), 400
+    result = proxy_pool.delete(ids)
+    return jsonify({"ok": True, **result})
+
+
+@app.post("/api/proxies/<proxy_id>/move")
+def proxy_pool_move(proxy_id: str):
+    direction = str((request.get_json(silent=True) or {}).get("direction") or "")
+    if direction not in ("up", "down"):
+        return jsonify({"ok": False, "message": "direction 必须是 up/down"}), 400
+    try:
+        proxy_pool.move(proxy_id, direction)
+        return jsonify({"ok": True})
+    except KeyError:
+        return jsonify({"ok": False, "message": "代理不存在"}), 404
+
+
+@app.post("/api/proxies/test")
+def proxy_pool_test_many():
+    body = request.get_json(silent=True) or {}
+    ids = body.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"ok": False, "message": "请选择要测试的代理"}), 400
+    ids = [str(x) for x in ids[:200]]
+
+    def _one(proxy_id: str) -> dict:
+        try:
+            probe_spec = expand_proxy_template(
+                proxy_pool.secret_spec(proxy_id), account="health-check", session=uuid.uuid4().hex[:16]
+            )
+            result = _probe_register_proxy(probe_spec, timeout=12)
+            proxy_pool.set_health(proxy_id, result)
+            return {
+                "id": proxy_id,
+                "ok": bool(result.get("ok")),
+                "message": result.get("message") or result.get("error") or "",
+            }
+        except KeyError:
+            return {"id": proxy_id, "ok": False, "message": "代理不存在"}
+        except Exception as exc:
+            proxy_pool.set_health(proxy_id, {"ok": False, "error": str(exc)})
+            return {"id": proxy_id, "ok": False, "message": str(exc)}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
+        results = list(pool.map(_one, ids))
+    passed = sum(1 for x in results if x["ok"])
+    return jsonify({"ok": passed == len(results), "passed": passed, "total": len(results), "results": results})
+
+
+def _start_proxy_pool_health_checks(selected_ids: list[str] | None = None) -> int:
+    """每批启动时后台并行预检；worker 只会领取已完成预检的条目。"""
+    ids = proxy_pool.begin_health_check(selected_ids)
+    if not ids:
+        return 0
+
+    def _run() -> None:
+        def _check(batch: list[str]) -> int:
+            def _one(proxy_id: str) -> bool:
+                try:
+                    probe_spec = expand_proxy_template(
+                        proxy_pool.secret_spec(proxy_id), account="health-check", session=uuid.uuid4().hex[:16]
+                    )
+                    result = _probe_register_proxy(probe_spec, timeout=12)
+                except Exception as exc:
+                    result = {"ok": False, "error": str(exc)}
+                proxy_pool.set_health(proxy_id, result)
+                return bool(result.get("ok"))
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(batch))) as checks:
+                return sum(1 for ok in checks.map(_one, batch) if ok)
+
+        passed = _check(ids)
+        logs.emit(f"代理池预检完成：{passed}/{len(ids)} 可用", "success" if passed else "warn")
+        while engine.is_running():
+            if engine.stop_event.wait(timeout=5):
+                break
+            due = proxy_pool.begin_due_health_checks()
+            if due:
+                recovered = _check(due)
+                logs.emit(f"冷却代理复检：{recovered}/{len(due)} 恢复", "info")
+
+    threading.Thread(target=_run, daemon=True, name="proxy-pool-health").start()
+    return len(ids)
+
+
+@app.get("/api/proxies/export")
+def proxy_pool_export():
+    # 导出只用于运维审计，服务端永不读出凭据。分页拉取全量脱敏条目。
+    items = []
+    page = 1
+    while True:
+        chunk = proxy_pool.list_public(page=page, per_page=200, query=request.args.get("q", ""))
+        items.extend(chunk["items"])
+        if len(items) >= chunk["total"]:
+            break
+        page += 1
+    return jsonify({"ok": True, "exported_at": datetime.now(timezone.utc).isoformat(), "items": items})
 
 
 @app.post("/api/upstream/test")
@@ -3374,7 +3574,7 @@ def test_import_service():
     body = request.get_json(silent=True) or {}
     service = str(body.get("service") or "").strip()
     cfg = IMPORT_CONFIG.load()
-    register_proxy = str(os.environ.get("GROK_PROXY") or read_env_file().get("GROK_PROXY") or "").strip()
+    register_proxy = ""
     if service == "sub2api":
         sub2 = cfg["services"]["sub2api"]
         _set_sub2_http_options(

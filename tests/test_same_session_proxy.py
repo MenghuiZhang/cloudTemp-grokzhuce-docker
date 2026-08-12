@@ -21,13 +21,13 @@ class SameSessionProxyTests(unittest.TestCase):
         ):
             self.assertEqual(_ss_local_proxy_spec(), "")
 
-    def test_web_proxy_uses_configured_value(self):
+    def test_legacy_global_proxy_is_ignored(self):
         with patch.dict(
             os.environ,
             {"GROK_PROXY": "127.0.0.1:7890"},
             clear=True,
         ):
-            self.assertEqual(_ss_local_proxy_spec(), "127.0.0.1:7890")
+            self.assertEqual(_ss_local_proxy_spec(), "")
 
     def test_explicit_empty_proxy_ignores_system_proxy(self):
         with patch.dict(
