@@ -1,5 +1,9 @@
 .git
 .gitignore
+.github
+deploy
+compose.yaml
+README.md
 .DS_Store
 .env
 .env.*

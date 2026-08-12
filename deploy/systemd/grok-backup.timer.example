@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily encrypted backup for grok-prod
+
+[Timer]
+OnCalendar=*-*-* 03:15:00
+RandomizedDelaySec=20m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

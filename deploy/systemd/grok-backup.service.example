@@ -1,0 +1,15 @@
+[Unit]
+Description=Encrypted backup for grok-prod
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=deployuser
+Group=deployuser
+WorkingDirectory=/opt/grok/prod
+ExecStart=/opt/grok/prod/deploy/scripts/backup.sh
+
+# 日志由 journald 管理，不把 restic 密码放在本文件中。
+PrivateTmp=true
+NoNewPrivileges=true

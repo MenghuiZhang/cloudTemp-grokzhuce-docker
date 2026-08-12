@@ -66,6 +66,14 @@ docker compose up -d --build
 `http://127.0.0.1:3333`。运行产物会持久化到宿主机的 `keys/`、
 `logs/`、`register_sso/` 和 `converted_auth/`。
 
+Compose 默认只把端口绑定到宿主机 `127.0.0.1`，并为项目创建独立的
+`<项目名>_private` bridge 网络。该网络仍可访问互联网；不要设为
+`internal: true`。如需修改宿主机端口，可通过单独的 Compose 环境变量传入：
+
+```bash
+GROK_HOST_PORT=3334 docker compose up -d --build
+```
+
 ```bash
 docker compose ps
 docker compose logs -f
@@ -73,6 +81,11 @@ docker compose down
 ```
 
 从旧版本升级时可直接保留原 `.env` 和现有 volume：程序会兼容读取旧邮箱变量；进入邮箱配置页保存后会写入新结构并保留旧变量用于回滚。默认部署是单进程、线程并发；不要用多个 Web worker 或多个容器共享同一 `.env`/`keys` volume。
+
+Linux 服务器的正式/测试双实例、私有 GHCR 镜像、接入现有 1Panel 反代、
+健康检查回滚、日志轮转和加密异地备份流程见
+[`deploy/README.md`](deploy/README.md)。服务器部署参数放在
+`deploy/deploy.env`，应用秘密仍只放在根目录 `.env`；两者不能混用。
 
 ### 本地 Python
 

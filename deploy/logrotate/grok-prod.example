@@ -1,0 +1,11 @@
+# 替换 deployuser，并复制到 /etc/logrotate.d/grok-prod。
+/opt/grok/prod/logs/*.log /opt/grok/prod/logs/*/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su deployuser deployuser
+}

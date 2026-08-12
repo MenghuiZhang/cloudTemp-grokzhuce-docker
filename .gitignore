@@ -2,6 +2,9 @@
 .env
 .env.*
 !.env.example
+deploy/deploy.env
+deploy/restic.env
+deploy/.deploy-state
 import_services.json
 
 # Python
