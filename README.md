@@ -9,7 +9,8 @@ Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Cas
 - Cloudflare Temp 多基础域名顺序轮替、失败切域、冷却与随机子域
 - 本地 Camoufox Turnstile Solver（也可接 YesCaptcha）
 - 多线程并发；主流程 / Risk·Token·NSFW 双栏日志
-- 进度按 CLEAN 成功数计；创邮次数单独展示（数量 = 创邮次数停批）
+- 运行面板可按批次关闭账号 Risk 检测（默认开启）；未检测账号独立标记为 `UNCHECKED`
+- 进度按注册成功数计；CLEAN / UNCHECKED / MARKED / 创邮次数分开展示（数量 = 创邮次数停批）
 - 独立导入中心：最近成功 / Keys / 注册 JSON / 上传文件，多目标预览、后台任务和失败重试
 - CPA/OIDC 本地生成与 CLIProxyAPI 上传；grok2api 本地池、chenyme Web/Console/Build、jiujiu 兼容
 - 每个下游独立测试、代理和自动导入开关；默认全部关闭
@@ -41,7 +42,7 @@ Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Cas
 本地运行产生、**不要提交**的内容：
 
 - `.env`（真实密钥）
-- `keys/`（SSO TXT 输出，以及每次任务对应的 `*_accounts.json` 结构化账号文件）
+- `keys/`（SSO TXT 输出，以及每次任务对应的 `*_accounts.json`、`*_clean.txt`、`*_unchecked.txt` 等文件）
 - `logs/`（运行日志）
 - `proxies/`（个人代理清单）
 
@@ -169,11 +170,15 @@ python start.py
 - **导入服务**：独立页面管理 Sub2API、CLIProxyAPI 和 grok2api，地址为 `/import-services`
 - **配置**：Solver 等通用参数 → 写入 `.env`
 - **注册代理**：独立页面管理代理池、调度与健康状态 → 写入 `data/proxy_pool.json`
-- **运行**：选择 `same_session`、并发、数量后开始
+- **运行**：选择 `same_session`、并发、数量和本批 Risk 检测开关后开始
 - **日志**：左侧主流程（建邮→camoufox→signup→SSO），右侧 Risk / Token / NSFW
 - **Keys**：下载 SSO 文件；批量导入统一在导入中心执行
 
 same_session 建议并发先 **1～2**（注册浏览器 + Solver 双开）。
+
+关闭“启用账号 Risk 检测”只会跳过 SSO 到手后的账号风险判定；
+Turnstile 和 Castle 仍是注册必需步骤。`UNCHECKED` 会正常落盘并继续 token / TOS / NSFW 收尾，
+但不会自动导入 Sub2API、CPA 或 Build；需在导入中心手动选择“覆盖风控限制”。
 
 ### 3. 导入服务中心
 
@@ -253,7 +258,7 @@ python3 -m unittest discover -s tests -v
 | 模式 | 说明 |
 |------|------|
 | `same_session`（默认） | 同页 Castle mint + 页内发码/验码/signup，CLEAN 主路径 |
-| `protocol` / `legacy` | 兼容旧路径，易被 Castle deny，不推荐 |
+| `protocol` / `legacy` | 兼容旧路径，不执行账号 Risk 探测，成功号为 UNCHECKED；易被 Castle deny，不推荐 |
 
 ## 注意事项
 

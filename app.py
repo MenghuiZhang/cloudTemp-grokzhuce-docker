@@ -2511,6 +2511,7 @@ def start():
     workers = body.get("workers", 8)
     target = body.get("target", 100)
     mode_raw = body.get("mode") or body.get("register_mode") or ""
+    risk_raw = body.get("risk_check_enabled", True)
     try:
         workers = int(workers)
         target = int(target)
@@ -2521,6 +2522,17 @@ def start():
         return jsonify({"ok": False, "message": "并发数范围 1-64"}), 400
     if target < 1 or target > 100000:
         return jsonify({"ok": False, "message": "注册数量范围 1-100000"}), 400
+    if isinstance(risk_raw, bool):
+        risk_check_enabled = risk_raw
+    elif isinstance(risk_raw, str) and risk_raw.strip().lower() in {
+        "1", "true", "yes", "on", "0", "false", "no", "off",
+    }:
+        risk_check_enabled = risk_raw.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        return jsonify({
+            "ok": False,
+            "message": "risk_check_enabled 必须是布尔值",
+        }), 400
 
     # 注册路径：same_session（默认 CLEAN）/ protocol（旧混合）
     try:
@@ -2601,13 +2613,24 @@ def start():
         except Exception as e:
             logs.emit(f"Solver 看门狗启动失败（任务仍继续）: {e}", "warn")
 
+    effective_risk_check = risk_check_enabled and reg_mode == "same_session"
     logs.emit(f"注册路径: {reg_mode}", "info")
+    logs.emit(
+        "账号 Risk 检测: " + ("开启" if effective_risk_check else "关闭 / UNCHECKED"),
+        "info" if effective_risk_check else "warn",
+    )
     proxy_checks = _start_proxy_pool_health_checks()
     if proxy_checks:
         logs.emit(f"代理池后台预检已启动：{proxy_checks} 条", "info")
     else:
         logs.emit("代理池为空，本批注册直连", "warn")
-    result = engine.start(workers=workers, target=target, blocking=False, mode=reg_mode)
+    result = engine.start(
+        workers=workers,
+        target=target,
+        blocking=False,
+        mode=reg_mode,
+        risk_check_enabled=risk_check_enabled,
+    )
     if not result.get("ok") and use_local_solver:
         try:
             solver_manager.stop_watchdog()

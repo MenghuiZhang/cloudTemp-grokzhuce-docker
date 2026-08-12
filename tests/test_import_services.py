@@ -218,6 +218,45 @@ class ImportJobManagerTests(unittest.TestCase):
             self.assertEqual(set(states), {"grok2api_web", "grok2api_console"})
             self.assertTrue(all(item["status"] == "success" for item in states.values()))
 
+    def test_unchecked_account_cannot_auto_enter_sensitive_targets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ImportConfigStore(root, env_reader=lambda: {})
+            targets = ImportTargets(root, store)
+            targets.import_chenyme_sso = Mock(return_value={"ok": True, "created": 1})
+            sub2api = Mock(return_value={"ok": True, "success": 1})
+            exchanger = Mock(return_value={"ok": False, "error": "must not exchange"})
+            manager = ImportJobManager(
+                root,
+                store,
+                targets,
+                sub2api_importer=sub2api,
+                token_exchanger=exchanger,
+            )
+
+            job = manager.create_job(
+                [{
+                    "id": "unchecked-1",
+                    "email": "u@example.com",
+                    "sso": "aaa.bbb.ccc",
+                    "clean": None,
+                }],
+                ["sub2api", "cpa_local", "grok2api_build", "grok2api_web"],
+                source={"type": "automatic"},
+                automatic=True,
+            )
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                current = manager.get(job["id"])
+                if current and current["status"] not in ("queued", "running", "cancelling"):
+                    break
+                time.sleep(0.02)
+
+            states = manager.get(job["id"])["accounts"][0]["targets"]
+            self.assertEqual(set(states), {"grok2api_web"})
+            sub2api.assert_not_called()
+            exchanger.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

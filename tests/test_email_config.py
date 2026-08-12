@@ -80,9 +80,42 @@ class EmailConfigTests(unittest.TestCase):
         })
         with patch.object(app, "read_env_file", return_value=cfg), patch.object(
             app.engine, "start", return_value={"ok": True, "message": "started"}
-        ):
+        ) as start_mock:
             response = app.app.test_client().post("/api/start", json={"workers": 1, "target": 1})
         self.assertEqual(response.status_code, 200)
+        self.assertTrue(start_mock.call_args.kwargs["risk_check_enabled"])
+
+    def test_start_forwards_disabled_risk_check(self):
+        cfg = dict(app.DEFAULTS)
+        cfg.update({
+            "EMAIL_PROVIDER": "outlook",
+            "EMAIL_OUTLOOK_ACCOUNTS_JSON": json.dumps([{
+                "email": "user@outlook.com", "password": "app-pass", "alias_limit": 5,
+            }]),
+            "YESCAPTCHA_KEY": "configured-to-skip-local-solver",
+        })
+        with patch.object(app, "read_env_file", return_value=cfg), patch.object(
+            app.engine, "start", return_value={"ok": True, "message": "started"}
+        ) as start_mock:
+            response = app.app.test_client().post(
+                "/api/start",
+                json={
+                    "workers": 1,
+                    "target": 1,
+                    "mode": "same_session",
+                    "risk_check_enabled": False,
+                },
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(start_mock.call_args.kwargs["risk_check_enabled"])
+
+    def test_start_rejects_invalid_risk_check_value(self):
+        response = app.app.test_client().post(
+            "/api/start",
+            json={"workers": 1, "target": 1, "risk_check_enabled": {"bad": True}},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("risk_check_enabled", response.json["message"])
 
     def test_partial_general_save_does_not_duplicate_email_keys(self):
         with tempfile.TemporaryDirectory() as tmp:

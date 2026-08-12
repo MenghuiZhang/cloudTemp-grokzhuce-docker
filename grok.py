@@ -1394,6 +1394,7 @@ class RegisterEngine:
         self.fail_count = 0
         self.clean_count = 0
         self.marked_count = 0
+        self.unchecked_count = 0
         # 创邮尝试次数：数量 N = 创建 N 个邮箱就停（CLEAN/MARKED/失败都计 1 次）
         self.attempt_count = 0
         self._ss_attempt_lock = threading.Lock()
@@ -1410,6 +1411,9 @@ class RegisterEngine:
         self.error_message = ""
         # 默认同会话 CLEAN；可被 start(mode=) / GROK_REGISTER_MODE 覆盖
         self.register_mode = resolve_register_mode()
+        # 每批任务快照：仅控制 SSO 到手后的账号 Risk 探测。
+        # Turnstile / Castle 是注册必需流程，不受此开关影响。
+        self.risk_check_enabled = True
         self._ss_idx = 0
         self._ss_idx_lock = threading.Lock()
         # 足够覆盖大批量注册；过小会导致「成功 100、可导入只剩 50」
@@ -1461,7 +1465,7 @@ class RegisterEngine:
         progress = 0.0
         attempts = int(getattr(self, "attempt_count", 0) or 0)
         if self.target_count > 0:
-            # 进度条 = CLEAN 成功 / 目标（创邮次数另字段 attempt_count，别拿来当完成度）
+            # 进度条 = 注册成功 / 目标（CLEAN + UNCHECKED）。
             # 否则数量=1 时一建邮就 100%，验码/signup 还在跑也显示满格
             progress = min(100.0, float(self.success_count) / self.target_count * 100)
         return {
@@ -1470,10 +1474,12 @@ class RegisterEngine:
             "fail_count": self.fail_count,
             "clean_count": int(getattr(self, "clean_count", 0) or 0),
             "marked_count": int(getattr(self, "marked_count", 0) or 0),
+            "unchecked_count": int(getattr(self, "unchecked_count", 0) or 0),
             "attempt_count": attempts,
             "target_count": self.target_count,
             "workers": self.workers,
             "register_mode": getattr(self, "register_mode", None) or resolve_register_mode(),
+            "risk_check_enabled": bool(getattr(self, "risk_check_enabled", True)),
             "elapsed": round(elapsed, 1),
             "avg_seconds": round(avg, 1),
             "progress": round(progress, 1),
@@ -1498,6 +1504,11 @@ class RegisterEngine:
                     "has_token": is_auth_token_usable(it.get("auth_token")),
                     "nsfw": it.get("nsfw"),
                     "clean": it.get("clean"),
+                    "risk_status": it.get("risk_status") or (
+                        "clean"
+                        if it.get("clean") is True
+                        else ("marked" if it.get("clean") is False else "unchecked")
+                    ),
                     "time": it.get("time"),
                     "imported": bool(it.get("imported")),
                     "email_provider": it.get("email_provider") or "",
@@ -1782,13 +1793,15 @@ class RegisterEngine:
         already_written: bool = False,
         auth_token: Optional[dict] = None,
         proxy_audit: Optional[dict] = None,
+        clean: Optional[bool] = None,
     ) -> str:
         """
         写入 SSO 并计入成功。返回 success_id（空串表示未计入成功列表）。
-        same_session：停批看创邮次数，CLEAN 数可超过 target（在飞号收尾仍计成功）。
-        protocol：仍按 CLEAN 数顶 target。
+        same_session：停批看创邮次数，成功数可超过 target（在飞号收尾仍计成功）。
+        protocol：仍按成功数顶 target。
         already_written=True：SSO 已在紧急落盘写过，只更新计数/UI，避免重复行。
         auth_token：注册时 device flow 换到的 token，导入上游可直写，免二次换票。
+        clean=True 表示已通过 Risk；None 表示未检测（UNCHECKED）。
         """
         with self.file_lock:
             email_meta = (
@@ -1797,7 +1810,7 @@ class RegisterEngine:
                 else {}
             )
             mode_now = resolve_register_mode(getattr(self, "register_mode", None))
-            # same_session 以创邮次数停批；在飞号拿到 CLEAN 仍应进成功列表
+            # same_session 以创邮次数停批；在飞号拿到 SSO 仍应进成功列表
             # protocol 旧路径才用 success_count 顶 target
             if (
                 mode_now != "same_session"
@@ -1842,6 +1855,16 @@ class RegisterEngine:
                 email=email, sso=sso, proxy_audit=proxy_audit, **email_meta
             )
 
+            if clean is None:
+                self.unchecked_count += 1
+                if self.output_file:
+                    unchecked_path = Path(self.output_file).with_name(
+                        Path(self.output_file).stem + "_unchecked.txt"
+                    )
+                    unchecked_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(unchecked_path, "a", encoding="utf-8") as f:
+                        f.write(f"{email}----{sso}\n")
+
             self.success_count += 1
             avg = (time.time() - self.start_time) / max(1, self.success_count)
             nsfw_tag = "✓" if unhinged_ok else "…"
@@ -1857,7 +1880,8 @@ class RegisterEngine:
                     "sso_preview": (sso[:18] + "...") if len(sso) > 18 else sso,
                     "auth_token": cached_token,
                     "nsfw": unhinged_ok,
-                    "clean": None,
+                    "clean": clean,
+                    "risk_status": "clean" if clean is True else "unchecked",
                     "time": datetime.now().strftime("%H:%M:%S"),
                     "imported": False,
                     "email_provider": email_meta.get("email_provider") or "",
@@ -1868,8 +1892,9 @@ class RegisterEngine:
             self.recent_success.appendleft(success_item)
             extra = f" | {note}" if note else ""
             attempts = int(getattr(self, "attempt_count", 0) or 0)
+            risk_label = "CLEAN" if clean is True else "UNCHECKED"
             self.log(
-                f"CLEAN {self.success_count} · 创邮 {attempts}/{self.target_count} | {email} | "
+                f"{risk_label} · 成功 {self.success_count} · 创邮 {attempts}/{self.target_count} | {email} | "
                 f"SSO: {sso[:15]}... | 平均: {avg:.1f}s | NSFW: {nsfw_tag}{extra}",
                 "success",
             )
@@ -1878,8 +1903,8 @@ class RegisterEngine:
                     email_service.delete_email(email)
                 except Exception:
                     pass
-            # same_session：停批看创邮次数，不在这里用 CLEAN 数提前停
-            # protocol 旧路径仍可按 CLEAN 凑满（attempt 未启用时）
+            # same_session：停批看创邮次数，不在这里用成功数提前停
+            # protocol 旧路径仍可按成功数凑满（attempt 未启用时）
             if (
                 resolve_register_mode(getattr(self, "register_mode", None)) != "same_session"
                 and self.success_count >= self.target_count
@@ -1887,7 +1912,7 @@ class RegisterEngine:
             ):
                 self.stop_event.set()
                 self.log(
-                    f"已达到 CLEAN 目标: {self.success_count}/{self.target_count}，停止新注册",
+                    f"已达到成功目标: {self.success_count}/{self.target_count}，停止新注册",
                     "success",
                 )
             return success_id
@@ -1923,6 +1948,7 @@ class RegisterEngine:
                     item["nsfw"] = bool(unhinged_ok)
                 if clean is not None:
                     item["clean"] = bool(clean)
+                    item["risk_status"] = "clean" if bool(clean) else "marked"
                 if note:
                     item["note"] = note
                 break
@@ -2515,9 +2541,11 @@ class RegisterEngine:
         max_attempts = max(1, int(self.target_count or 1))
         consecutive_browser_fails = 0
         deny_break_n = _ss_deny_break_n()
+        risk_enabled = bool(getattr(self, "risk_check_enabled", True))
         self.log(
             f"same_session · 数量={max_attempts}（按创邮次数停）"
-            f" · 连续MARKED熔断={deny_break_n or 'off'}"
+            f" · Risk={'ON' if risk_enabled else 'OFF/UNCHECKED'}"
+            f" · 连续MARKED熔断={deny_break_n or 'off' if risk_enabled else 'off'}"
             f" · 代理池={self.proxy_pool.summary().get('enabled', 0)} 条",
             "info",
         )
@@ -2529,7 +2557,8 @@ class RegisterEngine:
             if done_n >= max_attempts:
                 self.log(
                     f"创邮已达数量 {done_n}/{max_attempts}"
-                    f" · CLEAN {self.success_count}"
+                    f" · CLEAN {getattr(self, 'clean_count', 0)}"
+                    f" · UNCHECKED {getattr(self, 'unchecked_count', 0)}"
                     f" · MARKED {getattr(self, 'marked_count', 0)}"
                     f" · 过程失败 {self.fail_count} · 停批",
                     "info",
@@ -2539,7 +2568,7 @@ class RegisterEngine:
             # 连续 MARKED 熔断：同出口 Castle deny 簇打开后别硬刚
             with self._ss_deny_lock:
                 cur_deny = int(self._ss_consecutive_deny or 0)
-            if deny_break_n > 0 and cur_deny >= deny_break_n:
+            if risk_enabled and deny_break_n > 0 and cur_deny >= deny_break_n:
                 self.log(
                     f"连续 MARKED/deny {cur_deny}/{deny_break_n} · 熔断停批"
                     f"（同出口 registration 密度过高，换出口/冷却后再开）",
@@ -2550,7 +2579,9 @@ class RegisterEngine:
             idx = self._next_ss_idx()
             # 号间抖动：压同出口短时 registration 密度（Castle deny 簇）
             # 连续 MARKED 时自动加长冷却
-            jitter = _ss_inter_account_delay(self.workers, consecutive_deny=cur_deny)
+            jitter = _ss_inter_account_delay(
+                self.workers, consecutive_deny=cur_deny if risk_enabled else 0
+            )
             if jitter > 0 and idx > 1:
                 if cur_deny > 0 and jitter >= 1.0:
                     self.log(
@@ -2726,7 +2757,9 @@ class RegisterEngine:
                     f"al={str(fp.get('accept_language') or '')[:28]} · "
                     f"vp={vp.get('width')}x{vp.get('height')}"
                     f"{' · humanize' if fp.get('humanize') else ''} · "
-                    f"CLEAN={self.success_count} MARKED={getattr(self, 'marked_count', 0)} "
+                    f"CLEAN={getattr(self, 'clean_count', 0)} "
+                    f"UNCHECKED={getattr(self, 'unchecked_count', 0)} "
+                    f"MARKED={getattr(self, 'marked_count', 0)} "
                     f"fail={self.fail_count}",
                     "info",
                 )
@@ -2875,16 +2908,23 @@ class RegisterEngine:
                         steps_tail = " · " + " > ".join(str(x) for x in steps[-6:])
                 except Exception:
                     steps_tail = ""
+                risk_enabled = bool(getattr(self, "risk_check_enabled", True))
                 if stopped_mid:
+                    finish_action = "继续 risk/落盘" if risk_enabled else "落盘"
                     self.log(
-                        f"{email} 停批后仍拿到 SSO · 继续 risk/落盘（不丢号）"
+                        f"{email} 停批后仍拿到 SSO · {finish_action}（不丢号）"
                         f" · castle={castle_len}/{castle_method}{steps_tail}",
                         "warn",
                     )
                 else:
                     self.log(
                         f"{email} same_session SSO 到手 · castle={castle_len}"
-                        f"/{castle_method}{steps_tail} · 先 risk 再决定是否计成功",
+                        f"/{castle_method}{steps_tail} · "
+                        + (
+                            "先 risk 再决定是否计成功"
+                            if risk_enabled
+                            else "Risk 已关闭，将记为 UNCHECKED"
+                        ),
                         "info",
                     )
                 # 仅 forensic 紧急盘，不写主成功文件、不进成功列表
@@ -2899,15 +2939,25 @@ class RegisterEngine:
                 except Exception:
                     pass
 
-                # 前台 risk 门禁：只有 CLEAN 才计成功 / 可导入；换 token 异步
-                clean = self._probe_and_mark_clean(
-                    email=email,
-                    sso=sso,
-                    sso_rw=sso_rw,
-                    success_id="",
-                    proxy_spec=proxy_spec_str,
-                    foreground=True,
-                )
+                # 前台 risk 门禁：开启时只有 CLEAN 才计成功 / 可自动导入。
+                # 关闭时仅跳过此探测，Turnstile/Castle 与后续 enrich 仍照常运行。
+                if risk_enabled:
+                    clean = self._probe_and_mark_clean(
+                        email=email,
+                        sso=sso,
+                        sso_rw=sso_rw,
+                        success_id="",
+                        proxy_spec=proxy_spec_str,
+                        foreground=True,
+                    )
+                else:
+                    # 仅作流程放行哨兵；落库时仍传 clean=None，禁止伪装 CLEAN。
+                    clean = True
+                    self.log(
+                        f"{email} Risk 探测已跳过 · 账号状态=UNCHECKED "
+                        "· 敏感目标不会自动导入",
+                        "warn",
+                    )
                 if clean is not True:
                     # MARKED / 探测失败：已写 _marked，不进成功列表、不换票、不入库
                     # MARKED 只记 marked_count，不再叠 fail_count（避免「目标5却失败7」误解）
@@ -2969,9 +3019,10 @@ class RegisterEngine:
                         return
                     continue
 
-                # —— 仅 CLEAN 路径：清零连续 MARKED ——
-                with self._ss_deny_lock:
-                    self._ss_consecutive_deny = 0
+                # —— 仅实际 CLEAN 路径：清零连续 MARKED ——
+                if risk_enabled:
+                    with self._ss_deny_lock:
+                        self._ss_consecutive_deny = 0
                 ua = (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -2984,19 +3035,23 @@ class RegisterEngine:
                     email_service=email_service,
                     note=(
                         f"mode=same_session castle={castle_len} "
-                        f"method={castle_method} risk=CLEAN"
+                        f"method={castle_method} "
+                        f"risk={'CLEAN' if risk_enabled else 'UNCHECKED'}"
                     ),
                     already_written=False,
                     auth_token=None,
                     proxy_audit=self.proxy_pool.lease_audit(proxy_lease),
+                    clean=True if risk_enabled else None,
                 )
                 if sid:
-                    self._update_success_meta(
-                        sid, clean=True, note="risk=CLEAN · token=async"
-                    )
+                    if risk_enabled:
+                        self._update_success_meta(
+                            sid, clean=True, note="risk=CLEAN · token=async"
+                        )
                     # 换 token + 协议/NSFW 全部丢 enrich 池，主路径立刻开下一号
                     self.log(
-                        f"{email} CLEAN 已计成功 · 换 token/协议/NSFW 异步处理中",
+                        f"{email} {'CLEAN' if risk_enabled else 'UNCHECKED'} 已计成功 "
+                        "· 换 token/协议/NSFW 异步处理中",
                         "info",
                     )
                     self._schedule_enrich(
@@ -3646,7 +3701,7 @@ class RegisterEngine:
                     )
             except Exception:
                 pass
-            # 主流程不自动入库：CLEAN/token 只落盘 + recent_success，
+            # 主流程不自动入库：账号/token 只落盘 + recent_success，
             # 若 Web 运行时启用了目标，则只排队，不阻塞注册线程。
             callback = getattr(self, "auto_import_callback", None)
             if callable(callback):
@@ -3676,11 +3731,13 @@ class RegisterEngine:
                 pass
             else:
                 self.status = "done"
-                # 口径：数量=创邮次数；CLEAN/MARKED/过程失败分开计
+                # 口径：数量=创邮次数；CLEAN/UNCHECKED/MARKED/过程失败分开计
                 attempts = int(getattr(self, "attempt_count", 0) or 0)
                 self.log(
                     f"任务结束：创邮 {attempts}/{self.target_count}"
-                    f" · CLEAN {self.success_count}"
+                    f" · 成功 {self.success_count}"
+                    f" · CLEAN {getattr(self, 'clean_count', 0)}"
+                    f" · UNCHECKED {getattr(self, 'unchecked_count', 0)}"
                     f" · 过程失败 {self.fail_count}"
                     f" · MARKED {getattr(self, 'marked_count', 0)}"
                     f" · 连续MARKED {getattr(self, '_ss_consecutive_deny', 0)}",
@@ -3722,7 +3779,7 @@ class RegisterEngine:
             for it in list(self.recent_success)
             if it.get("sso")
             and not it.get("imported")
-            and (it.get("clean") is True or it.get("clean") is None)
+            and it.get("clean") is True
         ]
         already = sum(1 for it in list(self.recent_success) if it.get("imported"))
         if not pending and already > 0:
@@ -3829,6 +3886,7 @@ class RegisterEngine:
         target: int = 100,
         blocking: bool = False,
         mode: Optional[str] = None,
+        risk_check_enabled: bool = True,
     ) -> dict:
         with self._run_lock:
             # 线程还没跑到 initialize 时 status 也要立刻占位，防止重复启动
@@ -3858,11 +3916,14 @@ class RegisterEngine:
             self.fail_count = 0
             self.clean_count = 0
             self.marked_count = 0
+            self.unchecked_count = 0
             self.attempt_count = 0
             self._ss_consecutive_deny = 0
             self.target_count = target
             self.workers = workers
             self.register_mode = reg_mode
+            # protocol 路径没有同会话 Risk 门禁，始终按 UNCHECKED 处理。
+            self.risk_check_enabled = bool(risk_check_enabled) and reg_mode == "same_session"
             self._ss_idx = 0
             self.start_time = time.time()
             self.end_time = None  # 新一轮重新计时
@@ -3878,6 +3939,11 @@ class RegisterEngine:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             prefix = "grok_ss" if reg_mode == "same_session" else "grok"
             self.output_file = f"keys/{prefix}_{timestamp}_{target}.txt"
+            self.log(
+                "账号 Risk 检测: "
+                + ("已启用" if self.risk_check_enabled else "已关闭（成功号记为 UNCHECKED）"),
+                "info" if self.risk_check_enabled else "warn",
+            )
 
             if blocking:
                 self._run_workers(workers)

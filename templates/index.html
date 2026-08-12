@@ -303,7 +303,7 @@
 
     <main class="max-w-[1680px] mx-auto px-4 sm:px-6 py-6 space-y-5">
       <!-- Stats -->
-      <section class="grid grid-cols-2 lg:grid-cols-5 gap-3 sm:gap-4">
+      <section class="grid grid-cols-2 lg:grid-cols-6 gap-3 sm:gap-4">
         <article class="panel rounded-2xl p-4">
           <p class="text-[11px] uppercase tracking-[0.16em] text-ink-700/50 font-semibold">成功</p>
           <p id="statSuccess" class="mt-1 font-display text-3xl font-bold text-leaf-600">0</p>
@@ -313,6 +313,11 @@
           <p class="text-[11px] uppercase tracking-[0.16em] text-ink-700/50 font-semibold">CLEAN</p>
           <p id="statClean" class="mt-1 font-display text-3xl font-bold text-leaf-600">0</p>
           <p class="text-xs text-ink-700/50 font-mono mt-1">可入库</p>
+        </article>
+        <article class="panel rounded-2xl p-4">
+          <p class="text-[11px] uppercase tracking-[0.16em] text-ink-700/50 font-semibold">UNCHECKED</p>
+          <p id="statUnchecked" class="mt-1 font-display text-3xl font-bold text-sun-500">0</p>
+          <p class="text-xs text-ink-700/50 font-mono mt-1">未检测 · 手动导入</p>
         </article>
         <article class="panel rounded-2xl p-4">
           <p class="text-[11px] uppercase tracking-[0.16em] text-ink-700/50 font-semibold">过程失败</p>
@@ -344,13 +349,13 @@
           <span>路径：<span id="statMode" class="text-ink-800">同会话 CLEAN</span></span>
           <span>成功 <span id="statSuccessInline" class="text-leaf-600">0</span> / 目标 <span id="statTargetInline" class="text-ink-800">0</span></span>
           <span>创邮 <span id="statAttemptInline" class="text-ink-800">0</span> / <span id="statAttemptTargetInline" class="text-ink-800">0</span></span>
-          <span>CLEAN <span id="statCleanInline" class="text-leaf-600">0</span> · MARKED <span id="statMarked" class="text-sun-500">0</span></span>
+          <span>CLEAN <span id="statCleanInline" class="text-leaf-600">0</span> · UNCHECKED <span id="statUncheckedInline" class="text-sun-500">0</span> · MARKED <span id="statMarked" class="text-rose-500">0</span></span>
           <span>输出：<span id="outputFile" class="text-ink-800">—</span></span>
           <span>Action：<span id="actionId" class="text-ink-800">—</span></span>
         </div>
         <div id="pipelineBox" class="mt-3 rounded-xl bg-paper-100 border border-ink-900/5 px-3 py-2.5 text-[11px] font-mono text-ink-700/70 leading-relaxed">
-          <div class="text-[10px] uppercase tracking-[0.14em] text-ink-700/40 font-semibold mb-1">CLEAN 流水线</div>
-          <div id="pipelineSteps" class="text-ink-800">空闲 · 启动后显示：建邮 → camoufox → castle → 发码/验码 → turnstile → signup → SSO → risk → 计成功 → 异步 risk/token/NSFW</div>
+          <div class="text-[10px] uppercase tracking-[0.14em] text-ink-700/40 font-semibold mb-1">注册流水线</div>
+          <div id="pipelineSteps" class="text-ink-800">空闲 · 启动后显示：建邮 → camoufox → castle → 发码/验码 → turnstile → signup → SSO → risk（可选） → 计成功 → 异步 token/NSFW</div>
         </div>
       </section>
 
@@ -381,6 +386,19 @@
                     <input type="hidden" id="registerMode" name="registerMode" value="same_session" />
                   </div>
                   <p class="mt-1.5 text-[11px] text-ink-700/50">同会话：页内 mint castle + fetch（已验证 CLEAN）。旧协议易 CASTLE deny。</p>
+                </div>
+                <div class="rounded-xl border border-ink-900/8 bg-paper-50 p-3">
+                  <label class="flex items-start gap-3 cursor-pointer" for="riskCheckEnabled">
+                    <input id="riskCheckEnabled" type="checkbox" checked
+                           class="mt-0.5 h-4 w-4 rounded border-paper-300 text-brand-500 focus:ring-brand-500/30" />
+                    <span class="min-w-0">
+                      <span class="block text-sm font-semibold text-ink-900">启用账号 Risk 检测</span>
+                      <span class="block mt-0.5 text-[11px] text-ink-700/50">SSO 到手后判定 CLEAN / MARKED；不影响 Turnstile 和 Castle。</span>
+                    </span>
+                  </label>
+                  <div id="riskCheckWarning" class="hidden mt-2 rounded-lg border border-amber-300/70 bg-amber-50 px-2.5 py-2 text-[11px] leading-relaxed text-amber-800">
+                    当前批次将跳过 Risk 探测，账号记为 UNCHECKED；Sub2API、CPA 和 Build 等敏感目标不会自动导入，需在导入中心手动覆盖。
+                  </div>
                 </div>
                 <div>
                   <label class="field-label" for="workers">并发线程</label>
@@ -707,6 +725,8 @@
         [/换 token 失败|换 token 异常|换 token 返回体不可用|approve 成功但无 token/i, '异步换 token ✗ · 导入兜底'],
         [/换 token 开始/i, '异步换 token 中…'],
         [/CLEAN 已计成功 · 换 token/i, 'CLEAN ✓ · token/协议/NSFW 异步中'],
+        [/UNCHECKED 已计成功/i, 'UNCHECKED · token/协议/NSFW 异步中'],
+        [/Risk 探测已跳过/i, 'Risk 已跳过 → UNCHECKED'],
         [/risk CLEAN/i, 'risk · CLEAN ✓ → 计成功 → 异步 token/NSFW'],
         [/risk MARKED|绕过成功列表/i, 'risk · MARKED · 已绕过（不计成功/不导入）'],
         [/risk 探测开始/i, 'risk 探测中…'],
@@ -850,8 +870,28 @@
         { value: 'same_session', label: '同会话 CLEAN（推荐）' },
         { value: 'protocol', label: '旧混合协议（易 deny）' },
       ],
-      'same_session'
+      'same_session',
+      (val) => syncRiskControls(val)
     );
+
+    function syncRiskControls(mode) {
+      const checkbox = $('riskCheckEnabled');
+      const warning = $('riskCheckWarning');
+      if (!checkbox || !warning) return;
+      const protocol = String(mode || $('registerMode').value) === 'protocol';
+      checkbox.disabled = !!state.running || protocol;
+      warning.classList.toggle('hidden', checkbox.checked && !protocol);
+      if (protocol) {
+        warning.textContent = '旧混合协议路径不执行账号 Risk 探测，成功号将记为 UNCHECKED，敏感目标不会自动导入。';
+      } else {
+        warning.textContent = '当前批次将跳过 Risk 探测，账号记为 UNCHECKED；Sub2API、CPA 和 Build 等敏感目标不会自动导入，需在导入中心手动覆盖。';
+      }
+    }
+
+    $('riskCheckEnabled').addEventListener('change', () => {
+      syncRiskControls($('registerMode').value);
+    });
+    syncRiskControls('same_session');
 
     const workerSelect = initSelect(
       document.querySelector('[data-select="workers"]'),
@@ -1075,10 +1115,14 @@
       $('actionId').textContent = data.action_id ? data.action_id.slice(0, 18) + '…' : '—';
       if ($('statMode')) {
         const m = data.register_mode || 'same_session';
-        $('statMode').textContent = m === 'same_session' ? '同会话 CLEAN' : '旧协议';
+        $('statMode').textContent = m === 'same_session'
+          ? (data.risk_check_enabled === false ? '同会话 UNCHECKED' : '同会话 CLEAN')
+          : '旧协议 UNCHECKED';
       }
       if ($('statClean')) $('statClean').textContent = data.clean_count ?? 0;
       if ($('statCleanInline')) $('statCleanInline').textContent = data.clean_count ?? 0;
+      if ($('statUnchecked')) $('statUnchecked').textContent = data.unchecked_count ?? 0;
+      if ($('statUncheckedInline')) $('statUncheckedInline').textContent = data.unchecked_count ?? 0;
       if ($('statMarked')) $('statMarked').textContent = data.marked_count ?? 0;
       if ($('statAttemptInline')) $('statAttemptInline').textContent = data.attempt_count ?? 0;
       if ($('statAttemptTargetInline')) $('statAttemptTargetInline').textContent = data.target_count ?? 0;
@@ -1089,15 +1133,20 @@
         if (!state.lastPipelineHint || state.lastPipelineHint.indexOf('空闲') < 0) {
           const sc = data.success_count ?? 0;
           const cc = data.clean_count ?? 0;
+          const uc = data.unchecked_count ?? 0;
           const mc = data.marked_count ?? 0;
           if (data.status === 'done') {
-            setPipelineHint(`本轮结束 · 成功 ${sc} · CLEAN ${cc} · MARKED ${mc}`);
+            setPipelineHint(`本轮结束 · 成功 ${sc} · CLEAN ${cc} · UNCHECKED ${uc} · MARKED ${mc}`);
           }
         }
       }
       $('btnStart').disabled = state.running;
       $('btnStop').disabled = !state.running;
       if (registerModeSelect && registerModeSelect._setDisabled) registerModeSelect._setDisabled(state.running);
+      if (state.running && data.register_mode === 'same_session' && $('riskCheckEnabled')) {
+        $('riskCheckEnabled').checked = data.risk_check_enabled !== false;
+      }
+      syncRiskControls(state.running ? data.register_mode : $('registerMode').value);
       workerSelect._setDisabled(state.running);
       targetSelect._setDisabled(state.running);
       $('targetCustom').disabled = state.running;
@@ -1127,9 +1176,9 @@
         list.innerHTML = '<p class="text-ink-700/45">成功账号会显示在这里</p>';
       } else {
         list.innerHTML = items.map(it => {
-          let cleanBadge = '<span class="text-ink-700/35">risk…</span>';
+          let cleanBadge = '<span class="text-sun-500 font-semibold">UNCHECKED</span>';
           if (it.clean === true) cleanBadge = '<span class="text-leaf-600 font-semibold">CLEAN</span>';
-          else if (it.clean === false) cleanBadge = '<span class="text-sun-500 font-semibold">MARKED</span>';
+          else if (it.clean === false) cleanBadge = '<span class="text-rose-500 font-semibold">MARKED</span>';
           const tokenBadge = it.has_token
             ? '<span class="text-leaf-600 font-semibold">token✓</span>'
             : '<span class="text-ink-700/35">token·</span>';
@@ -1198,7 +1247,8 @@
           const sc = state.lastStatus.success_count ?? 0;
           const tc = state.lastStatus.target_count ?? 0;
           const cc = state.lastStatus.clean_count ?? 0;
-          setPipelineHint(`运行中 · 成功 ${sc}/${tc} · CLEAN ${cc} · 见下方双栏日志`);
+          const uc = state.lastStatus.unchecked_count ?? 0;
+          setPipelineHint(`运行中 · 成功 ${sc}/${tc} · CLEAN ${cc} · UNCHECKED ${uc} · 见下方双栏日志`);
         }
         state.pollFailCount = 0;
         if (!state.serverConnected) {
@@ -1405,6 +1455,7 @@
       let workers = Number($('workers').value || 4);
       let target = Number($('targetCustom').value || $('target').value || 100);
       let mode = ($('registerMode') && $('registerMode').value) || 'same_session';
+      const riskCheckEnabled = mode === 'same_session' && !!$('riskCheckEnabled').checked;
       state.starting = true;
       $('btnStart').disabled = true;
       setMessage($('formMessage'), '正在启动...', true);
@@ -1412,7 +1463,7 @@
         const data = await fetchJSON('/api/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ workers, target, mode }),
+          body: JSON.stringify({ workers, target, mode, risk_check_enabled: riskCheckEnabled }),
         });
         setMessage($('formMessage'), data.message || '已启动', true);
         renderStatus(data);

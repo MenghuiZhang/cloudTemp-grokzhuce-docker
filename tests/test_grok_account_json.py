@@ -82,6 +82,47 @@ class RegisterEngineAccountJsonTests(unittest.TestCase):
         self.assertEqual(accounts[0]["email_provider"], "cloudflare_temp")
         self.assertEqual(accounts[0]["email_domain"], "a.example")
 
+    def test_unchecked_success_has_separate_counter_file_and_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = RegisterEngine(log_fn=lambda *_args: None)
+            engine.output_file = str(Path(tmp) / "result.txt")
+            engine.target_count = 10
+            engine.start_time = 1.0
+
+            success_id = engine._record_success(
+                "unchecked@example.com",
+                "unchecked-sso",
+                False,
+                clean=None,
+            )
+
+            self.assertTrue(success_id)
+            self.assertEqual(engine.success_count, 1)
+            self.assertEqual(engine.unchecked_count, 1)
+            self.assertIsNone(engine.recent_success[0]["clean"])
+            self.assertEqual(engine.recent_success[0]["risk_status"], "unchecked")
+            self.assertEqual(engine.get_status()["unchecked_count"], 1)
+            self.assertEqual(
+                (Path(tmp) / "result_unchecked.txt").read_text(encoding="utf-8"),
+                "unchecked@example.com----unchecked-sso\n",
+            )
+
+    def test_clean_success_is_not_written_to_unchecked_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            engine = RegisterEngine(log_fn=lambda *_args: None)
+            engine.output_file = str(Path(tmp) / "result.txt")
+            engine.target_count = 10
+            engine.start_time = 1.0
+
+            engine._record_success(
+                "clean@example.com", "clean-sso", False, clean=True
+            )
+
+            self.assertEqual(engine.unchecked_count, 0)
+            self.assertTrue(engine.recent_success[0]["clean"])
+            self.assertEqual(engine.recent_success[0]["risk_status"], "clean")
+            self.assertFalse((Path(tmp) / "result_unchecked.txt").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

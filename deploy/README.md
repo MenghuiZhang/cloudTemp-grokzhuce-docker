@@ -55,7 +55,7 @@ COMPOSE_PROJECT_NAME=grok-prod
 GROK_BIND_ADDRESS=127.0.0.1
 GROK_HOST_PORT=3333
 GROK_IMAGE_REPOSITORY=ghcr.io/menghuizhang/cloudtemp-grokzhuce-docker
-GROK_IMAGE_REF=ghcr.io/menghuizhang/cloudtemp-grokzhuce-docker:v1.0.0
+GROK_IMAGE_REF=ghcr.io/menghuizhang/cloudtemp-grokzhuce-docker:v1.0.1
 DEPLOY_HEALTH_TIMEOUT=180
 ```
 
@@ -86,7 +86,7 @@ UPSTREAM_URL=https://SUB2API_DOMAIN.example.com
 只安装一个正式实例时，可在完成 GHCR 机器账号授权后运行：
 
 ```bash
-./deploy/scripts/install-prod.sh v1.0.0
+./deploy/scripts/install-prod.sh v1.0.1
 ```
 
 脚本会创建缺失的 `.env`、`deploy/deploy.env` 和持久化目录，先复用当前 Linux
