@@ -608,6 +608,46 @@
                   </div>
                 </div>
 
+                <!-- 3. Storage protection -->
+                <div class="cfg-block">
+                  <div class="flex items-start justify-between gap-3">
+                    <div>
+                      <h3 class="cfg-title">日志与磁盘保护</h3>
+                      <p id="storageUsage" class="hint">正在读取当前占用…</p>
+                    </div>
+                    <button type="button" id="btnClearCaptures" class="btn btn-danger text-[11px] px-2.5 py-1 shrink-0">清理抓包</button>
+                  </div>
+                  <label class="flex items-start gap-2 text-[11px] text-ink-700/75 cursor-pointer">
+                    <input id="cfgCaptureDumps" type="checkbox" class="mt-0.5 rounded border-paper-300 text-brand-500 focus:ring-brand-500/30" />
+                    <span>
+                      <span class="font-semibold text-ink-800">启用诊断抓包</span>
+                      <span class="block text-rose-500/80">默认关闭；响应体可能包含敏感数据，仅排障时临时开启</span>
+                    </span>
+                  </label>
+                  <details class="rounded-xl border border-ink-900/5 bg-paper-50/70 px-3 py-2">
+                    <summary class="cursor-pointer text-[11px] font-semibold text-ink-700/70 select-none">高级限制</summary>
+                    <div class="grid grid-cols-2 gap-2 pt-2">
+                      <div>
+                        <label class="field-label" for="cfgCaptureMaxGroups">最多抓包组数</label>
+                        <input id="cfgCaptureMaxGroups" class="field font-mono text-sm" type="number" min="1" max="1000" value="20" />
+                      </div>
+                      <div>
+                        <label class="field-label" for="cfgCaptureMaxMb">抓包总上限（MB）</label>
+                        <input id="cfgCaptureMaxMb" class="field font-mono text-sm" type="number" min="1" max="10240" value="50" />
+                      </div>
+                      <div>
+                        <label class="field-label" for="cfgLogMaxMb">单份日志上限（MB）</label>
+                        <input id="cfgLogMaxMb" class="field font-mono text-sm" type="number" min="1" max="1024" value="10" />
+                      </div>
+                      <div>
+                        <label class="field-label" for="cfgLogFileCount">保留文件数（含当前）</label>
+                        <input id="cfgLogFileCount" class="field font-mono text-sm" type="number" min="1" max="20" value="3" />
+                      </div>
+                    </div>
+                  </details>
+                  <p id="storageMessage" class="text-[11px] font-mono min-h-[1rem] text-ink-700/50"></p>
+                </div>
+
                 <!-- 4. UI -->
                 <div class="cfg-block">
                   <h3 class="cfg-title">控制台监听</h3>
@@ -1024,6 +1064,13 @@
         .replaceAll('>', '&gt;');
     }
 
+    function formatBytes(value) {
+      const bytes = Math.max(0, Number(value || 0));
+      if (bytes < 1024) return `${bytes} B`;
+      if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+      return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+    }
+
     async function fetchJSON(url, options) {
       const res = await fetch(url, options);
       const data = await res.json().catch(() => ({}));
@@ -1382,6 +1429,13 @@
         $('cfgYes').value = c.YESCAPTCHA_KEY || '';
         $('cfgSolver').value = c.SOLVER_URL || 'http://127.0.0.1:5072';
         $('cfgSolverThreads').value = c.SOLVER_THREADS || '2';
+        $('cfgCaptureDumps').checked = ['1', 'true', 'yes', 'on'].includes(
+          String(c.SOLVER_CAPTURE_DUMPS || '0').toLowerCase()
+        );
+        $('cfgCaptureMaxGroups').value = c.SOLVER_CAPTURE_MAX_GROUPS || '20';
+        $('cfgCaptureMaxMb').value = c.SOLVER_CAPTURE_MAX_MB || '50';
+        $('cfgLogMaxMb').value = c.LOG_MAX_MB || '10';
+        $('cfgLogFileCount').value = c.LOG_ROTATE_FILE_COUNT || '3';
         solverBrowserSelect._setValue(c.SOLVER_BROWSER || 'camoufox', true);
         $('cfgUiHost').value = c.UI_HOST || '127.0.0.1';
         $('cfgUiPort').value = c.UI_PORT || '3333';
@@ -1416,9 +1470,19 @@
           $('proxyEgressLine').classList.add('hidden');
         }
         // 邮箱域名发现已迁移到独立邮箱配置页，此处不再后台请求邮箱 API。
+        await loadStorage();
       } catch (e) {
         setMessage($('configMessage'), e.message || '加载失败', false);
       }
+    }
+
+    async function loadStorage() {
+      const data = await fetchJSON('/api/storage');
+      const captures = data.captures || {};
+      const diskLogs = data.logs || {};
+      const logsTotal = Object.values(diskLogs).reduce((sum, value) => sum + Number(value || 0), 0);
+      $('storageUsage').textContent = `抓包 ${captures.groups || 0} 组 / ${formatBytes(captures.bytes)} · 轮转日志 ${formatBytes(logsTotal)}`;
+      return data;
     }
 
     async function refreshKeys() {
@@ -1495,6 +1559,11 @@
         SOLVER_URL: $('cfgSolver').value.trim() || 'http://127.0.0.1:5072',
         SOLVER_BROWSER: $('cfgSolverBrowser').value || 'camoufox',
         SOLVER_THREADS: $('cfgSolverThreads').value.trim() || '2',
+        SOLVER_CAPTURE_DUMPS: $('cfgCaptureDumps').checked ? '1' : '0',
+        SOLVER_CAPTURE_MAX_GROUPS: $('cfgCaptureMaxGroups').value.trim() || '20',
+        SOLVER_CAPTURE_MAX_MB: $('cfgCaptureMaxMb').value.trim() || '50',
+        LOG_MAX_MB: $('cfgLogMaxMb').value.trim() || '10',
+        LOG_ROTATE_FILE_COUNT: $('cfgLogFileCount').value.trim() || '3',
         UI_HOST: $('cfgUiHost').value.trim() || '127.0.0.1',
         UI_PORT: $('cfgUiPort').value.trim() || '3333',
         captcha_mode: captchaMode,
@@ -1514,10 +1583,26 @@
         if (data.env) {
           renderStatus({ ...(state.lastStatus || {}), env: data.env, status: (state.lastStatus && state.lastStatus.status) || 'idle' });
         }
+        await loadStorage();
       } catch (e) {
         setMessage($('configMessage'), e.message || '保存失败', false);
       } finally {
         $('btnSaveConfig').disabled = false;
+      }
+    });
+
+    $('btnClearCaptures').addEventListener('click', async () => {
+      if (!confirm('确定删除全部诊断抓包吗？账号结果和普通日志不会受影响。')) return;
+      $('btnClearCaptures').disabled = true;
+      setMessage($('storageMessage'), '正在清理…', true);
+      try {
+        const data = await fetchJSON('/api/storage/captures', { method: 'DELETE' });
+        setMessage($('storageMessage'), data.message || '清理完成', true);
+        await loadStorage();
+      } catch (e) {
+        setMessage($('storageMessage'), e.message || '清理失败', false);
+      } finally {
+        $('btnClearCaptures').disabled = false;
       }
     });
 

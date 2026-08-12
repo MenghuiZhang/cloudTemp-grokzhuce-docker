@@ -50,6 +50,7 @@ except Exception:
     pass
 
 from dotenv import load_dotenv
+from log_storage import append_rotating_text
 
 load_dotenv(BASE / ".env", override=False)
 
@@ -534,8 +535,7 @@ def log(msg: str, level: str = "info") -> None:
     #      或 Get-Content -Encoding utf8 logs\standalone_live.log
     # 注意：别用 Tee-Object 接管道（PS5 会把 stderr/警告当 NativeCommandError 再乱码）
     try:
-        with open(_LIVE_LOG_PATH, "a", encoding="utf-8", errors="replace", newline="\n") as f:
-            f.write(line + "\n")
+        append_rotating_text(_LIVE_LOG_PATH, line + "\n")
     except Exception:
         pass
 

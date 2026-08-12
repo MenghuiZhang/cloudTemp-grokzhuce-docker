@@ -123,6 +123,9 @@ cp .env.example .env
 | `SOLVER_URL` | 本地 Solver 地址 | `http://127.0.0.1:5072` |
 | `SOLVER_BROWSER` | `camoufox` / `chromium` | `camoufox` |
 | `SOLVER_THREADS` | Solver 浏览器线程 | `4` |
+| `SOLVER_CAPTURE_DUMPS` | 保存 FO/RCH 诊断抓包；仅排障时开启 | `0` |
+| `SOLVER_CAPTURE_MAX_GROUPS` / `SOLVER_CAPTURE_MAX_MB` | 抓包保留组数/总容量双上限 | `20` / `50` |
+| `LOG_MAX_MB` / `LOG_ROTATE_FILE_COUNT` | 单份日志上限/总文件数（含当前） | `10` / `3` |
 | `UI_HOST` / `UI_PORT` | Web 监听 | `127.0.0.1` / `3333` |
 | `data/proxy_pool.json` | 注册代理池的本地私密存储；由 `/proxy-settings` 管理，不提交 Git | 空池（直连） |
 | `SUB2API_URL` | 旧版 sub2api 根地址；首次进入导入中心时用于迁移 | `http://127.0.0.1:9898` |
@@ -169,6 +172,7 @@ python start.py
 - **邮箱配置**：独立页面管理 provider、凭据、域名池、测试与启用
 - **导入服务**：独立页面管理 Sub2API、CLIProxyAPI 和 grok2api，地址为 `/import-services`
 - **配置**：Solver 等通用参数 → 写入 `.env`
+- **日志与磁盘保护**：抓包默认关闭；可查看占用、调整保留上限并清理历史诊断抓包
 - **注册代理**：独立页面管理代理池、调度与健康状态 → 写入 `data/proxy_pool.json`
 - **运行**：选择 `same_session`、并发、数量和本批 Risk 检测开关后开始
 - **日志**：左侧主流程（建邮→camoufox→signup→SSO），右侧 Risk / Token / NSFW

@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, render_template, request, send_from_directory
 
 from grok import LogBuffer, RegisterEngine
+from log_storage import clear_capture_dirs, enforce_storage_limits, storage_stats
 from g.email_config import (
     EMAIL_CONFIG_KEYS,
     EMAIL_DEFAULTS,
@@ -50,6 +51,7 @@ ENV_PATH = BASE_DIR / ".env"
 proxy_pool = get_proxy_pool(BASE_DIR)
 
 load_dotenv(ENV_PATH)
+enforce_storage_limits(BASE_DIR)
 
 app = Flask(__name__, template_folder=str(BASE_DIR / "templates"), static_folder=str(BASE_DIR / "static"))
 
@@ -133,6 +135,11 @@ CONFIG_KEYS = (
     "SOLVER_HOST",
     "SOLVER_PORT",
     "SOLVER_DEBUG",
+    "SOLVER_CAPTURE_DUMPS",
+    "SOLVER_CAPTURE_MAX_GROUPS",
+    "SOLVER_CAPTURE_MAX_MB",
+    "LOG_MAX_MB",
+    "LOG_ROTATE_FILE_COUNT",
     "UI_HOST",
     "UI_PORT",
     "SUB2API_URL",
@@ -166,6 +173,11 @@ DEFAULTS = {
     "SOLVER_HOST": "127.0.0.1",
     "SOLVER_PORT": "5072",
     "SOLVER_DEBUG": "1",
+    "SOLVER_CAPTURE_DUMPS": "0",
+    "SOLVER_CAPTURE_MAX_GROUPS": "20",
+    "SOLVER_CAPTURE_MAX_MB": "50",
+    "LOG_MAX_MB": "10",
+    "LOG_ROTATE_FILE_COUNT": "3",
     "UI_HOST": "127.0.0.1",
     "UI_PORT": "3333",
     "SUB2API_URL": "http://127.0.0.1:9898",
@@ -319,6 +331,11 @@ def write_env_file(values: dict) -> None:
             f"SOLVER_HOST={values.get('SOLVER_HOST', DEFAULTS['SOLVER_HOST'])}",
             f"SOLVER_PORT={values.get('SOLVER_PORT', DEFAULTS['SOLVER_PORT'])}",
             f"SOLVER_DEBUG={values.get('SOLVER_DEBUG', DEFAULTS['SOLVER_DEBUG'])}",
+            f"SOLVER_CAPTURE_DUMPS={values.get('SOLVER_CAPTURE_DUMPS', DEFAULTS['SOLVER_CAPTURE_DUMPS'])}",
+            f"SOLVER_CAPTURE_MAX_GROUPS={values.get('SOLVER_CAPTURE_MAX_GROUPS', DEFAULTS['SOLVER_CAPTURE_MAX_GROUPS'])}",
+            f"SOLVER_CAPTURE_MAX_MB={values.get('SOLVER_CAPTURE_MAX_MB', DEFAULTS['SOLVER_CAPTURE_MAX_MB'])}",
+            f"LOG_MAX_MB={values.get('LOG_MAX_MB', DEFAULTS['LOG_MAX_MB'])}",
+            f"LOG_ROTATE_FILE_COUNT={values.get('LOG_ROTATE_FILE_COUNT', DEFAULTS['LOG_ROTATE_FILE_COUNT'])}",
             "",
             "# Web 控制台",
             f"UI_HOST={values.get('UI_HOST', DEFAULTS['UI_HOST'])}",
@@ -2005,6 +2022,11 @@ def get_config():
             "SOLVER_HOST": cfg.get("SOLVER_HOST", DEFAULTS["SOLVER_HOST"]),
             "SOLVER_PORT": cfg.get("SOLVER_PORT", DEFAULTS["SOLVER_PORT"]),
             "SOLVER_DEBUG": cfg.get("SOLVER_DEBUG", DEFAULTS["SOLVER_DEBUG"]),
+            "SOLVER_CAPTURE_DUMPS": cfg.get("SOLVER_CAPTURE_DUMPS", DEFAULTS["SOLVER_CAPTURE_DUMPS"]),
+            "SOLVER_CAPTURE_MAX_GROUPS": cfg.get("SOLVER_CAPTURE_MAX_GROUPS", DEFAULTS["SOLVER_CAPTURE_MAX_GROUPS"]),
+            "SOLVER_CAPTURE_MAX_MB": cfg.get("SOLVER_CAPTURE_MAX_MB", DEFAULTS["SOLVER_CAPTURE_MAX_MB"]),
+            "LOG_MAX_MB": cfg.get("LOG_MAX_MB", DEFAULTS["LOG_MAX_MB"]),
+            "LOG_ROTATE_FILE_COUNT": cfg.get("LOG_ROTATE_FILE_COUNT", DEFAULTS["LOG_ROTATE_FILE_COUNT"]),
             "UI_HOST": cfg.get("UI_HOST", DEFAULTS["UI_HOST"]),
             "UI_PORT": cfg.get("UI_PORT", DEFAULTS["UI_PORT"]),
             "SUB2API_URL": cfg.get("SUB2API_URL", cfg.get("UPSTREAM_URL", DEFAULTS["SUB2API_URL"])),
@@ -2248,6 +2270,27 @@ def save_config():
     solver_host = str(body.get("SOLVER_HOST", current.get("SOLVER_HOST", DEFAULTS["SOLVER_HOST"]))).strip() or "127.0.0.1"
     solver_port = str(body.get("SOLVER_PORT", current.get("SOLVER_PORT", DEFAULTS["SOLVER_PORT"]))).strip() or "5072"
     solver_debug = str(body.get("SOLVER_DEBUG", current.get("SOLVER_DEBUG", DEFAULTS["SOLVER_DEBUG"]))).strip() or "1"
+    capture_dumps_raw = body.get(
+        "SOLVER_CAPTURE_DUMPS",
+        current.get("SOLVER_CAPTURE_DUMPS", DEFAULTS["SOLVER_CAPTURE_DUMPS"]),
+    )
+    capture_dumps = str(capture_dumps_raw).strip().lower() in ("1", "true", "yes", "on")
+    capture_max_groups = str(body.get(
+        "SOLVER_CAPTURE_MAX_GROUPS",
+        current.get("SOLVER_CAPTURE_MAX_GROUPS", DEFAULTS["SOLVER_CAPTURE_MAX_GROUPS"]),
+    )).strip()
+    capture_max_mb = str(body.get(
+        "SOLVER_CAPTURE_MAX_MB",
+        current.get("SOLVER_CAPTURE_MAX_MB", DEFAULTS["SOLVER_CAPTURE_MAX_MB"]),
+    )).strip()
+    log_max_mb = str(body.get(
+        "LOG_MAX_MB",
+        current.get("LOG_MAX_MB", DEFAULTS["LOG_MAX_MB"]),
+    )).strip()
+    log_rotate_file_count = str(body.get(
+        "LOG_ROTATE_FILE_COUNT",
+        current.get("LOG_ROTATE_FILE_COUNT", DEFAULTS["LOG_ROTATE_FILE_COUNT"]),
+    )).strip()
     ui_host = str(body.get("UI_HOST", current.get("UI_HOST", DEFAULTS["UI_HOST"]))).strip() or "127.0.0.1"
     ui_port = str(body.get("UI_PORT", current.get("UI_PORT", DEFAULTS["UI_PORT"]))).strip() or "3333"
     sub2api_url = str(body.get("SUB2API_URL", body.get("UPSTREAM_URL", current.get("SUB2API_URL", current.get("UPSTREAM_URL", DEFAULTS["SUB2API_URL"]))))).strip()
@@ -2339,6 +2382,18 @@ def save_config():
         return jsonify({"ok": False, "message": "SOLVER_PORT 必须是 2-5 位数字"}), 400
     if not re.fullmatch(r"\d{1,2}", solver_threads) or not (1 <= int(solver_threads) <= 16):
         return jsonify({"ok": False, "message": "SOLVER_THREADS 范围 1-16"}), 400
+    storage_ranges = (
+        ("SOLVER_CAPTURE_MAX_GROUPS", capture_max_groups, 1, 1000),
+        ("SOLVER_CAPTURE_MAX_MB", capture_max_mb, 1, 10240),
+        ("LOG_MAX_MB", log_max_mb, 1, 1024),
+        ("LOG_ROTATE_FILE_COUNT", log_rotate_file_count, 1, 20),
+    )
+    for name, raw_value, minimum, maximum in storage_ranges:
+        if not re.fullmatch(r"\d+", raw_value) or not (minimum <= int(raw_value) <= maximum):
+            return jsonify({
+                "ok": False,
+                "message": f"{name} 范围 {minimum}-{maximum}",
+            }), 400
     if not re.fullmatch(r"\d{2,5}", sub2api_db_port):
         return jsonify({"ok": False, "message": "SUB2API_DB_PORT 必须是 2-5 位数字"}), 400
     if not sub2api_group_name:
@@ -2365,6 +2420,11 @@ def save_config():
         "SOLVER_HOST": solver_host,
         "SOLVER_PORT": solver_port,
         "SOLVER_DEBUG": "1" if solver_debug not in ("0", "false", "False") else "0",
+        "SOLVER_CAPTURE_DUMPS": "1" if capture_dumps else "0",
+        "SOLVER_CAPTURE_MAX_GROUPS": capture_max_groups,
+        "SOLVER_CAPTURE_MAX_MB": capture_max_mb,
+        "LOG_MAX_MB": log_max_mb,
+        "LOG_ROTATE_FILE_COUNT": log_rotate_file_count,
         "UI_HOST": ui_host,
         "UI_PORT": ui_port,
         "SUB2API_URL": sub2api_url,
@@ -2383,10 +2443,47 @@ def save_config():
         "OUTLOOK_ACCOUNTS": outlook_accounts,
         "OUTLOOK_ALIAS_LIMIT": outlook_alias_limit,
     }
+    storage_keys = (
+        "SOLVER_CAPTURE_DUMPS",
+        "SOLVER_CAPTURE_MAX_GROUPS",
+        "SOLVER_CAPTURE_MAX_MB",
+        "LOG_MAX_MB",
+        "LOG_ROTATE_FILE_COUNT",
+    )
+    storage_changed = any(
+        str(current.get(key, DEFAULTS[key])) != str(values[key])
+        for key in storage_keys
+    )
+    solver_was_running = False
+    if storage_changed:
+        try:
+            solver_state = solver_manager.status(force=True)
+            # Only restart a Solver managed by this app (one with a tracked PID).
+            # An externally launched service may share the URL but is not ours to stop.
+            solver_was_running = bool(solver_state.get("process_running"))
+        except Exception:
+            pass
+
     try:
         write_env_file(values)
         apply_env_to_process(values)
         logs.emit("综合配置已保存到 .env", "success")
+
+        solver_restart = None
+        stopped = None
+        if storage_changed and solver_was_running:
+            stopped = solver_manager.stop()
+        if storage_changed:
+            enforce_storage_limits(BASE_DIR)
+        if stopped is not None:
+            if stopped.get("ok"):
+                solver_restart = solver_manager.start(wait_ready=False)
+            else:
+                solver_restart = stopped
+            logs.emit(
+                "磁盘保护配置已更新，" + str(solver_restart.get("message") or "Solver 已重启"),
+                "success" if solver_restart.get("ok") else "warn",
+            )
 
         # 保存后自动测试 sub2api HTTP 通道，并按名称解析 group_id 回写
         upstream_test = None
@@ -2423,6 +2520,8 @@ def save_config():
                 logs.emit(f"sub2api 连通性测试异常: {te}", "warn")
 
         msg = "配置已保存"
+        if solver_restart is not None:
+            msg += "；" + str(solver_restart.get("message") or "Solver 已自动重启")
         if upstream_test is not None:
             if upstream_test.get("ok"):
                 g = upstream_test.get("group") or {}
@@ -2436,6 +2535,7 @@ def save_config():
             "env": env_snapshot(),
             "config": values,
             "upstream_test": upstream_test,
+            "solver_restart": solver_restart,
         })
     except Exception as e:
         return jsonify({"ok": False, "message": f"保存失败: {e}"}), 500
@@ -2666,6 +2766,30 @@ def clear_logs():
     logs.emit("日志已清空", "info")
     post_logs.emit("Risk/换 token 日志已清空", "info")
     return jsonify({"ok": True})
+
+
+@app.get("/api/storage")
+def get_storage():
+    return jsonify({"ok": True, **storage_stats(BASE_DIR)})
+
+
+@app.delete("/api/storage/captures")
+def clear_diagnostic_captures():
+    if engine.is_running():
+        return jsonify({
+            "ok": False,
+            "message": "注册任务运行中，停止后才能清理诊断抓包",
+        }), 409
+    result = clear_capture_dirs(BASE_DIR / "logs" / "fo_captures")
+    logs.emit(
+        f"已清理 {result['removed_groups']} 组诊断抓包",
+        "success",
+    )
+    return jsonify({
+        "ok": True,
+        "message": f"已清理 {result['removed_groups']} 组诊断抓包",
+        **result,
+    })
 
 
 @app.get("/api/keys")

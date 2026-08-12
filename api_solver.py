@@ -5,8 +5,22 @@ import uuid
 import random
 import logging
 import asyncio
+from pathlib import Path
 from typing import Optional, Union
 import argparse
+
+from dotenv import load_dotenv
+
+from log_storage import (
+    RotatingTextStream,
+    capture_limits,
+    env_bool,
+    log_limits,
+    prune_capture_dirs,
+)
+
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env", override=False)
 
 # Windows 控制台 GBK 下避免 emoji / rich 编码崩溃
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
@@ -18,6 +32,19 @@ try:
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
+
+# solver_manager sets this path so every stdout/stderr writer shares the same
+# bounded stream, including Quart and third-party browser libraries.
+_managed_log_path = (os.getenv("SOLVER_MANAGED_LOG_FILE") or "").strip()
+if _managed_log_path:
+    _log_max_bytes, _log_file_count = log_limits()
+    _managed_log_stream = RotatingTextStream(
+        _managed_log_path,
+        max_bytes=_log_max_bytes,
+        file_count=_log_file_count,
+    )
+    sys.stdout = _managed_log_stream
+    sys.stderr = _managed_log_stream
 
 from quart import Quart, request, jsonify
 from camoufox.async_api import AsyncCamoufox
@@ -84,6 +111,14 @@ class TurnstileAPIServer:
         self.use_random_config = use_random_config
         self.browser_name = browser_name
         self.browser_version = browser_version
+        self.capture_dumps = env_bool("SOLVER_CAPTURE_DUMPS", False)
+        self.capture_root = BASE_DIR / "logs" / "fo_captures"
+        self.capture_max_groups, self.capture_max_bytes = capture_limits()
+        prune_capture_dirs(
+            self.capture_root,
+            self.capture_max_groups,
+            self.capture_max_bytes,
+        )
         # force_terminal=False：重定向到日志文件时不因 emoji/编码崩掉 lifespan
         self.console = Console(
             force_terminal=False,
@@ -715,8 +750,9 @@ class TurnstileAPIServer:
         
         await self._block_rendering(page)
         
-        # Setup FO interceptor for network-level capture
-        self._setup_fo_interceptor(page)
+        # Large FO/RCH payloads are captured only when explicitly enabled.
+        if self.capture_dumps:
+            self._setup_fo_interceptor(page)
         
         await page.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', {
@@ -817,8 +853,9 @@ class TurnstileAPIServer:
             
             await self._inject_captcha_directly(page, sitekey, action or '', cdata or '', index)
             
-            # Capture RCH page from Turnstile iframe
-            asyncio.create_task(self._capture_rch_from_iframe(page))
+            # Capture RCH page only for an explicit diagnostic run.
+            if self.capture_dumps:
+                asyncio.create_task(self._capture_rch_from_iframe(page))
             
             # 注入后稍等 widget 挂载；压到 0.25，成功主要靠下面快轮询
             await asyncio.sleep(0.25)
@@ -848,7 +885,7 @@ class TurnstileAPIServer:
                             if token:
                                 elapsed_time = round(time.time() - start_time, 3)
                                 logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                                await self._save_fo_dump(page, task_id, token)
+                                await self._save_fo_dump(page, task_id)
                                 await save_result(task_id, "turnstile", {"value": token, "elapsed_time": elapsed_time})
                                 return
                         except Exception as e:
@@ -865,7 +902,7 @@ class TurnstileAPIServer:
                                 if element_token:
                                     elapsed_time = round(time.time() - start_time, 3)
                                     logger.success(f"Browser {index}: Successfully solved captcha - {COLORS.get('MAGENTA')}{element_token[:10]}{COLORS.get('RESET')} in {COLORS.get('GREEN')}{elapsed_time}{COLORS.get('RESET')} Seconds")
-                                    await self._save_fo_dump(page, task_id, element_token)
+                                    await self._save_fo_dump(page, task_id)
                                     await save_result(task_id, "turnstile", {"value": element_token, "elapsed_time": elapsed_time})
                                     return
                             except Exception as e:
@@ -932,19 +969,20 @@ class TurnstileAPIServer:
 
 
 
-    async def _save_fo_dump(self, page, task_id: str, token: str):
+    async def _save_fo_dump(self, page, task_id: str):
         """Extract FO dump data from browser and save to disk."""
-        import json, os
+        import json
         from datetime import datetime
-        from pathlib import Path
 
         try:
+            if not self.capture_dumps:
+                return
             fo_data = getattr(self, '_fo_captured', None)
             if not fo_data:
                 return
 
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            out_dir = Path(__file__).resolve().parent / "logs" / "fo_captures" / f"{ts}_{task_id[:8]}"
+            out_dir = self.capture_root / f"{ts}_{task_id[:8]}"
             out_dir.mkdir(parents=True, exist_ok=True)
 
             for stage in ('fo1', 'fo2'):
@@ -959,9 +997,6 @@ class TurnstileAPIServer:
                         json.dumps(resp["headers"], indent=2), encoding="utf-8"
                     )
                     logger.success(f"{stage.upper()} response: {len(resp['body'])} bytes")
-
-            if token:
-                (out_dir / "token.txt").write_text(token, encoding="utf-8")
 
             # Capture RCH page from Turnstile iframe
             rch_html = getattr(self, '_rch_captured', None)
@@ -978,6 +1013,15 @@ class TurnstileAPIServer:
                 logger.success(f"gDRqi3 calls: {len(gd_data)}")
 
             logger.info(f"FO dump saved to {out_dir}")
+            pruned = prune_capture_dirs(
+                self.capture_root,
+                self.capture_max_groups,
+                self.capture_max_bytes,
+            )
+            if pruned["removed_groups"]:
+                logger.info(
+                    f"FO retention removed {pruned['removed_groups']} old capture(s)"
+                )
 
         except Exception as e:
             logger.debug(f"FO dump err: {e}")
@@ -1045,6 +1089,8 @@ class TurnstileAPIServer:
     def _setup_fo_interceptor(self, page):
         """Setup non-blocking request/response listeners to capture /fo/ traffic."""
         self._fo_captured = {}
+        self._rch_captured = None
+        self._gd_captured = None
 
         def on_request(request):
             url = request.url

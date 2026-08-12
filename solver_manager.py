@@ -19,6 +19,8 @@ from urllib.request import urlopen
 
 from dotenv import load_dotenv
 
+from log_storage import append_rotating_text
+
 BASE_DIR = Path(__file__).resolve().parent
 PID_FILE = BASE_DIR / "logs" / "turnstile_solver.pid"
 LOG_FILE = BASE_DIR / "logs" / "turnstile_solver.log"
@@ -596,9 +598,10 @@ def _start_unlocked(wait_ready: bool = True, timeout: float = 90.0) -> dict[str,
     if cfg["debug"]:
         cmd.append("--debug")
 
-    log_f = open(LOG_FILE, "a", encoding="utf-8", errors="ignore")
-    log_f.write("\n" + "=" * 60 + f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] START {' '.join(cmd)}\n")
-    log_f.flush()
+    append_rotating_text(
+        LOG_FILE,
+        "\n" + "=" * 60 + f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] START {' '.join(cmd)}\n",
+    )
 
     creationflags = 0
     if sys.platform == "win32":
@@ -627,19 +630,19 @@ def _start_unlocked(wait_ready: bool = True, timeout: float = 90.0) -> dict[str,
             child_env.pop(k, None)
     # 进一步避免子进程继承坏代理（camoufox/playwright 也会读）
     child_env["PYTHONUTF8"] = "1"
+    child_env["SOLVER_MANAGED_LOG_FILE"] = str(LOG_FILE)
 
     try:
         proc = subprocess.Popen(
             cmd,
             cwd=str(BASE_DIR),
-            stdout=log_f,
+            stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             creationflags=creationflags,
             env=child_env,
         )
     except Exception as e:
-        log_f.close()
         invalidate_status_cache()
         return {"ok": False, "message": f"启动失败: {e}", **status(force=True)}
 
