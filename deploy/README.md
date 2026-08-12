@@ -83,6 +83,16 @@ UPSTREAM_URL=https://SUB2API_DOMAIN.example.com
 
 ## 3. 首次启动与更新
 
+只安装一个正式实例时，可在完成 GHCR 机器账号授权后运行：
+
+```bash
+./deploy/scripts/install-prod.sh v1.0.0
+```
+
+脚本会创建缺失的 `.env`、`deploy/deploy.env` 和持久化目录，提示输入 GHCR
+只读凭据，然后部署一个正式容器。它不会安装或启动任何反代组件。已有配置文件会
+原样保留，不会覆盖。首次安装后仍需进入 Web 控制台配置邮箱等实际服务。
+
 脚本会拉取选定镜像、重建单个服务并等待 Docker 健康检查。更新前会检查注册任务
 以及导入任务；任一任务运行时拒绝更新。成功后会把精确镜像引用写回
 `deploy/deploy.env`，失败则自动恢复上一镜像。
