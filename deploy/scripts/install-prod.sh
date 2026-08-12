@@ -8,6 +8,8 @@ ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 DEPLOY_ENV="$ROOT_DIR/deploy/deploy.env"
 APP_ENV="$ROOT_DIR/.env"
 VERSION="${1:-v1.0.0}"
+IMAGE_REPOSITORY="ghcr.io/menghuizhang/cloudtemp-grokzhuce-docker"
+IMAGE_REF="${IMAGE_REPOSITORY}:${VERSION}"
 
 usage() {
   echo "用法: $0 [版本标签]" >&2
@@ -65,20 +67,30 @@ mkdir -p \
   "$ROOT_DIR/data"
 
 echo
-echo "私有 GHCR 需要只读凭据。"
-echo "令牌只需 read:packages 权限，输入时不会回显。"
-read -rp "GitHub 机器账号: " ghcr_user
-[[ -n "$ghcr_user" ]] || { echo "GitHub 账号不能为空" >&2; exit 1; }
-read -rsp "GHCR 只读令牌: " ghcr_token
-echo
-[[ -n "$ghcr_token" ]] || { echo "GHCR 令牌不能为空" >&2; exit 1; }
+echo "检查当前 Linux 用户已有的 GHCR 拉取权限……"
+if docker manifest inspect "$IMAGE_REF" >/dev/null 2>&1; then
+  echo "已有有效的 GHCR 登录，跳过令牌输入。"
+else
+  echo "未检测到可用的 GHCR 登录，需要输入只读凭据。"
+  echo "令牌只需 read:packages 权限，输入时不会回显。"
+  read -rp "GitHub 机器账号: " ghcr_user
+  [[ -n "$ghcr_user" ]] || { echo "GitHub 账号不能为空" >&2; exit 1; }
+  read -rsp "GHCR 只读令牌: " ghcr_token
+  echo
+  [[ -n "$ghcr_token" ]] || { echo "GHCR 令牌不能为空" >&2; exit 1; }
 
-if ! printf '%s' "$ghcr_token" | docker login ghcr.io -u "$ghcr_user" --password-stdin; then
+  if ! printf '%s' "$ghcr_token" | docker login ghcr.io -u "$ghcr_user" --password-stdin; then
+    unset ghcr_token
+    echo "GHCR 登录失败。请确认账号有该私有 Package 的读取权限。" >&2
+    exit 1
+  fi
   unset ghcr_token
-  echo "GHCR 登录失败。请确认账号有该私有 Package 的读取权限。" >&2
-  exit 1
+
+  docker manifest inspect "$IMAGE_REF" >/dev/null 2>&1 || {
+    echo "登录成功，但账号无权拉取 $IMAGE_REF。" >&2
+    exit 1
+  }
 fi
-unset ghcr_token
 
 echo
 echo "开始部署正式版 $VERSION……"
