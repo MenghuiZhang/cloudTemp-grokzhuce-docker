@@ -68,7 +68,7 @@ mkdir -p \
 
 echo
 echo "检查当前 Linux 用户已有的 GHCR 拉取权限……"
-if docker manifest inspect "$IMAGE_REF" >/dev/null 2>&1; then
+if docker pull "$IMAGE_REF" >/dev/null 2>&1; then
   echo "已有有效的 GHCR 登录，跳过令牌输入。"
 else
   echo "未检测到可用的 GHCR 登录，需要输入只读凭据。"
@@ -86,7 +86,7 @@ else
   fi
   unset ghcr_token
 
-  docker manifest inspect "$IMAGE_REF" >/dev/null 2>&1 || {
+  docker pull "$IMAGE_REF" >/dev/null 2>&1 || {
     echo "登录成功，但账号无权拉取 $IMAGE_REF。" >&2
     exit 1
   }
