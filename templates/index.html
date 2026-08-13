@@ -348,7 +348,9 @@
         <div class="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs font-mono text-ink-700/60">
           <span>路径：<span id="statMode" class="text-ink-800">同会话 CLEAN</span></span>
           <span>成功 <span id="statSuccessInline" class="text-leaf-600">0</span> / 目标 <span id="statTargetInline" class="text-ink-800">0</span></span>
-          <span>创邮 <span id="statAttemptInline" class="text-ink-800">0</span> / <span id="statAttemptTargetInline" class="text-ink-800">0</span></span>
+          <span>逻辑任务 <span id="statAttemptInline" class="text-ink-800">0</span> / <span id="statAttemptTargetInline" class="text-ink-800">0</span></span>
+          <span>实际创邮 <span id="statEmailCreateInline" class="text-ink-800">0</span></span>
+          <span>Bot复验 <span id="statBotRetryInline" class="text-ink-800">0</span></span>
           <span>CLEAN <span id="statCleanInline" class="text-leaf-600">0</span> · UNCHECKED <span id="statUncheckedInline" class="text-sun-500">0</span> · MARKED <span id="statMarked" class="text-rose-500">0</span></span>
           <span>输出：<span id="outputFile" class="text-ink-800">—</span></span>
           <span>Action：<span id="actionId" class="text-ink-800">—</span></span>
@@ -834,6 +836,7 @@
       running: { dot: 'bg-leaf-500 pulse-live', text: 'RUNNING' },
       stopping: { dot: 'bg-sun-500 pulse-live', text: 'STOPPING' },
       done: { dot: 'bg-brand-500', text: 'DONE' },
+      resource_exhausted: { dot: 'bg-rose-500', text: 'NEEDS ACTION' },
       error: { dot: 'bg-rose-500', text: 'ERROR' },
     };
 
@@ -924,7 +927,7 @@
       if (protocol) {
         warning.textContent = '旧混合协议路径不执行账号 Risk 探测，成功号将记为 UNCHECKED，敏感目标不会自动导入。';
       } else {
-        warning.textContent = '当前批次将跳过 Risk 探测，账号记为 UNCHECKED；Sub2API、CPA 和 Build 等敏感目标不会自动导入，需在导入中心手动覆盖。';
+        warning.textContent = '当前批次将跳过 Risk 探测，账号记为 UNCHECKED；代理/域名 Bot 自动停用不会生效；敏感目标不会自动导入。';
       }
     }
 
@@ -1173,6 +1176,8 @@
       if ($('statMarked')) $('statMarked').textContent = data.marked_count ?? 0;
       if ($('statAttemptInline')) $('statAttemptInline').textContent = data.attempt_count ?? 0;
       if ($('statAttemptTargetInline')) $('statAttemptTargetInline').textContent = data.target_count ?? 0;
+      if ($('statEmailCreateInline')) $('statEmailCreateInline').textContent = data.email_create_count ?? 0;
+      if ($('statBotRetryInline')) $('statBotRetryInline').textContent = data.bot_retry_count ?? 0;
 
       state.running = !!data.running;
       if (wasRunning !== state.running) schedulePoll();
@@ -1186,6 +1191,9 @@
             setPipelineHint(`本轮结束 · 成功 ${sc} · CLEAN ${cc} · UNCHECKED ${uc} · MARKED ${mc}`);
           }
         }
+      }
+      if (!state.running && data.status === 'resource_exhausted') {
+        setPipelineHint(`需要处理 · ${data.error_message || '代理或域名资源耗尽'}`);
       }
       $('btnStart').disabled = state.running;
       $('btnStop').disabled = !state.running;

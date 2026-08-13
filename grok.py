@@ -31,6 +31,7 @@ from g import (
     parse_proxy_spec,
 )
 from g.proxy_pool import ProxyLease, get_proxy_pool, parse_proxy_line
+from g.domain_pool import DomainLease, get_domain_pool
 
 try:
     from g import AntibotService
@@ -1379,6 +1380,7 @@ class RegisterEngine:
         self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._worker_thread: Optional[threading.Thread] = None
         self.proxy_pool = get_proxy_pool(_BASE_DIR)
+        self.domain_pool = get_domain_pool(_BASE_DIR)
         # 注册 POST 起步节流（不包整次 HTTP，允许多线程并行飞）
         self._post_min_interval = 0.25
         self._last_post_start = 0.0
@@ -1397,6 +1399,8 @@ class RegisterEngine:
         self.unchecked_count = 0
         # 创邮尝试次数：数量 N = 创建 N 个邮箱就停（CLEAN/MARKED/失败都计 1 次）
         self.attempt_count = 0
+        self.email_create_count = 0
+        self.bot_retry_count = 0
         self._ss_attempt_lock = threading.Lock()
         # 连续 risk MARKED（跨线程）：触顶熔断，避免同出口 deny 簇空烧
         self._ss_consecutive_deny = 0
@@ -1409,6 +1413,7 @@ class RegisterEngine:
         self.output_file: Optional[str] = None
         self.status = "idle"  # idle | initializing | running | stopping | done | error
         self.error_message = ""
+        self.resource_exhausted_reason = ""
         # 默认同会话 CLEAN；可被 start(mode=) / GROK_REGISTER_MODE 覆盖
         self.register_mode = resolve_register_mode()
         # 每批任务快照：仅控制 SSO 到手后的账号 Risk 探测。
@@ -1456,7 +1461,7 @@ class RegisterEngine:
             else:
                 end = self.end_time if self.end_time is not None else self.start_time
                 # 兼容旧进程：done 了但没 end_time，立刻钉死一次
-                if self.end_time is None and self.status in ("done", "error", "idle"):
+                if self.end_time is None and self.status in ("done", "error", "idle", "resource_exhausted"):
                     self.end_time = time.time()
                     end = self.end_time
             elapsed = max(0.0, float(end) - float(self.start_time))
@@ -1476,6 +1481,8 @@ class RegisterEngine:
             "marked_count": int(getattr(self, "marked_count", 0) or 0),
             "unchecked_count": int(getattr(self, "unchecked_count", 0) or 0),
             "attempt_count": attempts,
+            "email_create_count": int(getattr(self, "email_create_count", 0) or 0),
+            "bot_retry_count": int(getattr(self, "bot_retry_count", 0) or 0),
             "target_count": self.target_count,
             "workers": self.workers,
             "register_mode": getattr(self, "register_mode", None) or resolve_register_mode(),
@@ -2536,35 +2543,66 @@ class RegisterEngine:
 
         site_key = self.config.get("site_key") or "0x4AAAAAAAhr9JGVDZbrZOo0"
         current_email = None
-        # 数量 N = 创建 N 个邮箱就停（对齐 standalone COUNT）
-        # 不再「凑满 N 个 CLEAN 无限补」；失败/MARKED 也各占 1 次创邮额度
+        # 数量 N = N 条逻辑注册链；Bot 复验会另建邮箱，但不额外占 N。
         max_attempts = max(1, int(self.target_count or 1))
         consecutive_browser_fails = 0
         deny_break_n = _ss_deny_break_n()
         risk_enabled = bool(getattr(self, "risk_check_enabled", True))
+        configured_domains = list(
+            (email_service.structured_config.get("providers", {}).get("cloudflare_temp", {}) or {}).get("domains") or []
+        )
+        if email_service.provider_name == "cloudflare_temp" and self.domain_pool.summary().get("total"):
+            configured_domains = self.domain_pool.active_domains()
+        use_domain_pool = bool(
+            risk_enabled
+            and email_service.provider_name == "cloudflare_temp"
+            and configured_domains
+        )
+        if use_domain_pool:
+            self.domain_pool.sync_configured(configured_domains)
+            # Persistent per-proxy/domain isolation supersedes the old global
+            # consecutive-deny breaker.
+            deny_break_n = 0
+        revalidation: Optional[dict[str, Any]] = None
+
+        def _resource_exhausted(code: str, message: str) -> None:
+            self.resource_exhausted_reason = code
+            self.error_message = message
+            self.log(message, "error")
+
         self.log(
-            f"same_session · 数量={max_attempts}（按创邮次数停）"
+            f"same_session · 逻辑数量={max_attempts}（Bot 复验不额外占量）"
             f" · Risk={'ON' if risk_enabled else 'OFF/UNCHECKED'}"
-            f" · 连续MARKED熔断={deny_break_n or 'off' if risk_enabled else 'off'}"
+            f" · 域名隔离={'ON' if use_domain_pool else 'OFF'}"
             f" · 代理池={self.proxy_pool.summary().get('enabled', 0)} 条",
             "info",
         )
 
         while not self.stop_event.is_set():
-            # 创邮次数到顶 → 整批结束（成功+失败+MARKED 合计）
-            with self._ss_attempt_lock:
-                done_n = int(self.attempt_count or 0)
-            if done_n >= max_attempts:
-                self.log(
-                    f"创邮已达数量 {done_n}/{max_attempts}"
-                    f" · CLEAN {getattr(self, 'clean_count', 0)}"
-                    f" · UNCHECKED {getattr(self, 'unchecked_count', 0)}"
-                    f" · MARKED {getattr(self, 'marked_count', 0)}"
-                    f" · 过程失败 {self.fail_count} · 停批",
-                    "info",
-                )
-                self.stop_event.set()
+            if self.resource_exhausted_reason:
+                if revalidation is not None:
+                    self.domain_pool.abort_revalidation(
+                        revalidation["domain_lease"],
+                        code="REVALIDATION_INTERRUPTED",
+                        message="其他线程触发资源耗尽，复验中断",
+                    )
+                    revalidation = None
                 return
+            retrying_bot = revalidation is not None
+            if retrying_bot:
+                logical_id = str(revalidation["logical_id"])
+                attempt_i = int(revalidation["attempt_i"])
+                domain_lease: Optional[DomainLease] = revalidation["domain_lease"]
+            else:
+                # Reserve one logical slot atomically. Workers that arrive after
+                # N simply retire; in-flight workers still finish or revalidate.
+                with self._ss_attempt_lock:
+                    if int(self.attempt_count or 0) >= max_attempts:
+                        return
+                    self.attempt_count = int(self.attempt_count or 0) + 1
+                    attempt_i = self.attempt_count
+                logical_id = uuid.uuid4().hex
+                domain_lease = None
             # 连续 MARKED 熔断：同出口 Castle deny 簇打开后别硬刚
             with self._ss_deny_lock:
                 cur_deny = int(self._ss_consecutive_deny or 0)
@@ -2648,6 +2686,19 @@ class RegisterEngine:
                         return
                     consecutive_browser_fails = 0
 
+                if use_domain_pool and domain_lease is None:
+                    domain_lease = self.domain_pool.acquire(logical_id)
+                    if domain_lease is None:
+                        with self._ss_attempt_lock:
+                            self.attempt_count = max(0, int(self.attempt_count or 0) - 1)
+                        if self.domain_pool.summary().get("verifying"):
+                            # Another worker owns the only temporarily locked
+                            # domain. Retire this worker; the owner continues the
+                            # designated retry and may process remaining slots.
+                            return
+                        _resource_exhausted("DOMAIN_EXHAUSTED", "没有可用的 Cloudflare Temp 域名，任务需要人工处理")
+                        return
+
                 # Turnstile 预解与建邮/浏览器重叠
                 ts_pre: dict[str, Any] = {
                     "token": None,
@@ -2677,10 +2728,40 @@ class RegisterEngine:
                     target=_ts_prewarm, daemon=True, name=f"ss-ts-{idx}"
                 ).start()
 
+                proxy_exclude: set[str] = set()
+                if revalidation is not None:
+                    proxy_exclude = self.proxy_pool.retry_exclusions(
+                        revalidation.get("attempted_proxy_ids") or set(),
+                        str(revalidation.get("first_egress_ip") or ""),
+                    )
                 proxy_lease = self.proxy_pool.acquire(
-                    f"attempt-{idx}", stop_event=self.stop_event, wait=True
+                    f"attempt-{idx}",
+                    stop_event=self.stop_event,
+                    exclude=proxy_exclude,
+                    wait=not retrying_bot,
+                    wait_timeout=30.0 if not retrying_bot else None,
                 )
                 if proxy_lease is None:
+                    if revalidation is not None and domain_lease is not None:
+                        self.domain_pool.abort_revalidation(
+                            domain_lease,
+                            code="PROXY_EXHAUSTED",
+                            message="Bot 复验没有不同出口的可用代理",
+                        )
+                        revalidation = None
+                    elif domain_lease is not None:
+                        self.domain_pool.release(domain_lease)
+                    _resource_exhausted("PROXY_EXHAUSTED", "没有可用的不同出口代理，任务需要人工添加或启用代理")
+                    return
+                if retrying_bot and proxy_lease.direct:
+                    if domain_lease is not None:
+                        self.domain_pool.abort_revalidation(
+                            domain_lease,
+                            code="PROXY_EXHAUSTED",
+                            message="Bot 复验禁止回退直连",
+                        )
+                    revalidation = None
+                    _resource_exhausted("PROXY_EXHAUSTED", "Bot 复验没有可切换代理，禁止回退直连")
                     return
                 if hasattr(email_service, "set_register_proxy"):
                     email_service.set_register_proxy(proxy_lease.spec)
@@ -2698,7 +2779,10 @@ class RegisterEngine:
                         fp["timezone"] = str(geo.get("timezone") or region_fp.get("timezone") or fp.get("timezone"))
 
                 try:
-                    _jwt, email = email_service.create_email()
+                    if domain_lease is not None:
+                        _jwt, email = email_service.create_email_for_domain(domain_lease.domain)
+                    else:
+                        _jwt, email = email_service.create_email()
                     current_email = email
                 except Exception as e:
                     # 未真正建邮成功：不占创邮额度、不记过程失败
@@ -2709,6 +2793,16 @@ class RegisterEngine:
                         str(e),
                     )
                     proxy_lease = None
+                    if domain_lease is not None:
+                        if revalidation is not None:
+                            revalidation["infra_failures"] = int(revalidation.get("infra_failures") or 0) + 1
+                            if revalidation["infra_failures"] >= 3:
+                                self.domain_pool.abort_revalidation(domain_lease, code="REVALIDATION_INFRA_EXHAUSTED", message=str(e))
+                                revalidation = None
+                                _resource_exhausted("REVALIDATION_INFRA_EXHAUSTED", "域名复验连续 3 次基础设施故障，任务需要人工处理")
+                                return
+                        else:
+                            self.domain_pool.release(domain_lease)
                     if self._sleep(2):
                         return
                     continue
@@ -2716,13 +2810,24 @@ class RegisterEngine:
                     self.log("创建邮箱失败（未建邮）", "warn")
                     self.proxy_pool.release(proxy_lease, "failure", "create email failed")
                     proxy_lease = None
+                    if domain_lease is not None:
+                        if revalidation is not None:
+                            revalidation["infra_failures"] = int(revalidation.get("infra_failures") or 0) + 1
+                            if revalidation["infra_failures"] >= 3:
+                                self.domain_pool.abort_revalidation(domain_lease, code="REVALIDATION_INFRA_EXHAUSTED", message="create email failed")
+                                revalidation = None
+                                _resource_exhausted("REVALIDATION_INFRA_EXHAUSTED", "域名复验连续 3 次无法创建邮箱，任务需要人工处理")
+                                return
+                        else:
+                            self.domain_pool.release(domain_lease)
                     if self._sleep(1):
                         return
                     continue
-                # 创邮成功即占 1 次额度（对齐 standalone：COUNT=创邮次数）
+                # Physical mailbox count is separate from the logical target.
                 with self._ss_attempt_lock:
-                    self.attempt_count = int(self.attempt_count or 0) + 1
-                    attempt_i = self.attempt_count
+                    self.email_create_count = int(self.email_create_count or 0) + 1
+                    if revalidation is not None:
+                        self.bot_retry_count = int(self.bot_retry_count or 0) + 1
                 email_meta = email_service.get_email_metadata(email)
                 proxy_spec_str = proxy_lease.spec
                 self.log(
@@ -2799,7 +2904,9 @@ class RegisterEngine:
                 def _ss_log_msg(msg: str) -> None:
                     self.log(f"{email} {msg}", "info")
 
-                attempted_proxy_ids: set[str] = set()
+                attempted_proxy_ids: set[str] = set(
+                    (revalidation or {}).get("attempted_proxy_ids") or set()
+                )
                 ss: dict[str, Any] = {}
                 for proxy_try in range(1, 4):
                     if proxy_lease is None:
@@ -2830,10 +2937,14 @@ class RegisterEngine:
                     if ss.get("ok") or not _safe_to_retry_with_new_proxy(ss) or proxy_lease.direct:
                         break
                     self.proxy_pool.release(proxy_lease, "network", str(err_now))
+                    retry_exclude = self.proxy_pool.retry_exclusions(
+                        attempted_proxy_ids,
+                        str((revalidation or {}).get("first_egress_ip") or ""),
+                    )
                     proxy_lease = self.proxy_pool.acquire(
                         email,
                         stop_event=self.stop_event,
-                        exclude=attempted_proxy_ids,
+                        exclude=retry_exclude,
                         wait=False,
                     )
                     if proxy_lease is None:
@@ -2873,6 +2984,16 @@ class RegisterEngine:
                             str(err),
                         )
                         proxy_lease = None
+                    if domain_lease is not None:
+                        if revalidation is not None:
+                            revalidation["infra_failures"] = int(revalidation.get("infra_failures") or 0) + 1
+                            if revalidation["infra_failures"] >= 3:
+                                self.domain_pool.abort_revalidation(domain_lease, code="REVALIDATION_INFRA_EXHAUSTED", message=str(err))
+                                revalidation = None
+                                _resource_exhausted("REVALIDATION_INFRA_EXHAUSTED", "域名复验连续 3 次基础设施故障，任务需要人工处理")
+                                return
+                        else:
+                            self.domain_pool.release(domain_lease)
                     current_email = None
                     # 已停批且本号失败：本线程退出（别再开新邮）
                     if stopped_mid:
@@ -2893,6 +3014,16 @@ class RegisterEngine:
                     if proxy_lease is not None:
                         self.proxy_pool.release(proxy_lease, "failure", "no sso")
                         proxy_lease = None
+                    if domain_lease is not None:
+                        if revalidation is not None:
+                            revalidation["infra_failures"] = int(revalidation.get("infra_failures") or 0) + 1
+                            if revalidation["infra_failures"] >= 3:
+                                self.domain_pool.abort_revalidation(domain_lease, code="REVALIDATION_INFRA_EXHAUSTED", message="no sso")
+                                revalidation = None
+                                _resource_exhausted("REVALIDATION_INFRA_EXHAUSTED", "域名复验连续 3 次未获得明确 Bot 结论，任务需要人工处理")
+                                return
+                        else:
+                            self.domain_pool.release(domain_lease)
                     current_email = None
                     if stopped_mid:
                         return
@@ -2962,9 +3093,63 @@ class RegisterEngine:
                     # MARKED / 探测失败：已写 _marked，不进成功列表、不换票、不入库
                     # MARKED 只记 marked_count，不再叠 fail_count（避免「目标5却失败7」误解）
                     if clean is False:
+                        marked_proxy = proxy_lease.masked if proxy_lease is not None else "direct"
+                        marked_proxy_id = proxy_lease.proxy_id if proxy_lease is not None and not proxy_lease.direct else "direct"
+                        marked_egress = self.proxy_pool.lease_geo(proxy_lease).get("ip", "") if proxy_lease is not None else ""
                         if proxy_lease is not None:
-                            self.proxy_pool.release(proxy_lease, "marked", "risk MARKED")
+                            self.proxy_pool.disable_for_bot(
+                                proxy_lease,
+                                domain=domain_lease.domain if domain_lease is not None else "",
+                                logical_id=logical_id,
+                                message="risk MARKED",
+                            )
                             proxy_lease = None
+                        if domain_lease is not None:
+                            if revalidation is not None:
+                                self.domain_pool.complete_revalidation(
+                                    domain_lease,
+                                    clean=False,
+                                    proxy=marked_proxy,
+                                    message="指定复验 risk MARKED",
+                                )
+                                self.log(
+                                    f"{domain_lease.domain} 指定复验再次 MARKED · 第二代理与域名均已停用",
+                                    "error",
+                                )
+                                revalidation = None
+                            else:
+                                owns_revalidation = self.domain_pool.begin_revalidation(
+                                    domain_lease,
+                                    proxy=marked_proxy,
+                                    message="首次 risk MARKED",
+                                )
+                                if owns_revalidation:
+                                    revalidation = {
+                                        "logical_id": logical_id,
+                                        "attempt_i": attempt_i,
+                                        "domain_lease": domain_lease,
+                                        "attempted_proxy_ids": {marked_proxy_id},
+                                        "first_egress_ip": marked_egress,
+                                        "infra_failures": 0,
+                                    }
+                                    self.log(
+                                        f"{domain_lease.domain} 首次 MARKED · 已停用代理，锁定基础域等待不同出口复验",
+                                        "warn",
+                                    )
+                                    if marked_proxy_id == "direct":
+                                        self.domain_pool.abort_revalidation(
+                                            domain_lease,
+                                            code="PROXY_EXHAUSTED",
+                                            message="直连 MARKED 后没有可切换代理",
+                                        )
+                                        revalidation = None
+                                        _resource_exhausted("PROXY_EXHAUSTED", "直连 Bot MARKED 后没有可切换代理，任务需要人工添加代理")
+                                else:
+                                    self.domain_pool.record_parallel_marked(
+                                        domain_lease,
+                                        proxy=marked_proxy,
+                                        message="并发在途任务 risk MARKED，不计入指定复验",
+                                    )
                         callback = getattr(self, "auto_import_callback", None)
                         if callable(callback):
                             try:
@@ -3011,6 +3196,15 @@ class RegisterEngine:
                         self._fail_account(
                             email_service, email, reason, level="warn"
                         )
+                        if domain_lease is not None:
+                            if revalidation is not None:
+                                revalidation["infra_failures"] = int(revalidation.get("infra_failures") or 0) + 1
+                                if revalidation["infra_failures"] >= 3:
+                                    self.domain_pool.abort_revalidation(domain_lease, code="REVALIDATION_INFRA_EXHAUSTED", message="risk infra")
+                                    revalidation = None
+                                    _resource_exhausted("REVALIDATION_INFRA_EXHAUSTED", "域名复验连续 3 次 Risk 基础设施故障，任务需要人工处理")
+                            else:
+                                self.domain_pool.release(domain_lease)
                     current_email = None
                     # 停批后本号已收尾：退出本线程，不再开新邮
                     if stopped_mid or self.stop_event.is_set():
@@ -3023,6 +3217,19 @@ class RegisterEngine:
                 if risk_enabled:
                     with self._ss_deny_lock:
                         self._ss_consecutive_deny = 0
+                if domain_lease is not None:
+                    if revalidation is not None:
+                        self.domain_pool.complete_revalidation(
+                            domain_lease,
+                            clean=True,
+                            proxy=proxy_lease.masked if proxy_lease is not None else "direct",
+                            message="指定复验 CLEAN，域名继续启用",
+                        )
+                        self.log(f"{domain_lease.domain} Bot 复验 CLEAN · 域名继续启用", "success")
+                        revalidation = None
+                    else:
+                        self.domain_pool.release(domain_lease)
+                    domain_lease = None
                 ua = (
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -3091,6 +3298,15 @@ class RegisterEngine:
                         str(e),
                     )
                     proxy_lease = None
+                if domain_lease is not None:
+                    if revalidation is not None:
+                        revalidation["infra_failures"] = int(revalidation.get("infra_failures") or 0) + 1
+                        if revalidation["infra_failures"] >= 3:
+                            self.domain_pool.abort_revalidation(domain_lease, code="REVALIDATION_INFRA_EXHAUSTED", message=str(e))
+                            revalidation = None
+                            _resource_exhausted("REVALIDATION_INFRA_EXHAUSTED", "域名复验连续 3 次基础设施异常，任务需要人工处理")
+                    else:
+                        self.domain_pool.release(domain_lease)
                 if self.stop_event.is_set():
                     if current_email:
                         try:
@@ -3641,8 +3857,8 @@ class RegisterEngine:
             )
             if mode == "same_session":
                 self.log(
-                    f"启动 {workers} 线程 · 创邮数量 {self.target_count}"
-                    f"（失败/MARKED 也占 1 次）· 路径={mode}",
+                    f"启动 {workers} 线程 · 逻辑注册数量 {self.target_count}"
+                    f"（Bot 复验不额外占量）· 路径={mode}",
                     "info",
                 )
             else:
@@ -3666,6 +3882,9 @@ class RegisterEngine:
                         concurrent.futures.wait(futures, timeout=6)
                         break
             self._executor = None
+            recovered_domains = self.domain_pool.recover_incomplete()
+            if recovered_domains:
+                self.log(f"已恢复 {recovered_domains} 个中断的域名复验状态", "warn")
             # 等后台 NSFW/协议收尾（最多 ~45s）
             try:
                 deadline = time.time() + 45.0
@@ -3729,12 +3948,20 @@ class RegisterEngine:
                     pass
             if self.status == "error":
                 pass
+            elif self.resource_exhausted_reason:
+                self.status = "resource_exhausted"
+                self.log(
+                    f"任务结束：资源耗尽 {self.resource_exhausted_reason} · {self.error_message}",
+                    "error",
+                )
             else:
                 self.status = "done"
-                # 口径：数量=创邮次数；CLEAN/UNCHECKED/MARKED/过程失败分开计
+                # 口径：目标=逻辑链；实际创邮与 Bot 复验另列。
                 attempts = int(getattr(self, "attempt_count", 0) or 0)
                 self.log(
-                    f"任务结束：创邮 {attempts}/{self.target_count}"
+                    f"任务结束：逻辑任务 {attempts}/{self.target_count}"
+                    f" · 实际创邮 {getattr(self, 'email_create_count', 0)}"
+                    f" · Bot复验 {getattr(self, 'bot_retry_count', 0)}"
                     f" · 成功 {self.success_count}"
                     f" · CLEAN {getattr(self, 'clean_count', 0)}"
                     f" · UNCHECKED {getattr(self, 'unchecked_count', 0)}"
@@ -3749,7 +3976,7 @@ class RegisterEngine:
             self.log(f"运行失败: {e}", "error")
         finally:
             self.stop_event.set()
-            if self.status not in ("done", "error"):
+            if self.status not in ("done", "error", "resource_exhausted"):
                 self.status = "done"
             # 钉死耗时：结束后前端轮询不再让「已用时间」空转
             self._freeze_elapsed()
@@ -3918,6 +4145,8 @@ class RegisterEngine:
             self.marked_count = 0
             self.unchecked_count = 0
             self.attempt_count = 0
+            self.email_create_count = 0
+            self.bot_retry_count = 0
             self._ss_consecutive_deny = 0
             self.target_count = target
             self.workers = workers
@@ -3928,6 +4157,7 @@ class RegisterEngine:
             self.start_time = time.time()
             self.end_time = None  # 新一轮重新计时
             self.error_message = ""
+            self.resource_exhausted_reason = ""
             self.recent_success.clear()
             # 先标 initializing，避免并发 /api/start 重复拉起
             self.status = "initializing"

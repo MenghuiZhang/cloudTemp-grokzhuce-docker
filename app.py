@@ -44,6 +44,7 @@ from g.proxy_pool import (
     mask_proxy,
     parse_proxy_lines,
 )
+from g.domain_pool import DomainPoolError, get_domain_pool
 import solver_manager
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -51,6 +52,13 @@ ENV_PATH = BASE_DIR / ".env"
 proxy_pool = get_proxy_pool(BASE_DIR)
 
 load_dotenv(ENV_PATH)
+domain_pool = get_domain_pool(BASE_DIR)
+try:
+    domain_pool.sync_configured(
+        resolved_email_config(dict(os.environ))["providers"]["cloudflare_temp"].get("domains") or []
+    )
+except Exception:
+    pass
 enforce_storage_limits(BASE_DIR)
 
 app = Flask(__name__, template_folder=str(BASE_DIR / "templates"), static_folder=str(BASE_DIR / "static"))
@@ -1992,6 +2000,7 @@ def status():
     data = engine.get_status()
     data["env"] = env_snapshot()
     data["proxy_pool"] = proxy_pool.summary()
+    data["domain_pool"] = domain_pool.summary()
     try:
         data["solver"] = solver_manager.status()
     except Exception as e:
@@ -2056,9 +2065,24 @@ def get_config():
     })
 
 
+def _sync_cf_domain_env() -> None:
+    """Keep the legacy provider list aligned with currently active pool rows."""
+    values = read_env_file()
+    values["EMAIL_CF_TEMP_DOMAINS_JSON"] = json.dumps(
+        domain_pool.active_domains(), ensure_ascii=False, separators=(",", ":")
+    )
+    values["EMAIL_CF_TEMP_AUTO_DOMAIN"] = "0"
+    write_env_file(values)
+    os.environ["EMAIL_CF_TEMP_DOMAINS_JSON"] = values["EMAIL_CF_TEMP_DOMAINS_JSON"]
+    os.environ["EMAIL_CF_TEMP_AUTO_DOMAIN"] = "0"
+
+
 @app.get("/api/email-config")
 def get_email_config():
     structured = resolved_email_config(read_env_file())
+    if domain_pool.summary().get("total"):
+        structured["providers"]["cloudflare_temp"]["domains"] = domain_pool.active_domains()
+        structured["providers"]["cloudflare_temp"]["auto_domain"] = False
     try:
         from g.email_service import EmailService
         cf_health = dict(EmailService._cf_domain_health)
@@ -2073,6 +2097,7 @@ def get_email_config():
         "test_states": EMAIL_TEST_STATES,
         "running": engine.is_running(),
         "runtime": {"cloudflare_domain_health": cf_health, "outlook_account_health": outlook_health},
+        "domain_pool": domain_pool.list_public(page=1, per_page=50),
         "note": "密钥只写不读；留空表示保留现有值",
     })
 
@@ -2202,6 +2227,160 @@ def email_config_domains():
         return jsonify(result), (200 if result.get("ok") else 502)
     except Exception as exc:
         return jsonify({"ok": False, "domains": [], "message": str(exc)}), 500
+
+
+@app.get("/api/domains")
+def domain_pool_list():
+    try:
+        data = domain_pool.list_public(
+            page=request.args.get("page", 1, type=int),
+            per_page=request.args.get("per_page", 50, type=int),
+            query=request.args.get("q", "", type=str),
+            status=request.args.get("status", "", type=str),
+        )
+        return jsonify({"ok": True, **data})
+    except Exception as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.post("/api/domains")
+def domain_pool_add():
+    if engine.is_running():
+        return jsonify({"ok": False, "message": "任务运行中不能添加域名"}), 409
+    body = request.get_json(silent=True) or {}
+    values = body.get("domains")
+    if not isinstance(values, list):
+        values = [body.get("domain")]
+    try:
+        result = domain_pool.add([str(x or "") for x in values], enabled=False)
+        _sync_cf_domain_env()
+        return jsonify({"ok": True, **result, "message": "新域名已添加为停用，请测试后启用"})
+    except DomainPoolError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.patch("/api/domains/<domain_id>")
+def domain_pool_update(domain_id: str):
+    try:
+        values = request.get_json(silent=True) or {}
+        if values.get("enabled") is True:
+            tested = _test_domain(domain_id)
+            if not tested.get("ok"):
+                return jsonify({"ok": False, "message": tested.get("message") or "域名测试失败"}), 502
+        item = domain_pool.update(domain_id, values)
+        _sync_cf_domain_env()
+        return jsonify({"ok": True, "item": item})
+    except KeyError:
+        return jsonify({"ok": False, "message": "域名不存在"}), 404
+    except DomainPoolError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 409
+
+
+def _test_domain(domain_id: str) -> dict:
+    try:
+        item = domain_pool.get_public(domain_id)
+        from g.email_service import EmailService
+
+        service = EmailService(provider_override="cloudflare_temp")
+        _token, address = service.create_email_for_domain(item["domain"])
+        ok = bool(address)
+        deleted = False
+        if address:
+            try:
+                deleted = bool(service.delete_email(address))
+            except Exception:
+                deleted = False
+        message = "创建并删除测试邮箱成功" if ok else "创建测试邮箱失败"
+        if ok and not deleted:
+            message = "创建测试邮箱成功；清理失败"
+        domain_pool.set_email_health(domain_id, ok=ok, message=message)
+        return {"id": domain_id, "ok": ok, "message": message}
+    except KeyError:
+        return {"id": domain_id, "ok": False, "message": "域名不存在"}
+    except Exception as exc:
+        try:
+            domain_pool.set_email_health(domain_id, ok=False, message=str(exc))
+        except Exception:
+            pass
+        return {"id": domain_id, "ok": False, "message": str(exc)}
+
+
+@app.post("/api/domains/test")
+def domain_pool_test():
+    body = request.get_json(silent=True) or {}
+    ids = body.get("ids") or []
+    if not isinstance(ids, list) or not ids:
+        return jsonify({"ok": False, "message": "请选择要测试的域名"}), 400
+    ids = [str(x) for x in ids[:2000]]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
+        results = list(pool.map(_test_domain, ids))
+    passed = sum(1 for x in results if x["ok"])
+    return jsonify({"ok": True, "all_passed": passed == len(results), "passed": passed, "total": len(results), "results": results})
+
+
+@app.post("/api/domains/bulk")
+def domain_pool_bulk():
+    body = request.get_json(silent=True) or {}
+    ids = [str(x) for x in (body.get("ids") or [])]
+    action = str(body.get("action") or "")
+    if not ids:
+        return jsonify({"ok": False, "message": "请选择域名"}), 400
+    if action not in {"enable", "disable", "archive", "delete"}:
+        return jsonify({"ok": False, "message": "批量操作无效"}), 400
+    if action in {"archive", "delete"}:
+        if engine.is_running():
+            return jsonify({"ok": False, "message": "任务运行中不能归档域名"}), 409
+        result = domain_pool.delete_or_archive(ids) if action == "delete" else domain_pool.archive(ids)
+        _sync_cf_domain_env()
+        return jsonify({"ok": True, **result})
+    if action == "enable":
+        ids = ids[:2000]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
+            tested = list(pool.map(_test_domain, ids))
+        changed = 0
+        errors = []
+        for result in tested:
+            if not result["ok"]:
+                errors.append({"id": result["id"], "message": result["message"]})
+                continue
+            try:
+                domain_pool.update(result["id"], {"enabled": True})
+                changed += 1
+            except Exception as exc:
+                errors.append({"id": result["id"], "message": str(exc)})
+        _sync_cf_domain_env()
+        return jsonify({
+            "ok": True,
+            "all_passed": not errors,
+            "changed": changed,
+            "failed": len(errors),
+            "errors": errors[:100],
+        })
+    changed = failed = 0
+    errors = []
+    for domain_id in ids[:2000]:
+        try:
+            domain_pool.update(domain_id, {"enabled": action == "enable"})
+            changed += 1
+        except Exception as exc:
+            failed += 1
+            errors.append({"id": domain_id, "message": str(exc)})
+    _sync_cf_domain_env()
+    return jsonify({"ok": True, "all_passed": failed == 0, "changed": changed, "failed": failed, "errors": errors[:100]})
+
+
+@app.post("/api/domains/<domain_id>/move")
+def domain_pool_move(domain_id: str):
+    if engine.is_running():
+        return jsonify({"ok": False, "message": "任务运行中不能调整域名顺序"}), 409
+    direction = str((request.get_json(silent=True) or {}).get("direction") or "")
+    if direction not in {"up", "down"}:
+        return jsonify({"ok": False, "message": "direction 必须是 up/down"}), 400
+    try:
+        domain_pool.move(domain_id, direction)
+        return jsonify({"ok": True})
+    except KeyError:
+        return jsonify({"ok": False, "message": "域名不存在"}), 404
 
 
 @app.get("/api/mail-domains")
@@ -2643,6 +2822,10 @@ def start():
         reg_mode = (mode_raw or "same_session").strip().lower() or "same_session"
 
     cfg_env = read_env_file()
+    if domain_pool.summary().get("total"):
+        active_json = json.dumps(domain_pool.active_domains(), ensure_ascii=False)
+        cfg_env["EMAIL_CF_TEMP_DOMAINS_JSON"] = active_json
+        cfg_env["EMAIL_CF_TEMP_AUTO_DOMAIN"] = "0"
     email_cfg = resolved_email_config(cfg_env)
     email_errors = validate_provider_config(email_cfg)
     if email_errors:
@@ -3353,7 +3536,7 @@ def proxy_pool_test_many():
     ids = body.get("ids") or []
     if not isinstance(ids, list) or not ids:
         return jsonify({"ok": False, "message": "请选择要测试的代理"}), 400
-    ids = [str(x) for x in ids[:200]]
+    ids = [str(x) for x in ids[:2000]]
 
     def _one(proxy_id: str) -> dict:
         try:
@@ -3376,7 +3559,54 @@ def proxy_pool_test_many():
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
         results = list(pool.map(_one, ids))
     passed = sum(1 for x in results if x["ok"])
-    return jsonify({"ok": passed == len(results), "passed": passed, "total": len(results), "results": results})
+    return jsonify({"ok": True, "all_passed": passed == len(results), "passed": passed, "total": len(results), "results": results})
+
+
+@app.post("/api/proxies/bulk")
+def proxy_pool_bulk():
+    body = request.get_json(silent=True) or {}
+    ids = [str(x) for x in (body.get("ids") or [])][:2000]
+    action = str(body.get("action") or "")
+    if not ids:
+        return jsonify({"ok": False, "message": "请选择代理"}), 400
+    if action not in {"enable", "disable"}:
+        return jsonify({"ok": False, "message": "批量操作无效"}), 400
+    if action == "disable":
+        changed = failed = 0
+        errors = []
+        for proxy_id in ids:
+            try:
+                proxy_pool.update_entry(proxy_id, {"enabled": False})
+                changed += 1
+            except Exception as exc:
+                failed += 1
+                errors.append({"id": proxy_id, "message": str(exc)})
+        return jsonify({"ok": True, "all_passed": failed == 0, "changed": changed, "failed": failed, "errors": errors[:100]})
+
+    def _test_and_enable(proxy_id: str) -> dict:
+        try:
+            probe_spec = expand_proxy_template(
+                proxy_pool.secret_spec(proxy_id), account="health-check", session=uuid.uuid4().hex[:16]
+            )
+            result = _probe_register_proxy(probe_spec, timeout=12)
+            proxy_pool.set_health(proxy_id, result)
+            if not result.get("ok"):
+                return {"id": proxy_id, "ok": False, "message": result.get("message") or result.get("error") or "测试失败"}
+            proxy_pool.update_entry(proxy_id, {"enabled": True})
+            return {"id": proxy_id, "ok": True, "message": "测试通过并已启用"}
+        except Exception as exc:
+            return {"id": proxy_id, "ok": False, "message": str(exc)}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
+        results = list(pool.map(_test_and_enable, ids))
+    changed = sum(1 for x in results if x["ok"])
+    return jsonify({
+        "ok": True,
+        "all_passed": changed == len(results),
+        "changed": changed,
+        "failed": len(results) - changed,
+        "results": results,
+    })
 
 
 def _start_proxy_pool_health_checks(selected_ids: list[str] | None = None) -> int:

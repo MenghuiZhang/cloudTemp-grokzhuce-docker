@@ -217,6 +217,13 @@ class ProxyPool:
                         "enabled": bool(item.get("enabled", True)),
                         "max_concurrency": item.get("max_concurrency"),
                         "pending_delete": bool(item.get("pending_delete", False)),
+                        "disabled_reason": str(item.get("disabled_reason") or ""),
+                        "disabled_at": str(item.get("disabled_at") or ""),
+                        "bot_failures": int(item.get("bot_failures") or 0),
+                        "last_failure_code": str(item.get("last_failure_code") or ""),
+                        "last_failure_message": str(item.get("last_failure_message") or ""),
+                        "last_failure_at": str(item.get("last_failure_at") or ""),
+                        "isolation_events": list(item.get("isolation_events") or [])[-20:],
                     }
                 )
             doc["proxies"] = clean[:MAX_PROXIES]
@@ -318,6 +325,13 @@ class ProxyPool:
                     "enabled": True,
                     "max_concurrency": None,
                     "pending_delete": False,
+                    "disabled_reason": "",
+                    "disabled_at": "",
+                    "bot_failures": 0,
+                    "last_failure_code": "",
+                    "last_failure_message": "",
+                    "last_failure_at": "",
+                    "isolation_events": [],
                 }
                 existing.append(item)
                 existing_specs.add(row["spec"])
@@ -347,6 +361,9 @@ class ProxyPool:
                 raise KeyError(proxy_id)
             if "enabled" in values:
                 item["enabled"] = bool(values["enabled"])
+                if item["enabled"]:
+                    item["disabled_reason"] = ""
+                    item["disabled_at"] = ""
             if "label" in values:
                 item["label"] = str(values["label"] or "").strip()[:80] or item["label"]
             if "max_concurrency" in values:
@@ -409,6 +426,13 @@ class ProxyPool:
             "enabled": item["enabled"],
             "max_concurrency": item.get("max_concurrency"),
             "pending_delete": item.get("pending_delete", False),
+            "disabled_reason": item.get("disabled_reason", ""),
+            "disabled_at": item.get("disabled_at", ""),
+            "bot_failures": int(item.get("bot_failures") or 0),
+            "last_failure_code": item.get("last_failure_code", ""),
+            "last_failure_message": item.get("last_failure_message", ""),
+            "last_failure_at": item.get("last_failure_at", ""),
+            "isolation_events": list(item.get("isolation_events") or [])[-20:],
             **rt,
         }
 
@@ -444,7 +468,7 @@ class ProxyPool:
                 else:
                     items = [x for x in items if x["health"] == status]
             page = max(1, int(page))
-            per_page = max(1, min(int(per_page), 200))
+            per_page = max(1, min(int(per_page), 2000))
             start = (page - 1) * per_page
             return {
                 "items": items[start : start + per_page],
@@ -498,8 +522,10 @@ class ProxyPool:
         stop_event: threading.Event | None = None,
         exclude: Optional[set[str]] = None,
         wait: bool = True,
+        wait_timeout: Optional[float] = None,
     ) -> Optional[ProxyLease]:
         excluded = set(exclude or set())
+        deadline = time.monotonic() + max(0.0, float(wait_timeout)) if wait_timeout is not None else None
         with self._cv:
             if not self._data["proxies"]:
                 return ProxyLease("direct", "", "直连", account, "", True)
@@ -526,7 +552,22 @@ class ProxyPool:
                     return ProxyLease(item["id"], spec, mask_proxy(spec), account, session)
                 if not wait:
                     return None
+                if deadline is not None and time.monotonic() >= deadline:
+                    return None
                 self._cv.wait(timeout=0.5)
+
+    def retry_exclusions(self, attempted_ids: Iterable[str], egress_ip: str = "") -> set[str]:
+        """Exclude attempted rows and any row known to share the same egress."""
+        excluded = {str(x) for x in attempted_ids}
+        ip = str(egress_ip or "").strip()
+        if not ip:
+            return excluded
+        with self._lock:
+            for item in self._data["proxies"]:
+                rt = self._runtime.setdefault(item["id"], self._new_runtime())
+                if str(rt.get("egress_ip") or "").strip() == ip:
+                    excluded.add(item["id"])
+        return excluded
 
     def release(self, lease: ProxyLease | None, outcome: str = "neutral", message: str = "") -> None:
         if lease is None or lease.direct:
@@ -565,6 +606,52 @@ class ProxyPool:
                 self._runtime.pop(lease.proxy_id, None)
                 self._save_locked()
             self._cv.notify_all()
+
+    def disable_for_bot(
+        self,
+        lease: ProxyLease | None,
+        *,
+        domain: str = "",
+        logical_id: str = "",
+        message: str = "risk MARKED",
+    ) -> Optional[dict[str, Any]]:
+        """Atomically release a lease and persistently isolate its proxy.
+
+        Doing both under the pool condition lock closes the window where another
+        worker could acquire the proxy after MARKED but before it was disabled.
+        Existing leases are intentionally allowed to finish.
+        """
+        if lease is None or lease.direct:
+            return None
+        with self._cv:
+            item = self._entry(lease.proxy_id)
+            rt = self._runtime.get(lease.proxy_id)
+            if item is None or rt is None:
+                return None
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            rt["in_use"] = max(0, int(rt.get("in_use") or 0) - 1)
+            rt["marked"] = int(rt.get("marked") or 0) + 1
+            rt["consecutive_marked"] = int(rt.get("consecutive_marked") or 0) + 1
+            rt["health_message"] = "Bot MARKED，已自动停用"
+            item["enabled"] = False
+            item["disabled_reason"] = "BOT_MARKED"
+            item["disabled_at"] = now
+            item["bot_failures"] = int(item.get("bot_failures") or 0) + 1
+            item["last_failure_code"] = "BOT_MARKED"
+            item["last_failure_message"] = str(message or "risk MARKED")[:160]
+            item["last_failure_at"] = now
+            event = {
+                "at": now,
+                "code": "BOT_MARKED",
+                "proxy": lease.masked,
+                "domain": str(domain or ""),
+                "logical_id": str(logical_id or ""),
+                "message": str(message or "risk MARKED")[:160],
+            }
+            item["isolation_events"] = (list(item.get("isolation_events") or []) + [event])[-20:]
+            self._save_locked()
+            self._cv.notify_all()
+            return self._public_item(item)
 
     def set_health(self, proxy_id: str, result: dict[str, Any]) -> None:
         with self._cv:

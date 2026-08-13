@@ -852,6 +852,21 @@ class EmailService:
             self._emit(f"创建邮箱失败(Cloudflare Temp): {e}", "warn")
             return None, None
 
+    def create_email_for_domain(self, mail_domain: str):
+        """Create one Cloudflare Temp mailbox on an explicit base domain.
+
+        Unlike create_email(), this never falls through to another configured
+        domain, which lets the registration engine own domain retry semantics.
+        """
+        if self.provider_name != "cloudflare_temp":
+            raise ValueError("显式域名创邮仅支持 Cloudflare Temp")
+        domain = str(mail_domain or "").strip().lower()
+        if not domain:
+            raise ValueError("缺少基础域名")
+        result = self._create_cf_temp_for_domain(domain)
+        self._record_cf_domain_result(domain, bool(result[0] and result[1]))
+        return result
+
     def _create_freemail_legacy(self):
         """旧 freemail: GET /api/generate + Bearer token"""
         try:

@@ -117,6 +117,37 @@ class ProxyPoolTests(unittest.TestCase):
         self.pool.release(lease)
         self.assertEqual(self.pool.summary()["total"], 1)
 
+    def test_bot_failure_atomically_disables_and_persists(self):
+        self.pool.import_text("one.test:8001")
+        lease = self.pool.acquire("one")
+        isolated = self.pool.disable_for_bot(
+            lease,
+            domain="mail.example",
+            logical_id="logical-1",
+            message="policy=deny",
+        )
+        self.assertFalse(isolated["enabled"])
+        self.assertEqual(isolated["disabled_reason"], "BOT_MARKED")
+        self.assertEqual(isolated["bot_failures"], 1)
+        self.assertEqual(isolated["in_use"], 0)
+        self.assertIsNone(self.pool.acquire("two", wait=False))
+
+        restored = ProxyPool(self.path).list_public()["items"][0]
+        self.assertFalse(restored["enabled"])
+        self.assertEqual(restored["isolation_events"][-1]["domain"], "mail.example")
+
+    def test_retry_excludes_same_known_egress(self):
+        self.pool.import_text("one.test:8001\ntwo.test:8002\nthree.test:8003")
+        ids = [x["id"] for x in self.pool.list_public(per_page=10)["items"]]
+        self.pool.set_health(ids[0], {"ok": True, "egress_ip": "1.2.3.4"})
+        self.pool.set_health(ids[1], {"ok": True, "egress_ip": "1.2.3.4"})
+        self.pool.set_health(ids[2], {"ok": True, "egress_ip": "5.6.7.8"})
+        excluded = self.pool.retry_exclusions({ids[0]}, "1.2.3.4")
+        self.assertEqual(excluded, {ids[0], ids[1]})
+        lease = self.pool.acquire("retry", exclude=excluded, wait=False)
+        self.assertEqual(lease.proxy_id, ids[2])
+        self.pool.release(lease)
+
 
 if __name__ == "__main__":
     unittest.main()

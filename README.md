@@ -128,6 +128,7 @@ cp .env.example .env
 | `LOG_MAX_MB` / `LOG_ROTATE_FILE_COUNT` | 单份日志上限/总文件数（含当前） | `10` / `3` |
 | `UI_HOST` / `UI_PORT` | Web 监听 | `127.0.0.1` / `3333` |
 | `data/proxy_pool.json` | 注册代理池的本地私密存储；由 `/proxy-settings` 管理，不提交 Git | 空池（直连） |
+| `data/domain_pool.json` | Cloudflare Temp 基础域名状态、Bot 复验和审计记录；不提交 Git | 从现有域名配置迁移 |
 | `SUB2API_URL` | 旧版 sub2api 根地址；首次进入导入中心时用于迁移 | `http://127.0.0.1:9898` |
 | `SUB2API_GROK_GROUP_NAME` | 导入目标分组**名称**（按名称解析 ID） | `grok` |
 | `SUB2API_GROK_GROUP_ID` | 可选缓存；运行时会按名称回写 | 空 |
@@ -139,7 +140,7 @@ cp .env.example .env
 - 旧 `EMAIL_TYPE`、`FREEMAIL_*`、`OUTLOOK_*` 会自动读取；新页面首次保存后写入新结构并继续双写兼容变量。
 - Outlook 模式生成 `主账号+随机标签@outlook.com`，邮件仍进入主账号收件箱；这不是微软账户中创建的真实别名。
 - Outlook 收件优先使用 OAuth2；只有账号行未提供 OAuth2 凭据时，才尝试密码或应用密码。使用前需在 Outlook.com 中启用 IMAP。
-- Cloudflare Temp 域名池按页面顺序轮询。单域失败会尝试下一域；连续失败 3 次冷却 5 分钟。轮询游标和冷却状态仅在当前进程共享，重启或多实例不会共享。
+- Cloudflare Temp 域名表支持启停、测试、筛选和分页。邮箱 API 失败与 xAI Bot MARKED 分开统计；明确 MARKED 会停用当前代理，同一基础域在不同代理上复验仍 MARKED 时才持久化停用该域名。
 - Cloudflare 随机子域模式只应搭配 Worker `RANDOM_SUBDOMAIN_DOMAINS` 中的基础域名；Worker 还需配置 `RANDOM_SUBDOMAIN_LENGTH` 和通配 MX。
 - Sub2API 配置已迁移到独立“导入服务”页面；分组 ID 在测试/导入时按名称自动解析。
 - 名称匹配的是 sub2api **已有**分组（可跨 platform）；新分组请先在 sub2api 后台创建。
@@ -174,6 +175,7 @@ python start.py
 - **配置**：Solver 等通用参数 → 写入 `.env`
 - **日志与磁盘保护**：抓包默认关闭；可查看占用、调整保留上限并清理历史诊断抓包
 - **注册代理**：独立页面管理代理池、调度与健康状态 → 写入 `data/proxy_pool.json`
+- **域名管理**：Cloudflare Temp 区域管理基础域启停、邮箱健康、Bot 复验和审计 → 写入 `data/domain_pool.json`
 - **运行**：选择 `same_session`、并发、数量和本批 Risk 检测开关后开始
 - **日志**：左侧主流程（建邮→camoufox→signup→SSO），右侧 Risk / Token / NSFW
 - **Keys**：下载 SSO 文件；批量导入统一在导入中心执行
