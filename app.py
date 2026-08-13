@@ -2068,21 +2068,23 @@ def get_config():
 def _sync_cf_domain_env() -> None:
     """Keep the legacy provider list aligned with currently active pool rows."""
     values = read_env_file()
+    active_domains = domain_pool.active_domains()
     values["EMAIL_CF_TEMP_DOMAINS_JSON"] = json.dumps(
-        domain_pool.active_domains(), ensure_ascii=False, separators=(",", ":")
+        active_domains, ensure_ascii=False, separators=(",", ":")
     )
-    values["EMAIL_CF_TEMP_AUTO_DOMAIN"] = "0"
+    values["EMAIL_CF_TEMP_AUTO_DOMAIN"] = "0" if active_domains else "1"
     write_env_file(values)
     os.environ["EMAIL_CF_TEMP_DOMAINS_JSON"] = values["EMAIL_CF_TEMP_DOMAINS_JSON"]
-    os.environ["EMAIL_CF_TEMP_AUTO_DOMAIN"] = "0"
+    os.environ["EMAIL_CF_TEMP_AUTO_DOMAIN"] = values["EMAIL_CF_TEMP_AUTO_DOMAIN"]
 
 
 @app.get("/api/email-config")
 def get_email_config():
     structured = resolved_email_config(read_env_file())
     if domain_pool.summary().get("total"):
-        structured["providers"]["cloudflare_temp"]["domains"] = domain_pool.active_domains()
-        structured["providers"]["cloudflare_temp"]["auto_domain"] = False
+        active_domains = domain_pool.active_domains()
+        structured["providers"]["cloudflare_temp"]["domains"] = active_domains
+        structured["providers"]["cloudflare_temp"]["auto_domain"] = not bool(active_domains)
     try:
         from g.email_service import EmailService
         cf_health = dict(EmailService._cf_domain_health)
@@ -2245,16 +2247,19 @@ def domain_pool_list():
 
 @app.post("/api/domains")
 def domain_pool_add():
-    if engine.is_running():
-        return jsonify({"ok": False, "message": "任务运行中不能添加域名"}), 409
     body = request.get_json(silent=True) or {}
     values = body.get("domains")
     if not isinstance(values, list):
         values = [body.get("domain")]
     try:
         result = domain_pool.add([str(x or "") for x in values], enabled=False)
-        _sync_cf_domain_env()
-        return jsonify({"ok": True, **result, "message": "新域名已添加为停用，请测试后启用"})
+        if not engine.is_running():
+            _sync_cf_domain_env()
+        message = (
+            f"导入完成：新增 {result['added']}，已存在 {result['duplicates']}，"
+            f"无效 {result['invalid']}"
+        )
+        return jsonify({"ok": True, **result, "message": message})
     except DomainPoolError as exc:
         return jsonify({"ok": False, "message": str(exc)}), 400
 
@@ -2325,14 +2330,14 @@ def domain_pool_bulk():
     action = str(body.get("action") or "")
     if not ids:
         return jsonify({"ok": False, "message": "请选择域名"}), 400
-    if action not in {"enable", "disable", "archive", "delete"}:
+    if action not in {"enable", "disable", "delete"}:
         return jsonify({"ok": False, "message": "批量操作无效"}), 400
-    if action in {"archive", "delete"}:
+    if action == "delete":
         if engine.is_running():
-            return jsonify({"ok": False, "message": "任务运行中不能归档域名"}), 409
-        result = domain_pool.delete_or_archive(ids) if action == "delete" else domain_pool.archive(ids)
+            return jsonify({"ok": False, "message": "任务运行中不能删除域名"}), 409
+        result = domain_pool.delete(ids)
         _sync_cf_domain_env()
-        return jsonify({"ok": True, **result})
+        return jsonify({"ok": True, **result, "message": f"已永久删除 {result['removed']} 个域名及其历史"})
     if action == "enable":
         ids = ids[:2000]
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
@@ -2823,9 +2828,10 @@ def start():
 
     cfg_env = read_env_file()
     if domain_pool.summary().get("total"):
-        active_json = json.dumps(domain_pool.active_domains(), ensure_ascii=False)
+        active_domains = domain_pool.active_domains()
+        active_json = json.dumps(active_domains, ensure_ascii=False)
         cfg_env["EMAIL_CF_TEMP_DOMAINS_JSON"] = active_json
-        cfg_env["EMAIL_CF_TEMP_AUTO_DOMAIN"] = "0"
+        cfg_env["EMAIL_CF_TEMP_AUTO_DOMAIN"] = "0" if active_domains else "1"
     email_cfg = resolved_email_config(cfg_env)
     email_errors = validate_provider_config(email_cfg)
     if email_errors:

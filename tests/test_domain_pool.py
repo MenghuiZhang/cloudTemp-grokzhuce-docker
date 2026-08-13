@@ -2,8 +2,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from g.domain_pool import DomainPool
+from g.domain_pool import DomainPool, DomainPoolError
 
 
 class DomainPoolTests(unittest.TestCase):
@@ -80,27 +81,65 @@ class DomainPoolTests(unittest.TestCase):
         self.assertEqual(data["per_page"], 2000)
         self.assertEqual(len(data["items"]), 250)
 
-    def test_archive_is_persistent_and_filterable(self):
-        self.pool.sync_configured(["a.example"])
-        row = self.pool.list_public()["items"][0]
-        self.pool.archive([row["id"]])
-        self.assertEqual(self.pool.list_public()["total"], 0)
-        archived = DomainPool(self.path).list_public(status="archived")
-        self.assertEqual(archived["total"], 1)
-        stored = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(stored["domains"][0]["status"], "archived")
+    def test_archived_rows_migrate_to_disabled_with_history(self):
+        self.path.write_text(json.dumps({
+            "version": 1,
+            "domains": [{
+                "id": "legacy-id",
+                "domain": "Legacy.Example.",
+                "status": "archived",
+                "events": [{"code": "OLD_EVENT", "message": "old"}],
+            }],
+        }), encoding="utf-8")
 
-    def test_pristine_delete_is_hard_but_history_is_archived(self):
+        restored = DomainPool(self.path)
+        row = restored.list_public()["items"][0]
+        self.assertEqual(row["domain"], "legacy.example")
+        self.assertEqual(row["status"], "disabled")
+        self.assertEqual(row["disabled_reason"], "MIGRATED_FROM_ARCHIVE")
+        self.assertEqual([event["code"] for event in row["events"]], ["OLD_EVENT", "MIGRATED_FROM_ARCHIVE"])
+        stored = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(stored["domains"][0]["status"], "disabled")
+
+    def test_delete_removes_rows_even_with_history(self):
         self.pool.add(["new.example"])
         pristine = self.pool.list_public()["items"][0]
-        result = self.pool.delete_or_archive([pristine["id"]])
-        self.assertEqual(result, {"removed": 1, "archived": 0})
+        result = self.pool.delete([pristine["id"]])
+        self.assertEqual(result, {"removed": 1})
 
         self.pool.sync_configured(["used.example"])
         used = self.pool.list_public()["items"][0]
         self.pool.set_email_health(used["id"], ok=True, message="ok")
-        result = self.pool.delete_or_archive([used["id"]])
-        self.assertEqual(result, {"removed": 0, "archived": 1})
+        result = self.pool.delete([used["id"]])
+        self.assertEqual(result, {"removed": 1})
+        self.assertEqual(self.pool.list_public()["total"], 0)
+
+    def test_batch_add_normalizes_deduplicates_and_skips_invalid(self):
+        self.pool.add(["existing.example"])
+        result = self.pool.add([
+            " Existing.Example. ",
+            "new.example",
+            "NEW.EXAMPLE.",
+            "not a domain",
+            "",
+        ])
+        self.assertEqual(result["added"], 1)
+        self.assertEqual(result["duplicates"], 2)
+        self.assertEqual(result["invalid"], 2)
+        self.assertEqual(
+            [row["domain"] for row in self.pool.list_public(per_page=10)["items"]],
+            ["existing.example", "new.example"],
+        )
+
+    def test_batch_add_capacity_error_is_atomic(self):
+        self.pool.add(["existing.example"])
+        with patch("g.domain_pool.MAX_DOMAINS", 2):
+            with self.assertRaises(DomainPoolError):
+                self.pool.add(["one.example", "two.example"])
+        self.assertEqual(
+            [row["domain"] for row in self.pool.list_public(per_page=10)["items"]],
+            ["existing.example"],
+        )
 
 
 if __name__ == "__main__":

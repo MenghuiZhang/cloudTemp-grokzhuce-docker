@@ -66,7 +66,7 @@ class DomainPool:
                     loaded = {}
             clean: list[dict[str, Any]] = []
             seen: set[str] = set()
-            recovered = False
+            changed = False
             for raw in loaded.get("domains") or []:
                 if not isinstance(raw, dict):
                     continue
@@ -77,14 +77,25 @@ class DomainPool:
                 if domain in seen:
                     continue
                 seen.add(domain)
-                status = str(raw.get("status") or ("enabled" if raw.get("enabled", True) else "disabled"))
+                status = str(
+                    raw.get("status") or ("enabled" if raw.get("enabled", True) else "disabled")
+                ).lower()
                 if status not in {"enabled", "disabled", "verifying", "archived"}:
                     status = "enabled"
                 events = list(raw.get("events") or [])[-20:]
+                was_archived = status == "archived"
+                if was_archived:
+                    status = "disabled"
+                    changed = True
+                    events.append({
+                        "at": _now(),
+                        "code": "MIGRATED_FROM_ARCHIVE",
+                        "message": "旧归档状态已迁移为停用",
+                    })
                 # A registration attempt cannot be resumed safely after process restart.
                 if status == "verifying":
                     status = "enabled"
-                    recovered = True
+                    changed = True
                     events.append({
                         "at": _now(),
                         "code": "REVALIDATION_INTERRUPTED",
@@ -100,8 +111,16 @@ class DomainPool:
                     "last_failure_code": str(raw.get("last_failure_code") or ""),
                     "last_failure_message": str(raw.get("last_failure_message") or ""),
                     "last_failure_at": str(raw.get("last_failure_at") or ""),
-                    "disabled_reason": str(raw.get("disabled_reason") or ""),
-                    "disabled_at": str(raw.get("disabled_at") or ""),
+                    "disabled_reason": (
+                        "MIGRATED_FROM_ARCHIVE"
+                        if was_archived
+                        else str(raw.get("disabled_reason") or "")
+                    ),
+                    "disabled_at": (
+                        (str(raw.get("disabled_at") or "") or _now())
+                        if was_archived
+                        else str(raw.get("disabled_at") or "")
+                    ),
                     "email_health": str(raw.get("email_health") or "untested"),
                     "email_health_message": str(raw.get("email_health_message") or "尚未测试"),
                     "email_tested_at": str(raw.get("email_tested_at") or ""),
@@ -110,7 +129,7 @@ class DomainPool:
                 })
             self._data = {"version": 1, "domains": clean[:MAX_DOMAINS]}
             self._runtime = {row["id"]: {"in_use": 0} for row in clean}
-            if recovered:
+            if changed:
                 self._save_locked()
 
     def _save_locked(self) -> None:
@@ -181,22 +200,39 @@ class DomainPool:
         }
 
     def add(self, domains: Iterable[str], *, enabled: bool = False) -> dict[str, Any]:
+        normalized: list[str] = []
+        invalid_values: list[str] = []
+        for value in domains:
+            try:
+                normalized.append(normalize_domain(value))
+            except DomainPoolError:
+                invalid_values.append(str(value or "").strip()[:253])
+
         added = duplicates = 0
         with self._lock:
-            for value in domains:
-                domain = normalize_domain(value)
-                if self._entry_by_name(domain):
+            existing = {row["domain"] for row in self._data["domains"]}
+            candidates: list[str] = []
+            for domain in normalized:
+                if domain in existing:
                     duplicates += 1
                     continue
-                if len(self._data["domains"]) >= MAX_DOMAINS:
-                    raise DomainPoolError(f"域名数量超过 {MAX_DOMAINS}")
+                existing.add(domain)
+                candidates.append(domain)
+            if len(self._data["domains"]) + len(candidates) > MAX_DOMAINS:
+                raise DomainPoolError(f"域名数量超过 {MAX_DOMAINS}")
+            for domain in candidates:
                 row = self._new_entry(domain, status="enabled" if enabled else "disabled")
                 self._data["domains"].append(row)
                 self._runtime[row["id"]] = {"in_use": 0}
                 added += 1
             if added:
                 self._save_locked()
-        return {"added": added, "duplicates": duplicates}
+        return {
+            "added": added,
+            "duplicates": duplicates,
+            "invalid": len(invalid_values),
+            "invalid_values": invalid_values[:100],
+        }
 
     def _public(self, row: dict[str, Any]) -> dict[str, Any]:
         out = dict(row)
@@ -212,8 +248,6 @@ class DomainPool:
                 rows = [x for x in rows if q in (x["domain"] + " " + x.get("last_failure_message", "")).lower()]
             if status:
                 rows = [x for x in rows if x["status"] == status]
-            else:
-                rows = [x for x in rows if x["status"] != "archived"]
             page = max(1, int(page))
             per_page = max(1, min(int(per_page), 2000))
             start = (page - 1) * per_page
@@ -233,7 +267,6 @@ class DomainPool:
                 "enabled": sum(1 for x in rows if x["status"] == "enabled"),
                 "disabled": sum(1 for x in rows if x["status"] == "disabled"),
                 "verifying": sum(1 for x in rows if x["status"] == "verifying"),
-                "archived": sum(1 for x in rows if x["status"] == "archived"),
                 "busy": sum(int(x.get("in_use") or 0) for x in self._runtime.values()),
             }
 
@@ -371,46 +404,22 @@ class DomainPool:
             self._save_locked()
             return self._public(row)
 
-    def archive(self, ids: Iterable[str]) -> dict[str, int]:
+    def delete(self, ids: Iterable[str]) -> dict[str, int]:
+        """Permanently delete selected rows and their embedded history."""
         wanted = {str(x) for x in ids}
-        archived = 0
-        with self._lock:
-            for row in self._data["domains"]:
-                if row["id"] not in wanted:
-                    continue
-                row["status"] = "archived"
-                row["verification_owner"] = ""
-                self._event(row, "ARCHIVED", "人工归档")
-                archived += 1
-            if archived:
-                self._save_locked()
-        return {"archived": archived}
-
-    def delete_or_archive(self, ids: Iterable[str]) -> dict[str, int]:
-        """Hard-delete pristine rows; archive anything with history or use."""
-        wanted = {str(x) for x in ids}
-        removed = archived = 0
+        removed = 0
         with self._lock:
             kept: list[dict[str, Any]] = []
             for row in self._data["domains"]:
                 if row["id"] not in wanted:
                     kept.append(row)
                     continue
-                in_use = int(self._runtime.setdefault(row["id"], {"in_use": 0}).get("in_use") or 0)
-                has_history = bool(row.get("events") or row.get("bot_failures") or row.get("last_failure_at"))
-                if not in_use and not has_history:
-                    self._runtime.pop(row["id"], None)
-                    removed += 1
-                    continue
-                row["status"] = "archived"
-                row["verification_owner"] = ""
-                self._event(row, "ARCHIVED", "有历史或在途记录，删除已转为归档")
-                kept.append(row)
-                archived += 1
+                self._runtime.pop(row["id"], None)
+                removed += 1
             self._data["domains"] = kept
-            if removed or archived:
+            if removed:
                 self._save_locked()
-        return {"removed": removed, "archived": archived}
+        return {"removed": removed}
 
     def move(self, domain_id: str, direction: str) -> None:
         with self._lock:

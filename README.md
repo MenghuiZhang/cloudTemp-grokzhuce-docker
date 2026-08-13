@@ -140,7 +140,7 @@ cp .env.example .env
 - 旧 `EMAIL_TYPE`、`FREEMAIL_*`、`OUTLOOK_*` 会自动读取；新页面首次保存后写入新结构并继续双写兼容变量。
 - Outlook 模式生成 `主账号+随机标签@outlook.com`，邮件仍进入主账号收件箱；这不是微软账户中创建的真实别名。
 - Outlook 收件优先使用 OAuth2；只有账号行未提供 OAuth2 凭据时，才尝试密码或应用密码。使用前需在 Outlook.com 中启用 IMAP。
-- Cloudflare Temp 域名表支持启停、测试、筛选和分页。邮箱 API 失败与 xAI Bot MARKED 分开统计；明确 MARKED 会停用当前代理，同一基础域在不同代理上复验仍 MARKED 时才持久化停用该域名。
+- Cloudflare Temp 域名表支持从服务批量拉取、去重、启停、测试、筛选、分页和永久删除。新拉取域名默认停用；删除会同时移除该域名的检测与失败历史。邮箱 API 失败与 xAI Bot MARKED 分开统计；明确 MARKED 会停用当前代理，同一基础域在不同代理上复验仍 MARKED 时才持久化停用该域名。
 - Cloudflare 随机子域模式只应搭配 Worker `RANDOM_SUBDOMAIN_DOMAINS` 中的基础域名；Worker 还需配置 `RANDOM_SUBDOMAIN_LENGTH` 和通配 MX。
 - Sub2API 配置已迁移到独立“导入服务”页面；分组 ID 在测试/导入时按名称自动解析。
 - 名称匹配的是 sub2api **已有**分组（可跨 platform）；新分组请先在 sub2api 后台创建。
