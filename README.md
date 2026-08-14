@@ -146,7 +146,8 @@ cp .env.example .env
 - 名称匹配的是 sub2api **已有**分组（可跨 platform）；新分组请先在 sub2api 后台创建。
 - 导入主路径：`POST /api/v1/admin/grok/sso-to-oauth`（服务端换票）。
 - 默认**不**自动导入；服务测试通过后，可在导入中心按目标开启注册后自动导入。
-- 导入配置和写入型密钥保存在 `converted_auth/import_services.json`，API 只返回掩码。
+- 导入配置和写入型密钥保存在 `data/import_services.json`，API 只返回掩码；旧版
+  `converted_auth/import_services.json` 会在首次读取时自动迁移且保留原文件。
 - Token 换票 / 协议 / NSFW 在成功后异步后台跑，不堵注册主路径。
 
 ## 使用

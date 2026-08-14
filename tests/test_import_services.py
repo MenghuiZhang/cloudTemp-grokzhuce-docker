@@ -62,6 +62,41 @@ class ImportConfigStoreTests(unittest.TestCase):
             self.assertEqual(saved["test_states"]["cpa"]["status"], "untested")
             self.assertEqual(saved["paths"]["cpa_dir"], str((root / "converted_auth" / "cpa").resolve()))
 
+    def test_saved_services_survive_store_recreation_in_data_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ImportConfigStore(root, env_reader=lambda: {})
+            store.save({
+                "services": {
+                    "sub2api": {"base_url": "https://sub.example", "password": "sub-secret"},
+                    "cpa": {"base_url": "https://cpa.example", "management_key": "cpa-secret"},
+                    "grok2api": {"base_url": "https://grok.example", "password": "grok-secret"},
+                }
+            })
+
+            self.assertEqual(store.path, (root / "data" / "import_services.json").resolve())
+            restored = ImportConfigStore(root, env_reader=lambda: {}).load()
+            self.assertEqual(restored["services"]["sub2api"]["base_url"], "https://sub.example")
+            self.assertEqual(restored["services"]["sub2api"]["password"], "sub-secret")
+            self.assertEqual(restored["services"]["cpa"]["management_key"], "cpa-secret")
+            self.assertEqual(restored["services"]["grok2api"]["password"], "grok-secret")
+
+    def test_legacy_converted_auth_config_is_migrated_to_data(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = root / "converted_auth" / "import_services.json"
+            from g.import_services import _atomic_json
+
+            payload = ImportConfigStore(root, env_reader=lambda: {}).load()
+            payload["services"]["grok2api"]["base_url"] = "https://legacy.example"
+            _atomic_json(legacy, payload)
+
+            store = ImportConfigStore(root, env_reader=lambda: {})
+            restored = store.load()
+            self.assertEqual(restored["services"]["grok2api"]["base_url"], "https://legacy.example")
+            self.assertTrue(store.path.is_file())
+            self.assertTrue(legacy.is_file())
+
 
 class ImportTargetTests(unittest.TestCase):
     def test_local_pool_is_idempotent(self):

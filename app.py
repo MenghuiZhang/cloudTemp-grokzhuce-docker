@@ -206,6 +206,21 @@ DEFAULTS = {
 }
 DEFAULTS.update(EMAIL_DEFAULTS)
 
+LEGACY_SUB2_CONFIG_KEYS = frozenset({
+    "SUB2API_URL",
+    "SUB2API_DOCKER_CONTAINER",
+    "SUB2API_DB_HOST",
+    "SUB2API_DB_PORT",
+    "SUB2API_DB_NAME",
+    "SUB2API_DB_USER",
+    "SUB2API_DB_PASSWORD",
+    "SUB2API_GROK_GROUP_ID",
+    "SUB2API_GROK_GROUP_NAME",
+    "UPSTREAM_URL",
+    "UPSTREAM_ADMIN_EMAIL",
+    "UPSTREAM_ADMIN_PASSWORD",
+})
+
 # Deliberately process-local: a restart makes a provider require a fresh test
 # before it can be newly activated. A migrated already-active provider remains
 # runnable until the user edits or switches it.
@@ -2423,6 +2438,7 @@ def save_config():
 
     body = request.get_json(silent=True) or {}
     current = read_env_file()
+    legacy_sub2_update = bool(LEGACY_SUB2_CONFIG_KEYS.intersection(body))
 
     worker = str(body.get("WORKER_DOMAIN", current.get("WORKER_DOMAIN", ""))).strip()
     token = str(body.get("FREEMAIL_TOKEN", current.get("FREEMAIL_TOKEN", ""))).strip()
@@ -2578,13 +2594,14 @@ def save_config():
                 "ok": False,
                 "message": f"{name} 范围 {minimum}-{maximum}",
             }), 400
-    if not re.fullmatch(r"\d{2,5}", sub2api_db_port):
-        return jsonify({"ok": False, "message": "SUB2API_DB_PORT 必须是 2-5 位数字"}), 400
-    if not sub2api_group_name:
-        return jsonify({"ok": False, "message": "请填写分组名称"}), 400
-    # 旧缓存 ID 可保留；非法则清空，等名称解析后回写
-    if sub2api_group_id and not re.fullmatch(r"\d+", sub2api_group_id):
-        sub2api_group_id = ""
+    if legacy_sub2_update:
+        if not re.fullmatch(r"\d{2,5}", sub2api_db_port):
+            return jsonify({"ok": False, "message": "SUB2API_DB_PORT 必须是 2-5 位数字"}), 400
+        if not sub2api_group_name:
+            return jsonify({"ok": False, "message": "请填写分组名称"}), 400
+        # 旧缓存 ID 可保留；非法则清空，等名称解析后回写
+        if sub2api_group_id and not re.fullmatch(r"\d+", sub2api_group_id):
+            sub2api_group_id = ""
     if solver_browser not in ("camoufox", "chromium", "chrome", "msedge"):
         return jsonify({"ok": False, "message": "SOLVER_BROWSER 不支持该值"}), 400
     if not solver:
@@ -2611,22 +2628,25 @@ def save_config():
         "LOG_ROTATE_FILE_COUNT": log_rotate_file_count,
         "UI_HOST": ui_host,
         "UI_PORT": ui_port,
-        "SUB2API_URL": sub2api_url,
-        "SUB2API_DOCKER_CONTAINER": sub2api_container,
-        "SUB2API_DB_HOST": sub2api_db_host,
-        "SUB2API_DB_PORT": sub2api_db_port,
-        "SUB2API_DB_NAME": sub2api_db_name,
-        "SUB2API_DB_USER": sub2api_db_user,
-        "SUB2API_DB_PASSWORD": sub2api_db_password,
-        "SUB2API_GROK_GROUP_ID": sub2api_group_id,
-        "SUB2API_GROK_GROUP_NAME": sub2api_group_name,
-        "UPSTREAM_URL": upstream_url,
-        "UPSTREAM_ADMIN_EMAIL": upstream_email,
-        "UPSTREAM_ADMIN_PASSWORD": upstream_pwd,
         "EMAIL_TYPE": email_type,
         "OUTLOOK_ACCOUNTS": outlook_accounts,
         "OUTLOOK_ALIAS_LIMIT": outlook_alias_limit,
     }
+    if legacy_sub2_update:
+        values.update({
+            "SUB2API_URL": sub2api_url,
+            "SUB2API_DOCKER_CONTAINER": sub2api_container,
+            "SUB2API_DB_HOST": sub2api_db_host,
+            "SUB2API_DB_PORT": sub2api_db_port,
+            "SUB2API_DB_NAME": sub2api_db_name,
+            "SUB2API_DB_USER": sub2api_db_user,
+            "SUB2API_DB_PASSWORD": sub2api_db_password,
+            "SUB2API_GROK_GROUP_ID": sub2api_group_id,
+            "SUB2API_GROK_GROUP_NAME": sub2api_group_name,
+            "UPSTREAM_URL": upstream_url,
+            "UPSTREAM_ADMIN_EMAIL": upstream_email,
+            "UPSTREAM_ADMIN_PASSWORD": upstream_pwd,
+        })
     storage_keys = (
         "SOLVER_CAPTURE_DUMPS",
         "SOLVER_CAPTURE_MAX_GROUPS",
@@ -2671,7 +2691,7 @@ def save_config():
 
         # 保存后自动测试 sub2api HTTP 通道，并按名称解析 group_id 回写
         upstream_test = None
-        if sub2api_url and upstream_email and upstream_pwd and sub2api_group_name:
+        if legacy_sub2_update and sub2api_url and upstream_email and upstream_pwd and sub2api_group_name:
             try:
                 upstream_test = test_upstream_connectivity(
                     sub2api_url,

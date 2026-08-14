@@ -102,6 +102,18 @@ def _atomic_json(path: Path, payload: Any, *, mode: int = 0o600) -> None:
             pass
         os.replace(temp_name, path)
         temp_name = ""
+        # fsync the directory entry as well as the file contents.  This keeps
+        # a successful save durable across an immediate container/host restart.
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            # Some filesystems (notably a few Docker Desktop mounts) do not
+            # support directory fsync.  The atomic replace above still holds.
+            pass
     finally:
         if temp_name:
             try:
@@ -183,9 +195,11 @@ def default_config(base_dir: Path) -> dict:
 class ImportConfigStore:
     def __init__(self, base_dir: Path, env_reader: Callable[[], dict] | None = None):
         self.base_dir = Path(base_dir).resolve()
-        # ``converted_auth`` is already a Docker bind mount, so configuration
-        # and write-only management secrets survive image rebuilds.
-        self.path = self.base_dir / "converted_auth" / "import_services.json"
+        # Configuration is application state, not generated credential output.
+        # ``data`` is the dedicated persistent Docker mount.  Keep the former
+        # location for a one-way, non-destructive migration.
+        self.path = self.base_dir / "data" / "import_services.json"
+        self.legacy_path = self.base_dir / "converted_auth" / "import_services.json"
         self._env_reader = env_reader or (lambda: dict(os.environ))
         self._lock = threading.RLock()
 
@@ -205,19 +219,26 @@ class ImportConfigStore:
     def load(self) -> dict:
         with self._lock:
             defaults = self._migrated_defaults()
-            if not self.path.is_file():
+            source = self.path
+            migrate_legacy = False
+            if not source.is_file() and self.legacy_path.is_file():
+                source = self.legacy_path
+                migrate_legacy = True
+            if not source.is_file():
                 return defaults
             try:
-                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                raw = json.loads(source.read_text(encoding="utf-8"))
             except Exception:
-                broken = self.path.with_name(f"{self.path.name}.broken-{int(time.time())}")
+                broken = source.with_name(f"{source.name}.broken-{int(time.time())}")
                 try:
-                    self.path.replace(broken)
+                    source.replace(broken)
                 except OSError:
                     pass
                 return defaults
             merged = _deep_merge(defaults, raw if isinstance(raw, dict) else {})
             merged["paths"] = defaults["paths"]
+            if migrate_legacy:
+                _atomic_json(self.path, merged)
             return merged
 
     def save(self, incoming: dict) -> dict:
