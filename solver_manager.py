@@ -101,12 +101,60 @@ def _write_state(data: dict) -> None:
     STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _read_state() -> dict[str, Any]:
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
 def _clear_pid() -> None:
     try:
         if PID_FILE.exists():
             PID_FILE.unlink()
     except Exception:
         pass
+
+
+def _clear_process_state() -> None:
+    _clear_pid()
+    try:
+        if STATE_FILE.exists():
+            STATE_FILE.unlink()
+    except Exception:
+        pass
+
+
+def _managed_process_group(pid: Optional[int]) -> Optional[int]:
+    """Return only a process group that this manager explicitly created."""
+    if sys.platform == "win32" or not pid:
+        return None
+    state = _read_state()
+    try:
+        state_pid = int(state.get("pid") or 0)
+        pgid = int(state.get("pgid") or 0)
+    except (TypeError, ValueError):
+        return None
+    # start_new_session makes pgid == child pid. Requiring both values avoids
+    # signalling the web process' own group from a stale/corrupt file.
+    if state_pid == int(pid) and pgid == int(pid) and pgid > 1:
+        return pgid
+    return None
+
+
+def _process_group_running(pgid: Optional[int]) -> bool:
+    if sys.platform == "win32" or not pgid or pgid <= 1:
+        return False
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 
 def is_pid_running(pid: Optional[int]) -> bool:
@@ -266,9 +314,12 @@ def status(force: bool = False, http_timeout: float = 0.8) -> dict[str, Any]:
     pid = _read_pid()
     running = is_pid_running(pid)
     if not running and pid:
-        # PID 文件过期：清掉，后面用端口/进程再找回
-        _clear_pid()
-        pid = None
+        # Keep the recorded leader while its managed process group still has
+        # browser descendants. start()/stop() can then reap the orphan tree.
+        pgid = _managed_process_group(pid)
+        if not _process_group_running(pgid):
+            _clear_process_state()
+            pid = None
 
     # TCP 探测：force（看门狗）用更长超时，避免解验证码时假离线
     tcp_timeout = 1.2 if force else 0.5
@@ -579,8 +630,14 @@ def _start_unlocked(wait_ready: bool = True, timeout: float = 90.0) -> dict[str,
 
     # 清理僵死 PID，避免误判
     old_pid = _read_pid()
-    if old_pid and not is_pid_running(old_pid) and not port_is_open(cfg["host"], int(cfg["port"])):
-        _clear_pid()
+    if old_pid and not is_pid_running(old_pid):
+        old_pgid = _managed_process_group(old_pid)
+        if _process_group_running(old_pgid):
+            # The API parent died but Firefox/Camoufox descendants survived.
+            # Reap the old group before creating another solver generation.
+            stop()
+        elif not port_is_open(cfg["host"], int(cfg["port"])):
+            _clear_process_state()
 
     _ensure_dirs()
     cmd = [
@@ -640,6 +697,7 @@ def _start_unlocked(wait_ready: bool = True, timeout: float = 90.0) -> dict[str,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             creationflags=creationflags,
+            start_new_session=(sys.platform != "win32"),
             env=child_env,
         )
     except Exception as e:
@@ -650,6 +708,7 @@ def _start_unlocked(wait_ready: bool = True, timeout: float = 90.0) -> dict[str,
     _write_state(
         {
             "pid": proc.pid,
+            "pgid": proc.pid if sys.platform != "win32" else None,
             "cmd": cmd,
             "started_at": time.time(),
             "url": cfg["url"],
@@ -665,7 +724,9 @@ def _start_unlocked(wait_ready: bool = True, timeout: float = 90.0) -> dict[str,
     ready = _wait_http(cfg["url"], timeout=timeout, process=proc)
     # 若进程已退出
     if proc.poll() is not None:
-        _clear_pid()
+        # Startup may fail after spawning a browser driver. stop() targets the
+        # recorded process group even when the Python parent has already exited.
+        stop()
         invalidate_status_cache()
         return {
             "ok": False,
@@ -705,9 +766,12 @@ def _wait_http(
 def stop() -> dict[str, Any]:
     invalidate_status_cache()
     pid = _read_pid()
-    if not pid or not is_pid_running(pid):
+    pgid = _managed_process_group(pid)
+    pid_running = is_pid_running(pid)
+    group_running = _process_group_running(pgid)
+    if not pid or (not pid_running and not group_running):
         # 尝试按端口杀掉残留（仅本机 solver 端口）
-        _clear_pid()
+        _clear_process_state()
         st = status(force=True)
         if st["ready"]:
             return {
@@ -726,9 +790,27 @@ def stop() -> dict[str, Any]:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         else:
-            os.kill(pid, signal.SIGTERM)
-            time.sleep(1)
-            if is_pid_running(pid):
+            if pgid:
+                try:
+                    os.killpg(pgid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            elif pid_running:
+                os.kill(pid, signal.SIGTERM)
+
+            # Give Quart's after_serving cleanup a chance to close every browser.
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if not is_pid_running(pid) and not _process_group_running(pgid):
+                    break
+                time.sleep(0.1)
+
+            if _process_group_running(pgid):
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            elif is_pid_running(pid):
                 os.kill(pid, signal.SIGKILL)
     except Exception as e:
         invalidate_status_cache()
@@ -739,7 +821,7 @@ def stop() -> dict[str, Any]:
         if not is_pid_running(pid):
             break
         time.sleep(0.25)
-    _clear_pid()
+    _clear_process_state()
     invalidate_status_cache()
     return {"ok": True, "message": f"已停止 PID={pid}", **status(force=True)}
 

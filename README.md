@@ -123,6 +123,8 @@ cp .env.example .env
 | `SOLVER_URL` | 本地 Solver 地址 | `http://127.0.0.1:5072` |
 | `SOLVER_BROWSER` | `camoufox` / `chromium` | `camoufox` |
 | `SOLVER_THREADS` | Solver 浏览器线程 | `4` |
+| `SOLVER_BROWSER_MAX_USES` | 单个 Solver 浏览器处理指定次数后自动轮换 | `100` |
+| `SOLVER_IDLE_SHUTDOWN_SECONDS` | 注册批次结束后空闲多久停止本地 Solver；`0` 为关闭 | `60` |
 | `SOLVER_CAPTURE_DUMPS` | 保存 FO/RCH 诊断抓包；仅排障时开启 | `0` |
 | `SOLVER_CAPTURE_MAX_GROUPS` / `SOLVER_CAPTURE_MAX_MB` | 抓包保留组数/总容量双上限 | `20` / `50` |
 | `LOG_MAX_MB` / `LOG_ROTATE_FILE_COUNT` | 单份日志上限/总文件数（含当前） | `10` / `3` |

@@ -5,7 +5,10 @@ import uuid
 import random
 import logging
 import asyncio
+import inspect
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Any
 from typing import Optional, Union
 import argparse
 
@@ -69,6 +72,16 @@ COLORS = {
 }
 
 
+@dataclass
+class BrowserSlot:
+    index: int
+    manager: Any
+    browser: Any
+    config: dict[str, Any]
+    uses: int = 0
+    broken: bool = False
+
+
 class CustomLogger(logging.Logger):
     @staticmethod
     def format_message(level, color, message):
@@ -108,6 +121,16 @@ class TurnstileAPIServer:
         self.thread_count = thread
         self.proxy_support = proxy_support
         self.browser_pool = asyncio.Queue()
+        self.browser_slots: dict[int, BrowserSlot] = {}
+        self.background_tasks: set[asyncio.Task] = set()
+        self.periodic_cleanup_task: Optional[asyncio.Task] = None
+        self.closing = False
+        try:
+            self.browser_max_uses = max(
+                10, min(1000, int(os.getenv("SOLVER_BROWSER_MAX_USES") or "100"))
+            )
+        except ValueError:
+            self.browser_max_uses = 100
         self.use_random_config = use_random_config
         self.browser_name = browser_name
         self.browser_version = browser_version
@@ -195,6 +218,7 @@ class TurnstileAPIServer:
     def _setup_routes(self) -> None:
         """Set up the application routes."""
         self.app.before_serving(self._startup)
+        self.app.after_serving(self._shutdown)
         self.app.route('/turnstile', methods=['GET'])(self.process_turnstile)
         self.app.route('/result', methods=['GET'])(self.get_result)
         self.app.route('/')(self.index)
@@ -209,22 +233,15 @@ class TurnstileAPIServer:
             await self._initialize_browser()
             
             # Запускаем периодическую очистку старых результатов
-            asyncio.create_task(self._periodic_cleanup())
+            self.periodic_cleanup_task = asyncio.create_task(self._periodic_cleanup())
             
         except Exception as e:
             logger.error(f"Failed to initialize browser: {str(e)}")
+            await self._shutdown()
             raise
 
     async def _initialize_browser(self) -> None:
         """Initialize the browser and create the page pool."""
-        playwright = None
-        camoufox = None
-
-        if self.browser_type in ['chromium', 'chrome', 'msedge']:
-            playwright = await async_playwright().start()
-        elif self.browser_type == "camoufox":
-            camoufox = AsyncCamoufox(headless=self.headless)
-
         browser_configs = []
         for _ in range(self.thread_count):
             if self.browser_type in ['chromium', 'chrome', 'msedge']:
@@ -260,26 +277,9 @@ class TurnstileAPIServer:
 
         for i in range(self.thread_count):
             config = browser_configs[i]
-            
-            browser_args = [
-                "--window-position=0,0",
-                "--force-device-scale-factor=1"
-            ]
-            if config['useragent']:
-                browser_args.append(f"--user-agent={config['useragent']}")
-            
-            browser = None
-            if self.browser_type in ['chromium', 'chrome', 'msedge'] and playwright:
-                browser = await playwright.chromium.launch(
-                    channel=self.browser_type,
-                    headless=self.headless,
-                    args=browser_args
-                )
-            elif self.browser_type == "camoufox" and camoufox:
-                browser = await camoufox.start()
-
-            if browser:
-                await self.browser_pool.put((i+1, browser, config))
+            slot = await self._create_browser_slot(i + 1, config)
+            self.browser_slots[slot.index] = slot
+            await self.browser_pool.put(slot)
 
             if self.debug:
                 logger.info(f"Browser {i + 1} initialized successfully with {config['browser_name']} {config['browser_version']}")
@@ -298,6 +298,111 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {i+1} config: {config['browser_name']} {config['browser_version']}")
                 logger.debug(f"Browser {i+1} User-Agent: {config['useragent']}")
                 logger.debug(f"Browser {i+1} Sec-CH-UA: {config['sec_ch_ua']}")
+
+    async def _create_browser_slot(self, index: int, config: dict[str, Any]) -> BrowserSlot:
+        """每个池槽拥有独立 manager，使 browser/driver 可定向回收。"""
+        manager = None
+        browser = None
+        browser_args = ["--window-position=0,0", "--force-device-scale-factor=1"]
+        if config.get("useragent"):
+            browser_args.append(f"--user-agent={config['useragent']}")
+        try:
+            if self.browser_type in ['chromium', 'chrome', 'msedge']:
+                manager = async_playwright()
+                playwright = await manager.start()
+                browser = await playwright.chromium.launch(
+                    channel=self.browser_type,
+                    headless=self.headless,
+                    args=browser_args,
+                )
+            elif self.browser_type == "camoufox":
+                manager = AsyncCamoufox(headless=self.headless)
+                browser = await manager.start()
+            if browser is None:
+                raise RuntimeError(f"unsupported browser type: {self.browser_type}")
+            return BrowserSlot(index=index, manager=manager, browser=browser, config=dict(config))
+        except BaseException:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            if manager is not None:
+                try:
+                    result = manager.__aexit__(None, None, None)
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    pass
+            raise
+
+    async def _close_browser_slot(self, slot: BrowserSlot) -> None:
+        self.browser_slots.pop(slot.index, None)
+        try:
+            await slot.browser.close()
+        except Exception:
+            pass
+        try:
+            result = slot.manager.__aexit__(None, None, None)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            pass
+
+    def _track_task(self, task: asyncio.Task) -> asyncio.Task:
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+        return task
+
+    async def _restore_browser_slot(self, index: int, config: dict[str, Any]) -> None:
+        while not self.closing:
+            try:
+                slot = await self._create_browser_slot(index, config)
+                self.browser_slots[index] = slot
+                await self.browser_pool.put(slot)
+                logger.info(f"Browser {index}: slot rebuilt successfully")
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(f"Browser {index}: slot rebuild failed: {exc}")
+                await asyncio.sleep(2.0)
+
+    async def _release_browser_slot(self, slot: BrowserSlot) -> None:
+        slot.uses += 1
+        disconnected = False
+        try:
+            disconnected = hasattr(slot.browser, "is_connected") and not slot.browser.is_connected()
+        except Exception:
+            disconnected = True
+        recycle = slot.broken or disconnected or slot.uses >= self.browser_max_uses
+        if self.closing:
+            await self._close_browser_slot(slot)
+        elif recycle:
+            reason = "broken" if slot.broken or disconnected else f"uses={slot.uses}"
+            logger.info(f"Browser {slot.index}: recycling slot ({reason})")
+            config = dict(slot.config)
+            await self._close_browser_slot(slot)
+            self._track_task(asyncio.create_task(self._restore_browser_slot(slot.index, config)))
+        else:
+            await self.browser_pool.put(slot)
+
+    async def _shutdown(self) -> None:
+        """Quart 关服时取消任务并关闭所有 browser manager。"""
+        self.closing = True
+        if self.periodic_cleanup_task is not None:
+            self.periodic_cleanup_task.cancel()
+        tasks = list(self.background_tasks)
+        if self.periodic_cleanup_task is not None:
+            tasks.append(self.periodic_cleanup_task)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        slots = list(self.browser_slots.values())
+        self.browser_slots.clear()
+        for slot in slots:
+            await self._close_browser_slot(slot)
 
     async def _periodic_cleanup(self):
         """Periodic cleanup of old results every hour"""
@@ -623,16 +728,45 @@ class TurnstileAPIServer:
             logger.debug(f"Browser {index}: Injected CAPTCHA directly into website with sitekey: {websiteKey}")
 
     async def _solve_turnstile(self, task_id: str, url: str, sitekey: str, action: Optional[str] = None, cdata: Optional[str] = None):
-        """Solve the Turnstile challenge."""
-        proxy = None
+        """Borrow one slot and guarantee it is returned, rebuilt, or closed."""
+        slot = await self.browser_pool.get()
+        try:
+            await self._solve_turnstile_on_slot(
+                slot, task_id, url, sitekey, action=action, cdata=cdata
+            )
+        except asyncio.CancelledError:
+            slot.broken = True
+            raise
+        except Exception as exc:
+            slot.broken = True
+            await save_result(
+                task_id,
+                "turnstile",
+                {"value": "CAPTCHA_FAIL", "elapsed_time": 0},
+            )
+            logger.error(f"Browser {slot.index}: setup/solve failure: {exc}")
+        finally:
+            await self._release_browser_slot(slot)
 
-        index, browser, browser_config = await self.browser_pool.get()
+    async def _solve_turnstile_on_slot(
+        self,
+        slot: BrowserSlot,
+        task_id: str,
+        url: str,
+        sitekey: str,
+        action: Optional[str] = None,
+        cdata: Optional[str] = None,
+    ) -> None:
+        """Solve one challenge with a slot already borrowed from the pool."""
+        proxy = None
+        context = None
+        index, browser, browser_config = slot.index, slot.browser, slot.config
         
         try:
             if hasattr(browser, 'is_connected') and not browser.is_connected():
                 if self.debug:
                     logger.warning(f"Browser {index}: Browser disconnected, skipping")
-                await self.browser_pool.put((index, browser, browser_config))
+                slot.broken = True
                 await save_result(task_id, "turnstile", {"value": "CAPTCHA_FAIL", "elapsed_time": 0})
                 return
         except Exception as e:
@@ -855,7 +989,7 @@ class TurnstileAPIServer:
             
             # Capture RCH page only for an explicit diagnostic run.
             if self.capture_dumps:
-                asyncio.create_task(self._capture_rch_from_iframe(page))
+                self._track_task(asyncio.create_task(self._capture_rch_from_iframe(page)))
             
             # 注入后稍等 widget 挂载；压到 0.25，成功主要靠下面快轮询
             await asyncio.sleep(0.25)
@@ -945,24 +1079,14 @@ class TurnstileAPIServer:
                 logger.debug(f"Browser {index}: Closing browser context and cleaning up")
             
             try:
-                await context.close()
+                if context is not None:
+                    await context.close()
                 if self.debug:
                     logger.debug(f"Browser {index}: Context closed successfully")
             except Exception as e:
+                slot.broken = True
                 if self.debug:
                     logger.warning(f"Browser {index}: Error closing context: {str(e)}")
-            
-            try:
-                if hasattr(browser, 'is_connected') and browser.is_connected():
-                    await self.browser_pool.put((index, browser, browser_config))
-                    if self.debug:
-                        logger.debug(f"Browser {index}: Browser returned to pool")
-                else:
-                    if self.debug:
-                        logger.warning(f"Browser {index}: Browser disconnected, not returning to pool")
-            except Exception as e:
-                if self.debug:
-                    logger.warning(f"Browser {index}: Error returning browser to pool: {str(e)}")
 
 
 
@@ -1149,7 +1273,17 @@ class TurnstileAPIServer:
         })
 
         try:
-            asyncio.create_task(self._solve_turnstile(task_id=task_id, url=url, sitekey=sitekey, action=action, cdata=cdata))
+            self._track_task(
+                asyncio.create_task(
+                    self._solve_turnstile(
+                        task_id=task_id,
+                        url=url,
+                        sitekey=sitekey,
+                        action=action,
+                        cdata=cdata,
+                    )
+                )
+            )
 
             if self.debug:
                 logger.debug(f"Request completed with taskid {task_id}.")

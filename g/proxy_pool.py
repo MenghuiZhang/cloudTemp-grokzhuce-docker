@@ -668,6 +668,11 @@ class ProxyPool:
             rt["tested_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             if ok:
                 rt["cooldown_until"] = 0.0
+                rt["network_failures"] = 0
+            else:
+                rt["network_failures"] = int(rt.get("network_failures") or 0) + 1
+                idx = min(rt["network_failures"] - 1, len(COOLDOWN_SECONDS) - 1)
+                rt["cooldown_until"] = time.time() + COOLDOWN_SECONDS[idx]
             self._cv.notify_all()
 
     def begin_health_check(self, ids: Iterable[str] | None = None) -> list[str]:

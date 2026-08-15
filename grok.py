@@ -1426,6 +1426,8 @@ class RegisterEngine:
         # Web runtime may inject a non-blocking multi-target auto-import queue.
         # CLI/standalone modes leave it unset and keep their existing behavior.
         self.auto_import_callback = None
+        self.on_run_start = None
+        self.on_run_complete = None
         self._log_fn = log_fn or (lambda msg, level="info": print(msg))
         # Action ID 缓存：内存 + 磁盘，避免每次/重启都扫 JS（通常 5~20 秒）
         self._action_cache: dict = {
@@ -3867,9 +3869,24 @@ class RegisterEngine:
                     "info",
                 )
             self.log(f"输出: {self.output_file}", "info")
+
+            def _worker_entry() -> None:
+                try:
+                    worker_fn()
+                finally:
+                    # Playwright Sync/greenlet 必须由创建它的 worker 线程关闭。
+                    # 协调线程在 executor 退出后再关会触发跨线程切换错误。
+                    if mode == "same_session":
+                        try:
+                            from g.same_session_register import _drop_thread_pool
+
+                            _drop_thread_pool(self.log, reason="worker 退出清理")
+                        except Exception as cleanup_err:
+                            self.log(f"worker camoufox 清理异常: {cleanup_err}", "warn")
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
                 self._executor = executor
-                futures = [executor.submit(worker_fn) for _ in range(workers)]
+                futures = [executor.submit(_worker_entry) for _ in range(workers)]
                 # 周期检查 stop，避免 wait 一直挂到所有线程自然结束才有反馈
                 while True:
                     done, _not_done = concurrent.futures.wait(
@@ -3938,14 +3955,6 @@ class RegisterEngine:
                     ])
                 except Exception as auto_exc:
                     self.log(f"自动导入排队失败: {auto_exc}", "warn")
-            # same_session 浏览器池收尾
-            if resolve_register_mode(getattr(self, "register_mode", None)) == "same_session":
-                try:
-                    from g.same_session_register import shutdown_camoufox_pool
-
-                    shutdown_camoufox_pool()
-                except Exception:
-                    pass
             if self.status == "error":
                 pass
             elif self.resource_exhausted_reason:
@@ -3976,6 +3985,13 @@ class RegisterEngine:
             self.log(f"运行失败: {e}", "error")
         finally:
             self.stop_event.set()
+            # 账号级租约应已逐一释放；这里是批次异常/中断的最后兜底。
+            try:
+                from g.socks5_http_bridge import shutdown_all_bridges
+
+                shutdown_all_bridges()
+            except Exception:
+                pass
             if self.status not in ("done", "error", "resource_exhausted"):
                 self.status = "done"
             # 钉死耗时：结束后前端轮询不再让「已用时间」空转
@@ -3987,6 +4003,12 @@ class RegisterEngine:
                 solver_manager.stop_watchdog()
             except Exception:
                 pass
+            callback = getattr(self, "on_run_complete", None)
+            if callable(callback):
+                try:
+                    callback()
+                except Exception as callback_err:
+                    self.log(f"批次收尾回调异常: {callback_err}", "warn")
 
     def _auto_import_clean_accounts(self) -> None:
         """
@@ -4174,6 +4196,15 @@ class RegisterEngine:
                 + ("已启用" if self.risk_check_enabled else "已关闭（成功号记为 UNCHECKED）"),
                 "info" if self.risk_check_enabled else "warn",
             )
+
+            # Web runtime uses this synchronous hook to mark proxies as
+            # `testing` before any worker can acquire one.
+            callback = getattr(self, "on_run_start", None)
+            if callable(callback):
+                try:
+                    callback()
+                except Exception as callback_err:
+                    self.log(f"批次启动回调异常: {callback_err}", "warn")
 
             if blocking:
                 self._run_workers(workers)

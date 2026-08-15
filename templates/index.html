@@ -608,6 +608,17 @@
                       <input id="cfgSolverThreads" class="field font-mono text-sm" type="number" min="1" max="16" placeholder="2" />
                     </div>
                   </div>
+                  <div class="grid grid-cols-2 gap-2">
+                    <div>
+                      <label class="field-label" for="cfgSolverMaxUses">单浏览器最大次数</label>
+                      <input id="cfgSolverMaxUses" class="field font-mono text-sm" type="number" min="10" max="1000" value="100" />
+                    </div>
+                    <div>
+                      <label class="field-label" for="cfgSolverIdleSeconds">空闲关闭（秒）</label>
+                      <input id="cfgSolverIdleSeconds" class="field font-mono text-sm" type="number" min="0" max="3600" value="60" />
+                    </div>
+                  </div>
+                  <p class="hint">浏览器默认每 100 次轮换；注册批次结束后默认空闲 60 秒停止 Solver。</p>
                 </div>
 
                 <!-- 3. Storage protection -->
@@ -1437,6 +1448,8 @@
         $('cfgYes').value = c.YESCAPTCHA_KEY || '';
         $('cfgSolver').value = c.SOLVER_URL || 'http://127.0.0.1:5072';
         $('cfgSolverThreads').value = c.SOLVER_THREADS || '2';
+        $('cfgSolverMaxUses').value = c.SOLVER_BROWSER_MAX_USES || '100';
+        $('cfgSolverIdleSeconds').value = c.SOLVER_IDLE_SHUTDOWN_SECONDS || '60';
         $('cfgCaptureDumps').checked = ['1', 'true', 'yes', 'on'].includes(
           String(c.SOLVER_CAPTURE_DUMPS || '0').toLowerCase()
         );
@@ -1567,6 +1580,8 @@
         SOLVER_URL: $('cfgSolver').value.trim() || 'http://127.0.0.1:5072',
         SOLVER_BROWSER: $('cfgSolverBrowser').value || 'camoufox',
         SOLVER_THREADS: $('cfgSolverThreads').value.trim() || '2',
+        SOLVER_BROWSER_MAX_USES: $('cfgSolverMaxUses').value.trim() || '100',
+        SOLVER_IDLE_SHUTDOWN_SECONDS: $('cfgSolverIdleSeconds').value.trim() || '60',
         SOLVER_CAPTURE_DUMPS: $('cfgCaptureDumps').checked ? '1' : '0',
         SOLVER_CAPTURE_MAX_GROUPS: $('cfgCaptureMaxGroups').value.trim() || '20',
         SOLVER_CAPTURE_MAX_MB: $('cfgCaptureMaxMb').value.trim() || '50',

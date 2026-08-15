@@ -15,6 +15,7 @@ import select
 import socket
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import unquote, urlparse
 
@@ -91,6 +92,9 @@ class Socks5HttpBridge:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._started = False
+        self._active_lock = threading.Lock()
+        self._active_sockets: set[socket.socket] = set()
+        self._handler_threads: set[threading.Thread] = set()
 
     @property
     def port(self) -> int:
@@ -133,9 +137,32 @@ class Socks5HttpBridge:
         except Exception:
             pass
         self._sock = None
+        # First stop/join accept(), so no handler can be added after the active
+        # socket snapshot below.
         t = self._thread
-        if t and t.is_alive():
+        if t and t.is_alive() and t is not threading.current_thread():
             t.join(timeout=2.0)
+        # Closing only the listener leaves CONNECT relay threads alive for up to
+        # 180 seconds.  Close both ends of every active tunnel so an account lease
+        # releases its FDs immediately.
+        with self._active_lock:
+            active_sockets = list(self._active_sockets)
+            handlers = list(self._handler_threads)
+        for active in active_sockets:
+            try:
+                active.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                active.close()
+            except Exception:
+                pass
+        deadline = time.monotonic() + 2.0
+        current = threading.current_thread()
+        for handler in handlers:
+            if handler is current or not handler.is_alive():
+                continue
+            handler.join(timeout=max(0.0, deadline - time.monotonic()))
         self._thread = None
         self._started = False
 
@@ -148,11 +175,26 @@ class Socks5HttpBridge:
                 continue
             except OSError:
                 break
-            threading.Thread(
+            handler = threading.Thread(
                 target=self._handle_client,
                 args=(client,),
                 daemon=True,
-            ).start()
+                name=f"socks5-tunnel-{self._port}",
+            )
+            with self._active_lock:
+                self._active_sockets.add(client)
+                self._handler_threads.add(handler)
+            try:
+                handler.start()
+            except BaseException:
+                with self._active_lock:
+                    self._active_sockets.discard(client)
+                    self._handler_threads.discard(handler)
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                raise
 
     def _handle_client(self, client: socket.socket) -> None:
         upstream_sock: Optional[socket.socket] = None
@@ -188,6 +230,8 @@ class Socks5HttpBridge:
 
             up = self.upstream
             upstream_sock = socks.socksocket()
+            with self._active_lock:
+                self._active_sockets.add(upstream_sock)
             upstream_sock.set_proxy(
                 socks.SOCKS5,
                 up["host"],
@@ -219,6 +263,11 @@ class Socks5HttpBridge:
                         s.close()
                 except Exception:
                     pass
+            with self._active_lock:
+                self._active_sockets.discard(client)
+                if upstream_sock is not None:
+                    self._active_sockets.discard(upstream_sock)
+                self._handler_threads.discard(threading.current_thread())
 
     @staticmethod
     def _pipe(a: socket.socket, b: socket.socket) -> None:
@@ -253,11 +302,71 @@ class Socks5HttpBridge:
 
 
 # sid/spec → bridge（进程内复用，同 sticky 共用一个本地口）
-_BRIDGES: dict[str, Socks5HttpBridge] = {}
+@dataclass
+class _BridgeEntry:
+    bridge: Socks5HttpBridge
+    refs: int = 0
+
+
+BridgeKey = tuple[str, int, str, str]
+
+
+class Socks5HttpBridgeLease:
+    """对一条本地桥的引用计数租约。"""
+
+    def __init__(self, key: BridgeKey, bridge: Socks5HttpBridge) -> None:
+        self._key = key
+        self._bridge = bridge
+        self._released = False
+
+    @property
+    def playwright_proxy(self) -> dict[str, str]:
+        return dict(self._bridge.playwright_proxy)
+
+    def release(self) -> None:
+        if self._released:
+            return
+        self._released = True
+        release_socks5_http_bridge(self._key)
+
+    def __enter__(self) -> "Socks5HttpBridgeLease":
+        return self
+
+    def __exit__(self, *_args: Any) -> None:
+        self.release()
+
+
+class _LegacyBridgeProxy(dict[str, str]):
+    """dict-compatible adapter that keeps/releases a legacy caller's lease."""
+
+    def __init__(self, lease: Socks5HttpBridgeLease) -> None:
+        super().__init__(lease.playwright_proxy)
+        self._lease = lease
+
+    def release(self) -> None:
+        self._lease.release()
+
+    def __del__(self) -> None:  # pragma: no cover - interpreter timing varies
+        try:
+            self.release()
+        except Exception:
+            pass
+
+
+_BRIDGES: dict[BridgeKey, _BridgeEntry] = {}
 _BRIDGES_LOCK = threading.Lock()
 
 
-def ensure_socks5_http_bridge(spec_or_url: str) -> Optional[dict[str, str]]:
+def _bridge_key(up: dict[str, Any]) -> BridgeKey:
+    return (
+        str(up["host"]),
+        int(up["port"]),
+        str(up.get("username") or ""),
+        str(up.get("password") or ""),
+    )
+
+
+def acquire_socks5_http_bridge(spec_or_url: str) -> Optional[Socks5HttpBridgeLease]:
     """
     若是 socks5(+auth) → 返回给 Playwright 的 {server: http://127.0.0.1:port}
     非 socks5 → None（调用方用原 proxy）。
@@ -284,21 +393,65 @@ def ensure_socks5_http_bridge(spec_or_url: str) -> Optional[dict[str, str]]:
         raise RuntimeError(
             "SOCKS5 带账号需要本机桥，请 pip install PySocks"
         )
-    key = f"{up['host']}:{up['port']}:{up.get('username')}:{up.get('password')}"
+    key = _bridge_key(up)
     with _BRIDGES_LOCK:
-        br = _BRIDGES.get(key)
-        if br is None or not br._started:
-            br = Socks5HttpBridge(up).start()
-            _BRIDGES[key] = br
-        return dict(br.playwright_proxy)
+        entry = _BRIDGES.get(key)
+        if entry is None or not entry.bridge._started:
+            entry = _BridgeEntry(Socks5HttpBridge(up).start())
+            _BRIDGES[key] = entry
+        entry.refs += 1
+        return Socks5HttpBridgeLease(key, entry.bridge)
+
+
+def release_socks5_http_bridge(key: BridgeKey) -> None:
+    bridge: Optional[Socks5HttpBridge] = None
+    with _BRIDGES_LOCK:
+        entry = _BRIDGES.get(key)
+        if entry is None:
+            return
+        entry.refs = max(0, int(entry.refs) - 1)
+        if entry.refs == 0:
+            bridge = entry.bridge
+            _BRIDGES.pop(key, None)
+    if bridge is not None:
+        bridge.stop()
+
+
+def ensure_socks5_http_bridge(spec_or_url: str) -> Optional[dict[str, str]]:
+    """旧调用兼容；新代码必须使用 acquire 并在 finally 中 release。"""
+    lease = acquire_socks5_http_bridge(spec_or_url)
+    return _LegacyBridgeProxy(lease) if lease is not None else None
 
 
 def shutdown_all_bridges() -> None:
     with _BRIDGES_LOCK:
-        items = list(_BRIDGES.values())
+        items = [entry.bridge for entry in _BRIDGES.values()]
         _BRIDGES.clear()
     for br in items:
         try:
             br.stop()
         except Exception:
             pass
+
+
+def bridge_stats() -> dict[str, int]:
+    """运维/测试用的脱敏资源计数。"""
+    with _BRIDGES_LOCK:
+        entries = list(_BRIDGES.values())
+    active_sockets = 0
+    handlers = 0
+    for entry in entries:
+        with entry.bridge._active_lock:
+            active_sockets += len(entry.bridge._active_sockets)
+            handlers += len(entry.bridge._handler_threads)
+    return {
+        "bridges": len(entries),
+        "references": sum(entry.refs for entry in entries),
+        "active_sockets": active_sockets,
+        "handler_threads": handlers,
+    }
+
+
+import atexit
+
+atexit.register(shutdown_all_bridges)

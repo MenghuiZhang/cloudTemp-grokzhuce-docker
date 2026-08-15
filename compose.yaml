@@ -8,6 +8,10 @@ services:
     init: true
     restart: unless-stopped
     shm_size: "1gb"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     stop_grace_period: 30s
     ports:
       - "${GROK_BIND_ADDRESS:-127.0.0.1}:${GROK_HOST_PORT:-3333}:3333"

@@ -1,6 +1,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -89,6 +90,19 @@ class ProxyPoolTests(unittest.TestCase):
         self.assertGreater(public["cooldown_remaining"], 0)
         self.assertEqual(public["health"], "unhealthy")
         self.assertIsNone(self.pool.acquire("two", wait=False))
+
+    def test_failed_health_recheck_resets_cooldown(self):
+        self.pool.import_text("one.test:8001")
+        proxy_id = self.pool.list_public()["items"][0]["id"]
+        self.pool.set_health(proxy_id, {"ok": False, "error": "timeout"})
+        first_deadline = self.pool._runtime[proxy_id]["cooldown_until"]
+        self.pool._runtime[proxy_id]["cooldown_until"] = time.time() - 1
+        self.assertEqual(self.pool.begin_due_health_checks(), [proxy_id])
+
+        self.pool.set_health(proxy_id, {"ok": False, "error": "timeout again"})
+        second_deadline = self.pool._runtime[proxy_id]["cooldown_until"]
+        self.assertGreater(second_deadline, first_deadline)
+        self.assertEqual(self.pool.begin_due_health_checks(), [])
 
     def test_persistence_contains_secret_but_public_api_does_not(self):
         self.pool.import_text("user:secret@one.test:8001")

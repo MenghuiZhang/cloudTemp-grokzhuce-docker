@@ -612,20 +612,30 @@ def _acquire_camoufox_pooled(
         raise last_err or RuntimeError("camoufox 启动失败")
 
     is_browser = hasattr(camoufox_browser, "new_context")
-    if is_browser:
-        ctx = camoufox_browser.new_context(**ctx_kw)
-        page = ctx.new_page()
-        _apply_navigator_languages(page, nav_langs, lang_pack["lang"])
-        _apply_device_context(page, device_fp)
-    else:
-        ctx = camoufox_browser
-        page = ctx.new_page()
+    try:
+        if is_browser:
+            ctx = camoufox_browser.new_context(**ctx_kw)
+            page = ctx.new_page()
+            _apply_navigator_languages(page, nav_langs, lang_pack["lang"])
+            _apply_device_context(page, device_fp)
+        else:
+            ctx = camoufox_browser
+            page = ctx.new_page()
+            try:
+                ctx.set_extra_http_headers({"Accept-Language": al_header})
+            except Exception:
+                pass
+            _apply_navigator_languages(page, nav_langs, lang_pack["lang"])
+            _apply_device_context(page, device_fp)
+    except BaseException as init_err:
+        # __enter__ 已成功时，调用方的元组赋值尚未完成；必须在
+        # helper 内关闭，否则 manager/driver/browser 会全部丢失。
         try:
-            ctx.set_extra_http_headers({"Accept-Language": al_header})
+            camoufox_cm.__exit__(type(init_err), init_err, init_err.__traceback__)
         except Exception:
             pass
-        _apply_navigator_languages(page, nav_langs, lang_pack["lang"])
-        _apply_device_context(page, device_fp)
+        _clear_thread_event_loop(force=True)
+        raise
     launch_s = round(time.time() - t_launch, 2)
     log_fn(f"camoufox 就绪 · tid={tid} · gen={gen} · {launch_s}s")
 
@@ -2082,6 +2092,7 @@ def same_session_register(
         },
     }
     t0 = time.time()
+    bridge_lease = None
 
     if profile_dir is None:
         profile_dir = DEFAULT_PROFILE_ROOT / uuid.uuid4().hex[:10]
@@ -2119,7 +2130,7 @@ def same_session_register(
         )
         if need_bridge:
             try:
-                from g.socks5_http_bridge import ensure_socks5_http_bridge
+                from g.socks5_http_bridge import acquire_socks5_http_bridge
 
                 bridge_src = (
                     proxy_info.get("server_url")
@@ -2127,7 +2138,8 @@ def same_session_register(
                     or proxy_info.get("server")
                     or ""
                 )
-                bridged = ensure_socks5_http_bridge(str(bridge_src))
+                bridge_lease = acquire_socks5_http_bridge(str(bridge_src))
+                bridged = bridge_lease.playwright_proxy if bridge_lease is not None else None
                 if bridged and bridged.get("server"):
                     _log(
                         f"SOCKS5鉴权→本机桥 {bridged['server']} "
@@ -2137,6 +2149,12 @@ def same_session_register(
                     out["proxy_bridge"] = bridged["server"]
                     pw_proxy = {"server": bridged["server"]}
             except Exception as be:
+                if bridge_lease is not None:
+                    try:
+                        bridge_lease.release()
+                    except Exception:
+                        pass
+                    bridge_lease = None
                 out["error"] = f"SOCKS5 本机桥失败: {be}"
                 return out
 
@@ -3109,6 +3127,11 @@ def same_session_register(
             _clear_thread_event_loop(force=True)
     finally:
         out["elapsed_s"] = round(time.time() - t0, 2)
+        if bridge_lease is not None:
+            try:
+                bridge_lease.release()
+            except Exception:
+                pass
         # 可选清理临时 profile
         if fresh_profile and (os.getenv("GROK_SAME_SESSION_KEEP_PROFILE") or "0") not in (
             "1",

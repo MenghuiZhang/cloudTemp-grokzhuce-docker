@@ -129,6 +129,69 @@ def _route_engine_log(msg: str, level: str = "info") -> None:
 
 engine = RegisterEngine(log_fn=_route_engine_log)
 
+_solver_idle_lock = threading.Lock()
+_solver_idle_timer: threading.Timer | None = None
+
+
+def _cancel_solver_idle_shutdown() -> None:
+    global _solver_idle_timer
+    with _solver_idle_lock:
+        timer = _solver_idle_timer
+        _solver_idle_timer = None
+    if timer is not None:
+        timer.cancel()
+
+
+def _schedule_solver_idle_shutdown() -> None:
+    """批次收尾后延迟关闭本地 Solver；新批次会取消计时器。"""
+    global _solver_idle_timer
+    try:
+        seconds = max(
+            0,
+            min(3600, int(os.getenv("SOLVER_IDLE_SHUTDOWN_SECONDS") or "60")),
+        )
+    except ValueError:
+        seconds = 60
+    _cancel_solver_idle_shutdown()
+    if seconds <= 0 or (os.getenv("YESCAPTCHA_KEY") or "").strip():
+        return
+
+    timer: threading.Timer | None = None
+
+    def _stop_if_idle() -> None:
+        global _solver_idle_timer
+        with _solver_idle_lock:
+            # A cancelled timer may already be executing. Never let an old batch
+            # clear a newer timer or stop the Solver underneath a new task.
+            if _solver_idle_timer is not timer:
+                return
+            _solver_idle_timer = None
+            if engine.is_running():
+                return
+            # Serialize with _cancel_solver_idle_shutdown(): a new /api/start
+            # either cancels us first, or waits for stop() and then restarts.
+            result = solver_manager.stop()
+        level = "success" if result.get("ok") else "warn"
+        logs.emit(
+            result.get("message") or f"Solver 空闲 {seconds}s 已停止",
+            level,
+        )
+
+    timer = threading.Timer(seconds, _stop_if_idle)
+    timer.daemon = True
+    timer.name = "solver-idle-shutdown"
+    with _solver_idle_lock:
+        _solver_idle_timer = timer
+    timer.start()
+
+
+def _on_registration_complete() -> None:
+    _schedule_solver_idle_shutdown()
+    _stop_proxy_pool_health_checks()
+
+
+engine.on_run_complete = _on_registration_complete
+
 CONFIG_KEYS = (
     "WORKER_DOMAIN",
     "FREEMAIL_TOKEN",
@@ -140,6 +203,8 @@ CONFIG_KEYS = (
     "SOLVER_URL",
     "SOLVER_BROWSER",
     "SOLVER_THREADS",
+    "SOLVER_BROWSER_MAX_USES",
+    "SOLVER_IDLE_SHUTDOWN_SECONDS",
     "SOLVER_HOST",
     "SOLVER_PORT",
     "SOLVER_DEBUG",
@@ -178,6 +243,8 @@ DEFAULTS = {
     "SOLVER_URL": "http://127.0.0.1:5072",
     "SOLVER_BROWSER": "camoufox",
     "SOLVER_THREADS": "4",
+    "SOLVER_BROWSER_MAX_USES": "100",
+    "SOLVER_IDLE_SHUTDOWN_SECONDS": "60",
     "SOLVER_HOST": "127.0.0.1",
     "SOLVER_PORT": "5072",
     "SOLVER_DEBUG": "1",
@@ -351,6 +418,8 @@ def write_env_file(values: dict) -> None:
             f"SOLVER_URL={values.get('SOLVER_URL', DEFAULTS['SOLVER_URL'])}",
             f"SOLVER_BROWSER={values.get('SOLVER_BROWSER', DEFAULTS['SOLVER_BROWSER'])}",
             f"SOLVER_THREADS={values.get('SOLVER_THREADS', DEFAULTS['SOLVER_THREADS'])}",
+            f"SOLVER_BROWSER_MAX_USES={values.get('SOLVER_BROWSER_MAX_USES', DEFAULTS['SOLVER_BROWSER_MAX_USES'])}",
+            f"SOLVER_IDLE_SHUTDOWN_SECONDS={values.get('SOLVER_IDLE_SHUTDOWN_SECONDS', DEFAULTS['SOLVER_IDLE_SHUTDOWN_SECONDS'])}",
             f"SOLVER_HOST={values.get('SOLVER_HOST', DEFAULTS['SOLVER_HOST'])}",
             f"SOLVER_PORT={values.get('SOLVER_PORT', DEFAULTS['SOLVER_PORT'])}",
             f"SOLVER_DEBUG={values.get('SOLVER_DEBUG', DEFAULTS['SOLVER_DEBUG'])}",
@@ -429,6 +498,8 @@ def env_snapshot():
         "solver_url": cfg.get("SOLVER_URL") or DEFAULTS["SOLVER_URL"],
         "solver_browser": cfg.get("SOLVER_BROWSER") or DEFAULTS["SOLVER_BROWSER"],
         "solver_threads": cfg.get("SOLVER_THREADS") or DEFAULTS["SOLVER_THREADS"],
+        "solver_browser_max_uses": cfg.get("SOLVER_BROWSER_MAX_USES") or DEFAULTS["SOLVER_BROWSER_MAX_USES"],
+        "solver_idle_shutdown_seconds": cfg.get("SOLVER_IDLE_SHUTDOWN_SECONDS") or DEFAULTS["SOLVER_IDLE_SHUTDOWN_SECONDS"],
         "ui_host": cfg.get("UI_HOST") or DEFAULTS["UI_HOST"],
         "ui_port": cfg.get("UI_PORT") or DEFAULTS["UI_PORT"],
         "grok_proxy": "",
@@ -2043,6 +2114,8 @@ def get_config():
             "SOLVER_URL": cfg.get("SOLVER_URL", DEFAULTS["SOLVER_URL"]),
             "SOLVER_BROWSER": cfg.get("SOLVER_BROWSER", DEFAULTS["SOLVER_BROWSER"]),
             "SOLVER_THREADS": cfg.get("SOLVER_THREADS", DEFAULTS["SOLVER_THREADS"]),
+            "SOLVER_BROWSER_MAX_USES": cfg.get("SOLVER_BROWSER_MAX_USES", DEFAULTS["SOLVER_BROWSER_MAX_USES"]),
+            "SOLVER_IDLE_SHUTDOWN_SECONDS": cfg.get("SOLVER_IDLE_SHUTDOWN_SECONDS", DEFAULTS["SOLVER_IDLE_SHUTDOWN_SECONDS"]),
             "SOLVER_HOST": cfg.get("SOLVER_HOST", DEFAULTS["SOLVER_HOST"]),
             "SOLVER_PORT": cfg.get("SOLVER_PORT", DEFAULTS["SOLVER_PORT"]),
             "SOLVER_DEBUG": cfg.get("SOLVER_DEBUG", DEFAULTS["SOLVER_DEBUG"]),
@@ -2467,6 +2540,8 @@ def save_config():
     solver = str(body.get("SOLVER_URL", current.get("SOLVER_URL", DEFAULTS["SOLVER_URL"]))).strip()
     solver_browser = str(body.get("SOLVER_BROWSER", current.get("SOLVER_BROWSER", DEFAULTS["SOLVER_BROWSER"]))).strip() or "camoufox"
     solver_threads = str(body.get("SOLVER_THREADS", current.get("SOLVER_THREADS", DEFAULTS["SOLVER_THREADS"]))).strip() or "2"
+    solver_browser_max_uses = str(body.get("SOLVER_BROWSER_MAX_USES", current.get("SOLVER_BROWSER_MAX_USES", DEFAULTS["SOLVER_BROWSER_MAX_USES"]))).strip()
+    solver_idle_shutdown_seconds = str(body.get("SOLVER_IDLE_SHUTDOWN_SECONDS", current.get("SOLVER_IDLE_SHUTDOWN_SECONDS", DEFAULTS["SOLVER_IDLE_SHUTDOWN_SECONDS"]))).strip()
     solver_host = str(body.get("SOLVER_HOST", current.get("SOLVER_HOST", DEFAULTS["SOLVER_HOST"]))).strip() or "127.0.0.1"
     solver_port = str(body.get("SOLVER_PORT", current.get("SOLVER_PORT", DEFAULTS["SOLVER_PORT"]))).strip() or "5072"
     solver_debug = str(body.get("SOLVER_DEBUG", current.get("SOLVER_DEBUG", DEFAULTS["SOLVER_DEBUG"]))).strip() or "1"
@@ -2582,6 +2657,13 @@ def save_config():
         return jsonify({"ok": False, "message": "SOLVER_PORT 必须是 2-5 位数字"}), 400
     if not re.fullmatch(r"\d{1,2}", solver_threads) or not (1 <= int(solver_threads) <= 16):
         return jsonify({"ok": False, "message": "SOLVER_THREADS 范围 1-16"}), 400
+    solver_runtime_ranges = (
+        ("SOLVER_BROWSER_MAX_USES", solver_browser_max_uses, 10, 1000),
+        ("SOLVER_IDLE_SHUTDOWN_SECONDS", solver_idle_shutdown_seconds, 0, 3600),
+    )
+    for name, raw_value, minimum, maximum in solver_runtime_ranges:
+        if not re.fullmatch(r"\d+", raw_value) or not (minimum <= int(raw_value) <= maximum):
+            return jsonify({"ok": False, "message": f"{name} 范围 {minimum}-{maximum}"}), 400
     storage_ranges = (
         ("SOLVER_CAPTURE_MAX_GROUPS", capture_max_groups, 1, 1000),
         ("SOLVER_CAPTURE_MAX_MB", capture_max_mb, 1, 10240),
@@ -2618,6 +2700,8 @@ def save_config():
         "SOLVER_URL": solver,
         "SOLVER_BROWSER": solver_browser,
         "SOLVER_THREADS": solver_threads,
+        "SOLVER_BROWSER_MAX_USES": solver_browser_max_uses,
+        "SOLVER_IDLE_SHUTDOWN_SECONDS": solver_idle_shutdown_seconds,
         "SOLVER_HOST": solver_host,
         "SOLVER_PORT": solver_port,
         "SOLVER_DEBUG": "1" if solver_debug not in ("0", "false", "False") else "0",
@@ -2648,6 +2732,7 @@ def save_config():
             "UPSTREAM_ADMIN_PASSWORD": upstream_pwd,
         })
     storage_keys = (
+        "SOLVER_BROWSER_MAX_USES",
         "SOLVER_CAPTURE_DUMPS",
         "SOLVER_CAPTURE_MAX_GROUPS",
         "SOLVER_CAPTURE_MAX_MB",
@@ -2755,6 +2840,7 @@ def solver_status():
 
 @app.post("/api/solver/start")
 def solver_start():
+    _cancel_solver_idle_shutdown()
     body = request.get_json(silent=True) or {}
     wait = body.get("wait", True)
     try:
@@ -2776,6 +2862,7 @@ def solver_start():
 
 @app.post("/api/solver/stop")
 def solver_stop():
+    _cancel_solver_idle_shutdown()
     try:
         result = solver_manager.stop()
         level = "success" if result.get("ok") else "warn"
@@ -2811,6 +2898,7 @@ def get_logs():
 
 @app.post("/api/start")
 def start():
+    _cancel_solver_idle_shutdown()
     body = request.get_json(silent=True) or {}
     workers = body.get("workers", 8)
     target = body.get("target", 100)
@@ -2928,11 +3016,6 @@ def start():
         "账号 Risk 检测: " + ("开启" if effective_risk_check else "关闭 / UNCHECKED"),
         "info" if effective_risk_check else "warn",
     )
-    proxy_checks = _start_proxy_pool_health_checks()
-    if proxy_checks:
-        logs.emit(f"代理池后台预检已启动：{proxy_checks} 条", "info")
-    else:
-        logs.emit("代理池为空，本批注册直连", "warn")
     result = engine.start(
         workers=workers,
         target=target,
@@ -3635,40 +3718,96 @@ def proxy_pool_bulk():
     })
 
 
+_proxy_health_lock = threading.Lock()
+_proxy_health_stop: threading.Event | None = None
+_proxy_health_thread: threading.Thread | None = None
+
+
+def _stop_proxy_pool_health_checks() -> None:
+    global _proxy_health_stop, _proxy_health_thread
+    with _proxy_health_lock:
+        stop_event = _proxy_health_stop
+        thread = _proxy_health_thread
+    if stop_event is not None:
+        stop_event.set()
+    if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+        # A probe has a 12s timeout. Wait long enough for the only in-flight
+        # generation to finish, otherwise the next batch could overlap it.
+        thread.join(timeout=15.0)
+    with _proxy_health_lock:
+        if _proxy_health_thread is thread and (thread is None or not thread.is_alive()):
+            _proxy_health_stop = None
+            _proxy_health_thread = None
+
+
 def _start_proxy_pool_health_checks(selected_ids: list[str] | None = None) -> int:
     """每批启动时后台并行预检；worker 只会领取已完成预检的条目。"""
+    global _proxy_health_stop, _proxy_health_thread
+    # stop_event 不再复用 engine.stop_event，避免下一批 clear() 后旧线程复活。
+    _stop_proxy_pool_health_checks()
+    with _proxy_health_lock:
+        if _proxy_health_thread is not None and _proxy_health_thread.is_alive():
+            logs.emit("上一轮代理健康检查尚未退出，本批不重复启动", "warn")
+            return 0
     ids = proxy_pool.begin_health_check(selected_ids)
     if not ids:
         return 0
+    stop_event = threading.Event()
 
     def _run() -> None:
-        def _check(batch: list[str]) -> int:
-            def _one(proxy_id: str) -> bool:
-                try:
-                    probe_spec = expand_proxy_template(
-                        proxy_pool.secret_spec(proxy_id), account="health-check", session=uuid.uuid4().hex[:16]
-                    )
-                    result = _probe_register_proxy(probe_spec, timeout=12)
-                except Exception as exc:
-                    result = {"ok": False, "error": str(exc)}
-                proxy_pool.set_health(proxy_id, result)
-                return bool(result.get("ok"))
+        try:
+            def _check(batch: list[str]) -> int:
+                def _one(proxy_id: str) -> bool:
+                    if stop_event.is_set():
+                        return False
+                    try:
+                        probe_spec = expand_proxy_template(
+                            proxy_pool.secret_spec(proxy_id), account="health-check", session=uuid.uuid4().hex[:16]
+                        )
+                        result = _probe_register_proxy(probe_spec, timeout=12)
+                    except Exception as exc:
+                        result = {"ok": False, "error": str(exc)}
+                    proxy_pool.set_health(proxy_id, result)
+                    return bool(result.get("ok"))
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(batch))) as checks:
-                return sum(1 for ok in checks.map(_one, batch) if ok)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(batch))) as checks:
+                    return sum(1 for ok in checks.map(_one, batch) if ok)
 
-        passed = _check(ids)
-        logs.emit(f"代理池预检完成：{passed}/{len(ids)} 可用", "success" if passed else "warn")
-        while engine.is_running():
-            if engine.stop_event.wait(timeout=5):
-                break
-            due = proxy_pool.begin_due_health_checks()
-            if due:
-                recovered = _check(due)
-                logs.emit(f"冷却代理复检：{recovered}/{len(due)} 恢复", "info")
+            passed = _check(ids)
+            if not stop_event.is_set():
+                logs.emit(f"代理池预检完成：{passed}/{len(ids)} 可用", "success" if passed else "warn")
+            while not stop_event.is_set() and engine.is_running():
+                if stop_event.wait(timeout=5):
+                    break
+                due = proxy_pool.begin_due_health_checks()
+                if due:
+                    recovered = _check(due)
+                    if not stop_event.is_set():
+                        logs.emit(f"冷却代理复检：{recovered}/{len(due)} 恢复", "info")
+        finally:
+            global _proxy_health_stop, _proxy_health_thread
+            with _proxy_health_lock:
+                if _proxy_health_thread is threading.current_thread():
+                    _proxy_health_stop = None
+                    _proxy_health_thread = None
 
-    threading.Thread(target=_run, daemon=True, name="proxy-pool-health").start()
+    thread = threading.Thread(target=_run, daemon=True, name="proxy-pool-health")
+    with _proxy_health_lock:
+        _proxy_health_stop = stop_event
+        _proxy_health_thread = thread
+    thread.start()
     return len(ids)
+
+
+def _on_registration_start() -> None:
+    proxy_checks = _start_proxy_pool_health_checks()
+    if proxy_checks:
+        logs.emit(f"代理池后台预检已启动：{proxy_checks} 条", "info")
+    else:
+        logs.emit("代理池为空，本批注册直连", "warn")
+
+
+engine.on_run_start = _on_registration_start
 
 
 @app.get("/api/proxies/export")
