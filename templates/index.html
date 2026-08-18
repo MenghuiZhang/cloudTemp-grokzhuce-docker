@@ -305,7 +305,7 @@
       <!-- Stats -->
       <section class="grid grid-cols-2 lg:grid-cols-6 gap-3 sm:gap-4">
         <article class="panel rounded-2xl p-4">
-          <p class="text-[11px] uppercase tracking-[0.16em] text-ink-700/50 font-semibold">成功</p>
+          <p class="text-[11px] uppercase tracking-[0.16em] text-ink-700/50 font-semibold">已创邮箱</p>
           <p id="statSuccess" class="mt-1 font-display text-3xl font-bold text-leaf-600">0</p>
           <p class="text-xs text-ink-700/50 font-mono mt-1">目标 <span id="statTarget">0</span></p>
         </article>
@@ -327,7 +327,7 @@
         <article class="panel rounded-2xl p-4">
           <p class="text-[11px] uppercase tracking-[0.16em] text-ink-700/50 font-semibold">平均速度</p>
           <p id="statAvg" class="mt-1 font-display text-3xl font-bold text-brand-600">—</p>
-          <p class="text-xs text-ink-700/50 font-mono mt-1">秒 / 账号</p>
+          <p class="text-xs text-ink-700/50 font-mono mt-1">秒 / 邮箱</p>
         </article>
         <article class="panel rounded-2xl p-4">
           <p class="text-[11px] uppercase tracking-[0.16em] text-ink-700/50 font-semibold">已用时间</p>
@@ -347,10 +347,8 @@
         </div>
         <div class="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs font-mono text-ink-700/60">
           <span>路径：<span id="statMode" class="text-ink-800">同会话 CLEAN</span></span>
-          <span>成功 <span id="statSuccessInline" class="text-leaf-600">0</span> / 目标 <span id="statTargetInline" class="text-ink-800">0</span></span>
-          <span>逻辑任务 <span id="statAttemptInline" class="text-ink-800">0</span> / <span id="statAttemptTargetInline" class="text-ink-800">0</span></span>
-          <span>实际创邮 <span id="statEmailCreateInline" class="text-ink-800">0</span></span>
-          <span>Bot复验 <span id="statBotRetryInline" class="text-ink-800">0</span></span>
+          <span>创邮 <span id="statEmailCreateInline" class="text-leaf-600">0</span> / 目标 <span id="statTargetInline" class="text-ink-800">0</span></span>
+          <span>邮箱 API 尝试 <span id="statAttemptInline" class="text-ink-800">0</span></span>
           <span>CLEAN <span id="statCleanInline" class="text-leaf-600">0</span> · PENDING_BFS <span id="statPendingBfsInline" class="text-brand-600">0</span> · UNCHECKED <span id="statUncheckedInline" class="text-sun-500">0</span> · MARKED <span id="statMarked" class="text-rose-500">0</span></span>
           <span>输出：<span id="outputFile" class="text-ink-800">—</span></span>
           <span>Action：<span id="actionId" class="text-ink-800">—</span></span>
@@ -414,7 +412,7 @@
                   </div>
                 </div>
                 <div>
-                  <label class="field-label" for="target">注册数量</label>
+                  <label class="field-label" for="target">创建邮箱目标</label>
                   <div class="c-select" data-select="target">
                     <button type="button" class="c-select-btn" id="targetBtn" aria-haspopup="listbox">
                       <span class="value">100 个</span>
@@ -481,18 +479,12 @@
               <p id="configMessage" class="text-[11px] font-mono min-h-[1rem] text-ink-700/50 -mt-1"></p>
 
               <div class="cfg-block space-y-2">
-                <h3 class="cfg-title">BFS / ASN 安全控制</h3>
+                <h3 class="cfg-title">BFS 历史检查</h3>
                 <input id="monitorToken" type="password" class="field font-mono text-sm" placeholder="MONITOR_TOKEN（仅保存在当前标签会话）" autocomplete="off" />
-                <div class="grid grid-cols-2 gap-2">
-                  <input id="asnInput" class="field font-mono text-sm" placeholder="AS13335" />
-                  <button id="btnAsnAdd" type="button" class="btn btn-ghost text-xs">添加永久 ASN</button>
-                </div>
                 <div class="flex gap-2">
-                  <button id="btnAsnRefresh" type="button" class="btn btn-ghost text-xs flex-1">刷新 ASN 列表</button>
                   <button id="btnBfsPreview" type="button" class="btn btn-ghost text-xs flex-1">BFS 历史预览</button>
                   <button id="btnBfsApply" type="button" class="btn btn-danger text-xs flex-1" disabled>Apply 预览</button>
                 </div>
-                <div id="asnList" class="text-[11px] font-mono text-ink-700/60">未加载</div>
                 <p id="bfsOpsMessage" class="text-[11px] font-mono min-h-[1rem] text-ink-700/50"></p>
               </div>
 
@@ -1187,9 +1179,8 @@
       $('statusText').textContent = style.text;
 
       const wasRunning = state.running;
-      $('statSuccess').textContent = data.success_count ?? 0;
+      $('statSuccess').textContent = data.email_create_count ?? 0;
       $('statTarget').textContent = data.target_count ?? 0;
-      if ($('statSuccessInline')) $('statSuccessInline').textContent = data.success_count ?? 0;
       if ($('statTargetInline')) $('statTargetInline').textContent = data.target_count ?? 0;
       $('statFail').textContent = data.fail_count ?? 0;
       $('statAvg').textContent = data.avg_seconds ? `${data.avg_seconds}s` : '—';
@@ -1212,9 +1203,7 @@
       if ($('statMarked')) $('statMarked').textContent = data.marked_count ?? 0;
       if ($('statPendingBfsInline')) $('statPendingBfsInline').textContent = data.pending_bfs_count ?? 0;
       if ($('statAttemptInline')) $('statAttemptInline').textContent = data.attempt_count ?? 0;
-      if ($('statAttemptTargetInline')) $('statAttemptTargetInline').textContent = data.target_count ?? 0;
       if ($('statEmailCreateInline')) $('statEmailCreateInline').textContent = data.email_create_count ?? 0;
-      if ($('statBotRetryInline')) $('statBotRetryInline').textContent = data.bot_retry_count ?? 0;
 
       state.running = !!data.running;
       if (wasRunning !== state.running) schedulePoll();
@@ -1225,7 +1214,9 @@
           const uc = data.unchecked_count ?? 0;
           const mc = data.marked_count ?? 0;
           if (data.status === 'done') {
-            setPipelineHint(`本轮结束 · 成功 ${sc} · CLEAN ${cc} · UNCHECKED ${uc} · MARKED ${mc}`);
+            const ec = data.email_create_count ?? 0;
+            const tc = data.target_count ?? 0;
+            setPipelineHint(`本轮结束 · 创邮 ${ec}/${tc} · 结果 ${sc} · CLEAN ${cc} · UNCHECKED ${uc} · MARKED ${mc}`);
           }
         }
       }
@@ -1336,11 +1327,11 @@
           inferPipelineFromLogs(newLogs);
         if (hint) setPipelineHint(hint);
         else if (state.running && state.lastStatus) {
-          const sc = state.lastStatus.success_count ?? 0;
+          const ec = state.lastStatus.email_create_count ?? 0;
           const tc = state.lastStatus.target_count ?? 0;
           const cc = state.lastStatus.clean_count ?? 0;
           const uc = state.lastStatus.unchecked_count ?? 0;
-          setPipelineHint(`运行中 · 成功 ${sc}/${tc} · CLEAN ${cc} · UNCHECKED ${uc} · 见下方双栏日志`);
+          setPipelineHint(`运行中 · 创邮 ${ec}/${tc} · CLEAN ${cc} · UNCHECKED ${uc} · 见下方双栏日志`);
         }
         state.pollFailCount = 0;
         if (!state.serverConnected) {
@@ -1750,23 +1741,6 @@
 
     let lastBfsReport = '';
     if ($('monitorToken')) $('monitorToken').value = sessionStorage.getItem('monitorToken') || '';
-    async function refreshAsnList() {
-      const data = await secureFetchJSON('/api/asn-blacklist');
-      $('asnList').innerHTML = (data.items || []).length
-        ? data.items.map(item => `<span class="inline-block mr-2">${escapeHtml(item.label)} · ${escapeHtml(item.source)}</span>`).join('')
-        : '黑名单为空';
-    }
-    $('btnAsnRefresh').addEventListener('click', () => refreshAsnList().catch(e => setMessage($('bfsOpsMessage'), e.message, false)));
-    $('btnAsnAdd').addEventListener('click', async () => {
-      try {
-        await secureFetchJSON('/api/asn-blacklist', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ asn: $('asnInput').value.trim() }),
-        });
-        await refreshAsnList();
-        setMessage($('bfsOpsMessage'), 'ASN 已添加', true);
-      } catch (e) { setMessage($('bfsOpsMessage'), e.message, false); }
-    });
     $('btnBfsPreview').addEventListener('click', async () => {
       try {
         const data = await secureFetchJSON('/api/bfs-scan/preview', { method: 'POST' });

@@ -246,7 +246,6 @@ class ProxyPool:
             "health_message": "尚未测试",
             "egress_ip": "",
             "egress_cc": "",
-            "egress_asn": "",
             "region": "",
             "timezone": "",
             "tested_at": "",
@@ -511,7 +510,7 @@ class ProxyPool:
                 continue
             rt = self._runtime.setdefault(item["id"], self._new_runtime())
             cap = int(item.get("max_concurrency") or default_cap)
-            if rt["cooldown_until"] > now or rt["in_use"] >= cap or rt["health"] in ("unhealthy", "testing", "blocked_asn"):
+            if rt["cooldown_until"] > now or rt["in_use"] >= cap or rt["health"] in ("unhealthy", "testing"):
                 continue
             out.append(item)
         return out
@@ -581,7 +580,6 @@ class ProxyPool:
             if outcome == "success":
                 rt["success"] += 1
                 rt["network_failures"] = 0
-                rt["consecutive_marked"] = 0
                 rt["cooldown_until"] = 0.0
                 rt["health"] = "healthy"
                 rt["health_message"] = "最近注册成功"
@@ -595,17 +593,31 @@ class ProxyPool:
             elif outcome == "marked":
                 rt["marked"] += 1
                 rt["consecutive_marked"] += 1
-                if rt["consecutive_marked"] >= 3:
-                    rt["cooldown_until"] = time.time() + 1800
-                    rt["health_message"] = "连续 3 次 MARKED，冷却 30 分钟"
+                idx = min(rt["consecutive_marked"] - 1, len(COOLDOWN_SECONDS) - 1)
+                seconds = COOLDOWN_SECONDS[idx]
+                rt["cooldown_until"] = time.time() + seconds
+                rt["health"] = "unhealthy"
+                rt["health_message"] = (
+                    f"Risk MARKED 连续 {rt['consecutive_marked']} 次，冷却 {seconds // 60} 分钟"
+                )
             elif outcome == "failure":
                 rt["failures"] += 1
-                rt["consecutive_marked"] = 0
             item = self._entry(lease.proxy_id)
             if item and item.get("pending_delete") and rt["in_use"] == 0:
                 self._data["proxies"] = [x for x in self._data["proxies"] if x["id"] != lease.proxy_id]
                 self._runtime.pop(lease.proxy_id, None)
                 self._save_locked()
+            self._cv.notify_all()
+
+    def mark_risk_clean(self, lease: ProxyLease | None) -> None:
+        """Only a conclusive Risk CLEAN resets the MARKED cooldown ladder."""
+        if lease is None or lease.direct:
+            return
+        with self._cv:
+            rt = self._runtime.get(lease.proxy_id)
+            if rt is None:
+                return
+            rt["consecutive_marked"] = 0
             self._cv.notify_all()
 
     def disable_for_bot(
@@ -660,11 +672,12 @@ class ProxyPool:
             if rt is None:
                 return
             ok = bool(result.get("ok"))
-            rt["health"] = "healthy" if ok else ("blocked_asn" if result.get("blocked_asn") else "unhealthy")
+            rt["health"] = "healthy" if ok else "unhealthy"
             rt["health_message"] = str(result.get("message") or result.get("error") or "")[:160]
             rt["egress_ip"] = str(result.get("egress_ip") or result.get("ip") or "")
             rt["egress_cc"] = str(result.get("egress_cc") or result.get("cc") or "").upper()
-            rt["egress_asn"] = str(result.get("egress_asn") or result.get("asn") or "")
+            # ASN detection is disabled; clear any value left by an older runtime.
+            rt.pop("egress_asn", None)
             rt["region"] = str(result.get("egress_region") or result.get("region") or result.get("country") or "")
             rt["timezone"] = str(result.get("egress_timezone") or result.get("timezone") or "")
             rt["tested_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -753,7 +766,6 @@ class ProxyPool:
                 "region": str(rt.get("region") or ""),
                 "timezone": str(rt.get("timezone") or ""),
                 "ip": str(rt.get("egress_ip") or ""),
-                "asn": str(rt.get("egress_asn") or ""),
             }
 
     def lease_audit(self, lease: ProxyLease | None) -> dict[str, Any]:

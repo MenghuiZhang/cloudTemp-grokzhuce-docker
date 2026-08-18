@@ -47,22 +47,22 @@ from g.proxy_pool import (
     parse_proxy_lines,
 )
 from g.domain_pool import DomainPoolError, get_domain_pool
-from g.asn_blacklist import AsnBlacklistStore
 from g.bfs_scan_service import apply_scan_report, preview_scan, set_token_bound_override
 import solver_manager
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 proxy_pool = get_proxy_pool(BASE_DIR)
-asn_blacklist = AsnBlacklistStore(BASE_DIR / "data" / "asn_blacklist.json")
 
 load_dotenv(ENV_PATH)
 MONITOR_TOKEN = str(os.getenv("MONITOR_TOKEN") or "").strip()
 domain_pool = get_domain_pool(BASE_DIR)
 try:
-    domain_pool.sync_configured(
+    configured_cf_domains = (
         resolved_email_config(dict(os.environ))["providers"]["cloudflare_temp"].get("domains") or []
     )
+    if configured_cf_domains:
+        domain_pool.reconcile_configured(configured_cf_domains)
 except Exception:
     pass
 enforce_storage_limits(BASE_DIR)
@@ -2181,7 +2181,9 @@ def _sync_cf_domain_env() -> None:
     values["EMAIL_CF_TEMP_DOMAINS_JSON"] = json.dumps(
         active_domains, ensure_ascii=False, separators=(",", ":")
     )
-    values["EMAIL_CF_TEMP_AUTO_DOMAIN"] = "0" if active_domains else "1"
+    values["EMAIL_CF_TEMP_AUTO_DOMAIN"] = (
+        "0" if domain_pool.summary().get("total") else values.get("EMAIL_CF_TEMP_AUTO_DOMAIN", "1")
+    )
     write_env_file(values)
     os.environ["EMAIL_CF_TEMP_DOMAINS_JSON"] = values["EMAIL_CF_TEMP_DOMAINS_JSON"]
     os.environ["EMAIL_CF_TEMP_AUTO_DOMAIN"] = values["EMAIL_CF_TEMP_AUTO_DOMAIN"]
@@ -2193,7 +2195,7 @@ def get_email_config():
     if domain_pool.summary().get("total"):
         active_domains = domain_pool.active_domains()
         structured["providers"]["cloudflare_temp"]["domains"] = active_domains
-        structured["providers"]["cloudflare_temp"]["auto_domain"] = not bool(active_domains)
+        structured["providers"]["cloudflare_temp"]["auto_domain"] = False
     try:
         from g.email_service import EmailService
         cf_health = dict(EmailService._cf_domain_health)
@@ -2224,6 +2226,13 @@ def save_email_config():
     # Saving is a draft operation; activation has a separate endpoint.
     body = dict(body)
     body["provider"] = active
+    providers = dict(body.get("providers") or {})
+    cloudflare_temp = dict(providers.get("cloudflare_temp") or {})
+    if domain_pool.summary().get("total"):
+        cloudflare_temp["domains"] = domain_pool.active_domains()
+        cloudflare_temp["auto_domain"] = False
+    providers["cloudflare_temp"] = cloudflare_temp
+    body["providers"] = providers
     try:
         values = serialize_structured_config(current, body)
         after = resolved_email_config(values)
@@ -2361,13 +2370,23 @@ def domain_pool_add():
     if not isinstance(values, list):
         values = [body.get("domain")]
     try:
-        result = domain_pool.add([str(x or "") for x in values], enabled=False)
-        if not engine.is_running():
-            _sync_cf_domain_env()
-        message = (
-            f"导入完成：新增 {result['added']}，已存在 {result['duplicates']}，"
-            f"无效 {result['invalid']}"
-        )
+        if body.get("replace"):
+            if engine.is_running():
+                return jsonify({"ok": False, "message": "任务运行中不能整体替换域名列表"}), 409
+            result = domain_pool.reconcile_configured([str(x or "") for x in values])
+            message = (
+                f"域名列表已生效：启用 {result['active']}，新增 {result['added']}，"
+                f"停用旧域 {result['disabled']}"
+            )
+        else:
+            if engine.is_running():
+                return jsonify({"ok": False, "message": "任务运行中不能添加新域名，可启停已有域名"}), 409
+            result = domain_pool.add([str(x or "") for x in values], enabled=True)
+            message = (
+                f"导入完成并立即启用：新增 {result['added']}，已存在 {result['duplicates']}，"
+                f"无效 {result['invalid']}"
+            )
+        _sync_cf_domain_env()
         return jsonify({"ok": True, **result, "message": message})
     except DomainPoolError as exc:
         return jsonify({"ok": False, "message": str(exc)}), 400
@@ -2377,10 +2396,6 @@ def domain_pool_add():
 def domain_pool_update(domain_id: str):
     try:
         values = request.get_json(silent=True) or {}
-        if values.get("enabled") is True:
-            tested = _test_domain(domain_id)
-            if not tested.get("ok"):
-                return jsonify({"ok": False, "message": tested.get("message") or "域名测试失败"}), 502
         item = domain_pool.update(domain_id, values)
         _sync_cf_domain_env()
         return jsonify({"ok": True, "item": item})
@@ -2447,29 +2462,6 @@ def domain_pool_bulk():
         result = domain_pool.delete(ids)
         _sync_cf_domain_env()
         return jsonify({"ok": True, **result, "message": f"已永久删除 {result['removed']} 个域名及其历史"})
-    if action == "enable":
-        ids = ids[:2000]
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(ids))) as pool:
-            tested = list(pool.map(_test_domain, ids))
-        changed = 0
-        errors = []
-        for result in tested:
-            if not result["ok"]:
-                errors.append({"id": result["id"], "message": result["message"]})
-                continue
-            try:
-                domain_pool.update(result["id"], {"enabled": True})
-                changed += 1
-            except Exception as exc:
-                errors.append({"id": result["id"], "message": str(exc)})
-        _sync_cf_domain_env()
-        return jsonify({
-            "ok": True,
-            "all_passed": not errors,
-            "changed": changed,
-            "failed": len(errors),
-            "errors": errors[:100],
-        })
     changed = failed = 0
     errors = []
     for domain_id in ids[:2000]:
@@ -2934,7 +2926,7 @@ def start():
     if workers < 1 or workers > 64:
         return jsonify({"ok": False, "message": "并发数范围 1-64"}), 400
     if target < 1 or target > 100000:
-        return jsonify({"ok": False, "message": "注册数量范围 1-100000"}), 400
+        return jsonify({"ok": False, "message": "创建邮箱目标范围 1-100000"}), 400
     if isinstance(risk_raw, bool):
         risk_check_enabled = risk_raw
     elif isinstance(risk_raw, str) and risk_raw.strip().lower() in {
@@ -2956,12 +2948,24 @@ def start():
         reg_mode = (mode_raw or "same_session").strip().lower() or "same_session"
 
     cfg_env = read_env_file()
+    active_domains: list[str] = []
     if domain_pool.summary().get("total"):
         active_domains = domain_pool.active_domains()
         active_json = json.dumps(active_domains, ensure_ascii=False)
         cfg_env["EMAIL_CF_TEMP_DOMAINS_JSON"] = active_json
-        cfg_env["EMAIL_CF_TEMP_AUTO_DOMAIN"] = "0" if active_domains else "1"
+        # A configured pool is authoritative even when every row is disabled.
+        # Never fall back to a provider-selected or stale legacy domain.
+        cfg_env["EMAIL_CF_TEMP_AUTO_DOMAIN"] = "0"
     email_cfg = resolved_email_config(cfg_env)
+    if (
+        email_cfg.get("provider") == "cloudflare_temp"
+        and domain_pool.summary().get("total")
+        and not active_domains
+    ):
+        return jsonify({
+            "ok": False,
+            "message": "Cloudflare Temp 域名池没有已启用域名，请先启用至少一个域名。",
+        }), 409
     email_errors = validate_provider_config(email_cfg)
     if email_errors:
         return jsonify({
@@ -3187,7 +3191,6 @@ def _probe_egress_via_proxy(creq, proxies=None, timeout: float = 8.0) -> dict:
         "region": "",
         "timezone": "",
         "postal": "",
-        "asn": "",
         "at": "",
         "source": "",
         "ms": 0,
@@ -3223,7 +3226,6 @@ def _probe_egress_via_proxy(creq, proxies=None, timeout: float = 8.0) -> dict:
             "city": str(data.get("city") or "").strip(),
             "region": str(data.get("state") or "").strip(),
             "postal": str(data.get("postal") or "").strip(),
-            "asn": str(data.get("asn") or "").strip(),
             "at": str(data.get("at") or "").strip(),
         }
 
@@ -3257,7 +3259,7 @@ def _probe_egress_via_proxy(creq, proxies=None, timeout: float = 8.0) -> dict:
     try:
         r = _curl_get(
             creq,
-            "http://ip-api.com/json/?fields=status,message,country,countryCode,regionName,city,timezone,query,as",
+            "http://ip-api.com/json/?fields=status,message,country,countryCode,regionName,city,timezone,query",
             proxies=proxies,
             timeout=per,
         )
@@ -3271,7 +3273,6 @@ def _probe_egress_via_proxy(creq, proxies=None, timeout: float = 8.0) -> dict:
                 city=str(data.get("city") or "").strip(),
                 region=str(data.get("regionName") or "").strip(),
                 timezone=str(data.get("timezone") or "").strip(),
-                asn=str(data.get("as") or "").strip(),
             )
         errors.append(f"ip-api:{data.get('message') or r.status_code}")
     except Exception as e:
@@ -3304,7 +3305,6 @@ def _probe_egress_via_proxy(creq, proxies=None, timeout: float = 8.0) -> dict:
                 city=extra.get("city") or "",
                 region=extra.get("region") or "",
                 postal=extra.get("postal") or "",
-                asn=extra.get("asn") or "",
                 at=extra.get("at") or "",
             )
         errors.append(f"cf:{r.status_code}")
@@ -3330,14 +3330,13 @@ def _probe_egress_via_proxy(creq, proxies=None, timeout: float = 8.0) -> dict:
 
 
 def _format_egress_label(eg: dict) -> str:
-    """出口一行：1.2.3.4 · HK Kwai Chung · Kwai Tsing District · AS48266"""
+    """出口一行：1.2.3.4 · HK Kwai Chung · Kwai Tsing District"""
     if not eg or not eg.get("ok"):
         return ""
     ip = str(eg.get("ip") or "").strip()
     cc = str(eg.get("cc") or eg.get("country") or "").strip().upper()
     city = str(eg.get("city") or "").strip()
     region = str(eg.get("region") or "").strip()
-    asn = str(eg.get("asn") or "").strip()
     at = str(eg.get("at") or "").strip()
     tz = str(eg.get("timezone") or "").strip()
     parts = []
@@ -3350,8 +3349,6 @@ def _format_egress_label(eg: dict) -> str:
     # 州/区（与城市不同才显示）
     if region and region.lower() not in (city or "").lower():
         parts.append(region)
-    if asn:
-        parts.append(asn)
     if at and at.lower() not in ("", "isp"):
         parts.append(at)
     if tz:
@@ -3449,7 +3446,6 @@ def _probe_register_proxy(raw: str, timeout: float = 12.0) -> dict:
     result["egress_region"] = str(eg.get("region") or "")
     result["egress_timezone"] = str(eg.get("timezone") or "")
     result["egress_postal"] = str(eg.get("postal") or "")
-    result["egress_asn"] = str(eg.get("asn") or "")
     result["egress_at"] = str(eg.get("at") or "")
     result["egress_source"] = str(eg.get("source") or "")
     result["egress_ms"] = int(eg.get("ms") or 0)
@@ -3482,31 +3478,6 @@ def _probe_register_proxy(raw: str, timeout: float = 12.0) -> dict:
         xai_err = f"{type(e).__name__}:{e}"
 
     result["ms"] = round((_time.time() - t0) * 1000)
-
-    if result.get("egress_ok"):
-        asn = str(result.get("egress_asn") or "").strip()
-        if not asn:
-            result.update(
-                ok=False,
-                blocked_asn=True,
-                asn_reason="lookup_failed",
-                error="ASN 查询失败",
-                message=f"出口 {result.get('egress_ip') or '未知'} 的 ASN 无法确认，本次预检已阻止",
-            )
-            return result
-        try:
-            blocked, detail = asn_blacklist.is_blocked(asn)
-        except ValueError:
-            blocked, detail = True, {"source": "lookup_failed"}
-        if blocked:
-            result.update(
-                ok=False,
-                blocked_asn=True,
-                asn_reason=detail.get("source") or "blacklist",
-                error="出口 ASN 已屏蔽",
-                message=f"出口 {result.get('egress_ip')} · {asn} 命中 ASN 黑名单，已阻止",
-            )
-            return result
 
     # 拼展示文案：出口 + xAI
     eg_part = ""
@@ -3543,16 +3514,10 @@ def _probe_register_proxy(raw: str, timeout: float = 12.0) -> dict:
 
 def _probe_saved_proxy(proxy_id: str, *, timeout: float = 12.0) -> dict:
     template = proxy_pool.secret_spec(proxy_id)
-    attempts = 3 if ("{session}" in template or "{account}" in template) else 1
-    result: dict = {"ok": False, "error": "未执行预检"}
-    for _ in range(attempts):
-        probe_spec = expand_proxy_template(
-            template, account="health-check", session=uuid.uuid4().hex[:16]
-        )
-        result = _probe_register_proxy(probe_spec, timeout=timeout)
-        if not result.get("blocked_asn"):
-            break
-    return result
+    probe_spec = expand_proxy_template(
+        template, account="health-check", session=uuid.uuid4().hex[:16]
+    )
+    return _probe_register_proxy(probe_spec, timeout=timeout)
 
 
 @app.post("/api/proxy/test")
@@ -3580,36 +3545,6 @@ def proxy_test():
         pass
     code = 200 if result.get("ok") else 502
     return jsonify(result), code
-
-
-@app.get("/api/asn-blacklist")
-@require_monitor_token
-def asn_blacklist_list():
-    return jsonify({"ok": True, **asn_blacklist.public()})
-
-
-@app.post("/api/asn-blacklist")
-@require_monitor_token
-def asn_blacklist_add():
-    body = request.get_json(silent=True) or {}
-    try:
-        item = asn_blacklist.add_manual(body.get("asn"), str(body.get("note") or ""))
-        proxy_pool.block_known_asn(item["asn"])
-        return jsonify({"ok": True, "item": item, **asn_blacklist.public()}), 201
-    except ValueError as exc:
-        return jsonify({"ok": False, "message": str(exc)}), 400
-
-
-@app.delete("/api/asn-blacklist/<asn>")
-@require_monitor_token
-def asn_blacklist_delete(asn: str):
-    try:
-        removed = asn_blacklist.remove(asn)
-        if removed:
-            proxy_pool.unblock_known_asn(asn)
-        return jsonify({"ok": True, "removed": removed, **asn_blacklist.public()})
-    except ValueError as exc:
-        return jsonify({"ok": False, "message": str(exc)}), 400
 
 
 @app.post("/api/bfs-scan/preview")

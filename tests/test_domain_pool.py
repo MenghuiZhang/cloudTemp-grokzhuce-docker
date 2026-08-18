@@ -22,15 +22,51 @@ class DomainPoolTests(unittest.TestCase):
         self.assertEqual([x["domain"] for x in rows], ["a.example", "b.example"])
         self.assertTrue(all(x["status"] == "enabled" for x in rows))
 
-    def test_new_domain_requires_health_before_enable(self):
+    def test_new_domain_can_enable_without_health_check(self):
         self.pool.add(["new.example"])
         row = self.pool.list_public()["items"][0]
         self.assertEqual(row["status"], "disabled")
-        with self.assertRaisesRegex(ValueError, "测试通过"):
-            self.pool.update(row["id"], {"enabled": True})
-        self.pool.set_email_health(row["id"], ok=True, message="ok")
         enabled = self.pool.update(row["id"], {"enabled": True})
         self.assertEqual(enabled["status"], "enabled")
+        self.assertEqual(enabled["email_health"], "untested")
+
+    def test_reconcile_replaces_active_list_and_retains_history(self):
+        self.pool.sync_configured(["old.example", "keep.example"])
+        old = next(x for x in self.pool.list_public(per_page=10)["items"] if x["domain"] == "old.example")
+        self.pool.set_email_health(old["id"], ok=True, message="historical")
+        self.pool.update(old["id"], {"enabled": False})
+
+        result = self.pool.reconcile_configured(["KEEP.EXAMPLE.", "new.example", "old.example"])
+
+        self.assertEqual(result["active"], 3)
+        self.assertEqual(result["added"], 1)
+        rows = self.pool.list_public(per_page=10)["items"]
+        self.assertEqual([x["domain"] for x in rows[:3]], ["keep.example", "new.example", "old.example"])
+        restored = next(x for x in rows if x["domain"] == "old.example")
+        self.assertEqual(restored["status"], "enabled")
+        self.assertEqual(restored["email_health"], "healthy")
+
+        result = self.pool.reconcile_configured(["new.example"])
+        self.assertEqual(result["disabled"], 2)
+        self.assertEqual(self.pool.active_domains(), ["new.example"])
+        history = {x["domain"]: x for x in self.pool.list_public(per_page=10)["items"]}
+        self.assertEqual(history["old.example"]["disabled_reason"], "CONFIG_REMOVED")
+        self.assertEqual(history["old.example"]["email_health"], "healthy")
+
+    def test_empty_reconcile_is_atomic(self):
+        self.pool.sync_configured(["keep.example"])
+        before = self.pool.list_public(per_page=10)["items"]
+        with self.assertRaisesRegex(DomainPoolError, "域名列表为空"):
+            self.pool.reconcile_configured(["", "not a domain"])
+        self.assertEqual(self.pool.list_public(per_page=10)["items"], before)
+
+    def test_reconcile_capacity_error_preserves_history_atomically(self):
+        self.pool.sync_configured(["one.example", "two.example"])
+        before = self.pool.list_public(per_page=10)["items"]
+        with patch("g.domain_pool.MAX_DOMAINS", 2):
+            with self.assertRaisesRegex(DomainPoolError, "旧域历史会保留"):
+                self.pool.reconcile_configured(["one.example", "three.example"])
+        self.assertEqual(self.pool.list_public(per_page=10)["items"], before)
 
     def test_first_marked_locks_and_second_marked_disables(self):
         self.pool.sync_configured(["a.example"])

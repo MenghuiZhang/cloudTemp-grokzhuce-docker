@@ -50,18 +50,17 @@ class ProxyParserTests(unittest.TestCase):
 
 
 class ProxyPoolTests(unittest.TestCase):
-    def test_new_asn_rule_blocks_only_future_leases(self):
+    def test_legacy_asn_rule_is_inert_without_runtime_asn_detection(self):
         with tempfile.TemporaryDirectory() as temp:
             pool = ProxyPool(Path(temp) / "pool.json")
             pool.import_text("proxy.example:8080")
             proxy_id = pool.list_public()["items"][0]["id"]
             pool.set_health(proxy_id, {"ok": True, "egress_ip": "192.0.2.10", "egress_asn": "AS64500"})
-            active = pool.acquire("active", wait=False)
-            self.assertIsNotNone(active)
-            pool.block_known_asn("AS64500")
-            self.assertEqual(pool.list_public()["items"][0]["health"], "blocked_asn")
-            self.assertIsNone(pool.acquire("new", wait=False))
-            pool.release(active, "neutral")
+            self.assertNotIn("egress_asn", pool.list_public()["items"][0])
+            self.assertEqual(pool.block_known_asn("AS64500"), 0)
+            new_lease = pool.acquire("new", wait=False)
+            self.assertIsNotNone(new_lease)
+            pool.release(new_lease, "neutral")
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -103,6 +102,45 @@ class ProxyPoolTests(unittest.TestCase):
         self.assertGreater(public["cooldown_remaining"], 0)
         self.assertEqual(public["health"], "unhealthy")
         self.assertIsNone(self.pool.acquire("two", wait=False))
+
+    def test_marked_always_cools_with_ladder_until_risk_clean(self):
+        self.pool.import_text("one.test:8001")
+        proxy_id = self.pool.list_public()["items"][0]["id"]
+
+        first = self.pool.acquire("first")
+        self.pool.release(first, "marked")
+        first_remaining = self.pool.list_public()["items"][0]["cooldown_remaining"]
+        self.assertGreaterEqual(first_remaining, 59)
+        self.assertLessEqual(first_remaining, 60)
+
+        self.pool._runtime[proxy_id]["cooldown_until"] = time.time() - 1
+        self.pool.set_health(proxy_id, {"ok": True})
+        second = self.pool.acquire("second")
+        self.pool.release(second, "marked")
+        second_remaining = self.pool.list_public()["items"][0]["cooldown_remaining"]
+        self.assertGreaterEqual(second_remaining, 299)
+        self.assertLessEqual(second_remaining, 300)
+
+        self.pool._runtime[proxy_id]["cooldown_until"] = time.time() - 1
+        self.pool.set_health(proxy_id, {"ok": True})
+        ordinary = self.pool.acquire("ordinary")
+        self.pool.release(ordinary, "failure")
+        third_marked = self.pool.acquire("third-marked")
+        self.pool.release(third_marked, "marked")
+        third_remaining = self.pool.list_public()["items"][0]["cooldown_remaining"]
+        self.assertGreaterEqual(third_remaining, 899)
+        self.assertLessEqual(third_remaining, 900)
+
+        self.pool._runtime[proxy_id]["cooldown_until"] = time.time() - 1
+        self.pool.set_health(proxy_id, {"ok": True})
+        clean = self.pool.acquire("clean")
+        self.pool.mark_risk_clean(clean)
+        self.pool.release(clean, "success")
+        third = self.pool.acquire("after-clean")
+        self.pool.release(third, "marked")
+        reset_remaining = self.pool.list_public()["items"][0]["cooldown_remaining"]
+        self.assertGreaterEqual(reset_remaining, 59)
+        self.assertLessEqual(reset_remaining, 60)
 
     def test_failed_health_recheck_resets_cooldown(self):
         self.pool.import_text("one.test:8001")

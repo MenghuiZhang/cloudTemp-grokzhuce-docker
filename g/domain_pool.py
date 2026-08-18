@@ -178,6 +178,76 @@ class DomainPool:
                 self._save_locked()
         return added
 
+    def reconcile_configured(self, domains: Iterable[str]) -> dict[str, Any]:
+        """Make a non-empty configured list the active rotation, preserving history.
+
+        Existing rows keep counters/events. Rows absent from the new list are
+        disabled instead of deleted; rows that reappear are enabled immediately.
+        An empty/invalid result is rejected so an upstream discovery failure
+        cannot accidentally clear a working pool.
+        """
+        normalized: list[str] = []
+        invalid_values: list[str] = []
+        seen: set[str] = set()
+        for value in domains:
+            try:
+                domain = normalize_domain(value)
+            except DomainPoolError:
+                invalid_values.append(str(value or "").strip()[:253])
+                continue
+            if domain not in seen:
+                seen.add(domain)
+                normalized.append(domain)
+        if not normalized:
+            raise DomainPoolError("域名列表为空，现有域名池保持不变")
+        if len(normalized) > MAX_DOMAINS:
+            raise DomainPoolError(f"域名数量超过 {MAX_DOMAINS}")
+
+        added = enabled = disabled = 0
+        with self._lock:
+            by_name = {row["domain"]: row for row in self._data["domains"]}
+            new_count = sum(1 for domain in normalized if domain not in by_name)
+            if len(self._data["domains"]) + new_count > MAX_DOMAINS:
+                raise DomainPoolError(f"域名数量超过 {MAX_DOMAINS}（旧域历史会保留）")
+            ordered: list[dict[str, Any]] = []
+            for domain in normalized:
+                row = by_name.get(domain)
+                if row is None:
+                    row = self._new_entry(domain, status="enabled")
+                    self._runtime[row["id"]] = {"in_use": 0}
+                    added += 1
+                elif row["status"] != "enabled":
+                    row["status"] = "enabled"
+                    row["disabled_reason"] = ""
+                    row["disabled_at"] = ""
+                    row["verification_owner"] = ""
+                    self._event(row, "CONFIG_REENABLED", "域名重新进入已保存列表")
+                    enabled += 1
+                ordered.append(row)
+
+            for row in self._data["domains"]:
+                if row["domain"] in seen:
+                    continue
+                if row["status"] in {"enabled", "verifying"}:
+                    row["status"] = "disabled"
+                    row["disabled_reason"] = "CONFIG_REMOVED"
+                    row["disabled_at"] = _now()
+                    row["verification_owner"] = ""
+                    self._event(row, "CONFIG_REMOVED", "域名不在新的已保存列表中")
+                    disabled += 1
+                ordered.append(row)
+            self._data["domains"] = ordered
+            self._cursor = 0
+            self._save_locked()
+        return {
+            "added": added,
+            "enabled": enabled,
+            "disabled": disabled,
+            "active": len(normalized),
+            "invalid": len(invalid_values),
+            "invalid_values": invalid_values[:100],
+        }
+
     @staticmethod
     def _new_entry(domain: str, *, status: str = "disabled") -> dict[str, Any]:
         return {
@@ -271,9 +341,9 @@ class DomainPool:
             }
 
     def active_domains(self) -> list[str]:
-        """Domains eligible for provider use (including an in-flight verifier)."""
+        """Domains eligible for new provider leases."""
         with self._lock:
-            return [x["domain"] for x in self._data["domains"] if x["status"] in {"enabled", "verifying"}]
+            return [x["domain"] for x in self._data["domains"] if x["status"] == "enabled"]
 
     def acquire(self, logical_id: str) -> Optional[DomainLease]:
         with self._lock:
@@ -376,8 +446,6 @@ class DomainPool:
             if "enabled" in values:
                 enabled = bool(values["enabled"])
                 if enabled:
-                    if row["email_health"] != "healthy" and not values.get("force"):
-                        raise DomainPoolError("域名邮箱测试通过后才能启用")
                     row["status"] = "enabled"
                     row["disabled_reason"] = ""
                     row["disabled_at"] = ""

@@ -6,13 +6,13 @@ Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Cas
 
 - 同页 same-session 注册（Castle mint + 页内 fetch，默认 CLEAN 主路径）
 - 独立邮箱配置中心：Outlook Plus Alias、[idinging/freemail](https://github.com/idinging/freemail)、[YYDS Mail](https://vip.215.im/docs)、[cloudflare_temp_email](https://github.com/dreamhunter2333/cloudflare_temp_email)
-- Cloudflare Temp 多基础域名顺序轮替、失败切域、冷却与随机子域
+- Cloudflare Temp 多基础域名顺序轮替、即时列表替换与随机子域
 - 本地 Camoufox Turnstile Solver（也可接 YesCaptcha）
 - 多线程并发；主流程 / Risk·Token·NSFW 双栏日志
-- Risk 开启时按 `Risk → PENDING_BFS → OAuth/BFS` 分类，批次目标按最终 `CLEAN` 数计
-- Risk 关闭时不执行 Risk、OAuth 或 BFS，账号归入 `UNCHECKED`，批次目标按成功 SSO 数计
+- Risk 开启时按 `Risk → PENDING_BFS → OAuth/BFS` 分类；Risk 关闭时不执行 Risk、OAuth 或 BFS，账号归入 `UNCHECKED`
+- 批次目标统一按“成功创建邮箱数”计；创邮失败不占目标，已创邮的在途账号会继续完成分类
 - 统一互斥分类文件：`*_clean.txt` / `*_marked.txt` / `*_unchecked.txt` / `*_infra_retry.txt`
-- 代理出口 ASN 预检、手动永久黑名单，以及 Risk MARKED 的 24 小时自动学习
+- Risk MARKED 节点阶梯冷却（1 / 5 / 15 / 30 分钟）；仅明确 Risk CLEAN 重置该节点阶梯
 - 独立导入中心：最近成功 / Keys / 注册 JSON / 上传文件，多目标预览、后台任务和失败重试
 - CPA/OIDC 本地生成与 CLIProxyAPI 上传；grok2api 本地池、chenyme Web/Console/Build、jiujiu 兼容
 - 每个下游独立测试、代理和自动导入开关；默认全部关闭
@@ -132,9 +132,8 @@ cp .env.example .env
 | `LOG_MAX_MB` / `LOG_ROTATE_FILE_COUNT` | 单份日志上限/总文件数（含当前） | `10` / `3` |
 | `UI_HOST` / `UI_PORT` | Web 监听 | `127.0.0.1` / `3333` |
 | `data/proxy_pool.json` | 注册代理池的本地私密存储；由 `/proxy-settings` 管理，不提交 Git | 空池（直连） |
-| `data/domain_pool.json` | Cloudflare Temp 基础域名状态、Bot 复验和审计记录；不提交 Git | 从现有域名配置迁移 |
-| `MONITOR_TOKEN` | BFS/ASN 运维 API 的 Bearer / `X-Monitor-Token` | 必须显式配置 |
-| `data/asn_blacklist.json` | 手动/自动 ASN 黑名单及 Risk 样本；`0600` | 空 |
+| `data/domain_pool.json` | Cloudflare Temp 基础域名状态和审计历史；不提交 Git | 从现有域名配置迁移 |
+| `MONITOR_TOKEN` | BFS 运维 API 的 Bearer / `X-Monitor-Token` | 必须显式配置 |
 | `SUB2API_URL` | 旧版 sub2api 根地址；首次进入导入中心时用于迁移 | `http://127.0.0.1:9898` |
 | `SUB2API_GROK_GROUP_NAME` | 导入目标分组**名称**（按名称解析 ID） | `grok` |
 | `SUB2API_GROK_GROUP_ID` | 可选缓存；运行时会按名称回写 | 空 |
@@ -146,7 +145,7 @@ cp .env.example .env
 - 旧 `EMAIL_TYPE`、`FREEMAIL_*`、`OUTLOOK_*` 会自动读取；新页面首次保存后写入新结构并继续双写兼容变量。
 - Outlook 模式生成 `主账号+随机标签@outlook.com`，邮件仍进入主账号收件箱；这不是微软账户中创建的真实别名。
 - Outlook 收件优先使用 OAuth2；只有账号行未提供 OAuth2 凭据时，才尝试密码或应用密码。使用前需在 Outlook.com 中启用 IMAP。
-- Cloudflare Temp 域名表支持从服务批量拉取、去重、启停、测试、筛选、分页和永久删除。新拉取域名默认停用；删除会同时移除该域名的检测与失败历史。邮箱 API 失败与 xAI Bot MARKED 分开统计；明确 MARKED 会停用当前代理，同一基础域在不同代理上复验仍 MARKED 时才持久化停用该域名。
+- Cloudflare Temp 域名表支持从服务拉取并镜像替换、去重、启停、诊断测试、筛选、分页和永久删除。非空列表保存后新域立即启用，缺失的旧域停用但保留历史；拉取失败或空列表不修改现有池。诊断测试不再影响启用状态。Risk MARKED 不停用或复验域名，下一次创邮按顺序轮询。
 - Cloudflare 随机子域模式只应搭配 Worker `RANDOM_SUBDOMAIN_DOMAINS` 中的基础域名；Worker 还需配置 `RANDOM_SUBDOMAIN_LENGTH` 和通配 MX。
 - Sub2API 配置已迁移到独立“导入服务”页面；分组 ID 在测试/导入时按名称自动解析。
 - 名称匹配的是 sub2api **已有**分组（可跨 platform）；新分组请先在 sub2api 后台创建。
@@ -154,7 +153,7 @@ cp .env.example .env
 - 默认**不**自动导入；服务测试通过后，可在导入中心按目标开启注册后自动导入。
 - 导入配置和写入型密钥保存在 `data/import_services.json`，API 只返回掩码；旧版
   `converted_auth/import_services.json` 会在首次读取时自动迁移且保留原文件。
-- Risk CLEAN 后先异步换票并检查 JWT `bfs` claim；只有 BFS CLEAN 才计入成功和下游导入。
+- Risk CLEAN 后先异步换票并检查 JWT `bfs` claim；只有 BFS CLEAN 才归入 CLEAN 结果并进入敏感下游导入。
 - JWT 中只要存在 `bfs` key（包括 `bfs: 0`）就是 MARKED；已取得但无法解码的 token 按 BFS UNKNOWN 处理。
 - BFS MARKED/UNKNOWN 的 CPA 仅保留在本地且强制 `disabled=true`，不进入任何下游。
 
@@ -184,7 +183,7 @@ python start.py
 - **配置**：Solver 等通用参数 → 写入 `.env`
 - **日志与磁盘保护**：抓包默认关闭；可查看占用、调整保留上限并清理历史诊断抓包
 - **注册代理**：独立页面管理代理池、调度与健康状态 → 写入 `data/proxy_pool.json`
-- **域名管理**：Cloudflare Temp 区域管理基础域启停、邮箱健康、Bot 复验和审计 → 写入 `data/domain_pool.json`
+- **域名管理**：Cloudflare Temp 区域管理基础域列表、启停、诊断测试和审计 → 写入 `data/domain_pool.json`
 - **运行**：选择 `same_session`、并发、数量和本批 Risk 检测开关后开始
 - **日志**：左侧主流程（建邮→camoufox→signup→SSO），右侧 Risk / Token / NSFW
 - **Keys**：下载 SSO 文件；批量导入统一在导入中心执行
@@ -275,21 +274,6 @@ python scan_bfs_auth.py override converted_auth/cpa/xai-example.json --reason "m
 ```
 
 Risk MARKED 不允许这种放行；token 更换后旧指纹自动失效。
-
-### 8. ASN 黑名单
-
-网页首页可查看和维护 ASN 黑名单，也可以使用命令行：
-
-```bash
-python asn_blacklist_cli.py list
-python asn_blacklist_cli.py add AS64500 --note "manual review"
-python asn_blacklist_cli.py remove AS64500
-```
-
-手动项永久有效，直到明确删除。自动项只由 Risk MARKED 样本学习：同一 ASN 在 24 小时内
-出现 5 个不同出口 IP 后进入黑名单，24 小时后自动过期；BFS 结果不会参与 ASN 学习。
-静态代理命中后标记为 `blocked_asn`，动态代理会更换会话并重查；ASN 查询失败时保守阻断，
-不会静默回退到直连。
 
 ## 测试
 

@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -29,11 +30,11 @@ class DomainApiTests(unittest.TestCase):
         self.assertEqual(response.json["per_page"], 2000)
         self.assertEqual(len(response.json["items"]), 250)
 
-    def test_added_domain_starts_disabled(self):
+    def test_added_domain_is_immediately_enabled(self):
         response = self.client.post("/api/domains", json={"domain": "new.example.com"})
         self.assertEqual(response.status_code, 200)
         row = next(x for x in self.pool.list_public(per_page=1000)["items"] if x["domain"] == "new.example.com")
-        self.assertEqual(row["status"], "disabled")
+        self.assertEqual(row["status"], "enabled")
 
     def test_batch_add_reports_duplicates_and_invalid_domains(self):
         response = self.client.post("/api/domains", json={
@@ -44,11 +45,11 @@ class DomainApiTests(unittest.TestCase):
         self.assertEqual(response.json["duplicates"], 2)
         self.assertEqual(response.json["invalid"], 1)
 
-    def test_batch_add_is_allowed_while_running_without_env_sync(self):
+    def test_batch_add_is_rejected_while_running(self):
         with patch.object(app.engine, "is_running", return_value=True):
             response = self.client.post("/api/domains", json={"domains": ["running.example.com"]})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json["added"], 1)
+        self.assertEqual(response.status_code, 409)
+        self.assertNotIn("running.example.com", self.pool.active_domains())
         self.sync_mock.assert_not_called()
 
     def test_delete_permanently_removes_domain_history(self):
@@ -81,15 +82,11 @@ class DomainApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 400)
 
-    def test_bulk_enable_tests_before_enabling(self):
+    def test_bulk_enable_does_not_run_connection_test(self):
         self.pool.add(["new.example.com"])
         row = next(x for x in self.pool.list_public(per_page=1000)["items"] if x["domain"] == "new.example.com")
 
-        def fake_test(domain_id):
-            self.pool.set_email_health(domain_id, ok=True, message="ok")
-            return {"id": domain_id, "ok": True, "message": "ok"}
-
-        with patch.object(app, "_test_domain", side_effect=fake_test):
+        with patch.object(app, "_test_domain") as test_domain:
             response = self.client.post(
                 "/api/domains/bulk",
                 json={"ids": [row["id"]], "action": "enable"},
@@ -97,8 +94,10 @@ class DomainApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json["changed"], 1)
         self.assertEqual(self.pool.get_public(row["id"])["status"], "enabled")
+        self.assertEqual(self.pool.get_public(row["id"])["email_health"], "untested")
+        test_domain.assert_not_called()
 
-    def test_disabled_only_pool_is_presented_in_auto_domain_mode(self):
+    def test_disabled_only_pool_never_falls_back_to_auto_domain(self):
         with tempfile.TemporaryDirectory() as tmp:
             disabled_pool = DomainPool(Path(tmp) / "domain_pool.json")
             disabled_pool.add(["disabled.example.com"])
@@ -110,11 +109,65 @@ class DomainApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         cloudflare = response.json["config"]["providers"]["cloudflare_temp"]
         self.assertEqual(cloudflare["domains"], [])
-        self.assertIs(cloudflare["auto_domain"], True)
+        self.assertIs(cloudflare["auto_domain"], False)
+
+    def test_replace_reconciles_active_list_without_testing(self):
+        with patch.object(app, "_test_domain") as test_domain:
+            response = self.client.post("/api/domains", json={
+                "domains": ["fresh.example.com", "d1.example.com"],
+                "replace": True,
+            })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.pool.active_domains(), ["fresh.example.com", "d1.example.com"])
+        self.assertEqual(response.json["disabled"], 249)
+        test_domain.assert_not_called()
+
+    def test_empty_replace_keeps_current_pool(self):
+        before = self.pool.active_domains()
+        response = self.client.post("/api/domains", json={"domains": [], "replace": True})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.pool.active_domains(), before)
+
+    def test_start_rejects_configured_pool_with_no_active_domain(self):
+        for row in self.pool.list_public(per_page=1000)["items"]:
+            self.pool.update(row["id"], {"enabled": False})
+        with (
+            patch.object(app, "read_env_file", return_value={}),
+            patch.object(app, "resolved_email_config", return_value={"provider": "cloudflare_temp"}),
+        ):
+            response = self.client.post("/api/start", json={"workers": 1, "target": 1})
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("没有已启用域名", response.json["message"])
+
+    def test_general_save_cannot_restore_stale_cloudflare_domains(self):
+        current = dict(app.DEFAULTS)
+        current["EMAIL_PROVIDER"] = "cloudflare_temp"
+        current["EMAIL_CF_TEMP_DOMAINS_JSON"] = '["stale.example.com"]'
+        with (
+            patch.object(app, "read_env_file", return_value=current),
+            patch.object(app, "write_env_file") as write_env,
+            patch.object(app, "apply_env_to_process"),
+        ):
+            response = self.client.post("/api/email-config", json={
+                "providers": {
+                    "cloudflare_temp": {
+                        "domains": ["stale.example.com"],
+                        "auto_domain": True,
+                    }
+                }
+            })
+        self.assertEqual(response.status_code, 200)
+        saved = write_env.call_args.args[0]
+        self.assertEqual(
+            json.loads(saved["EMAIL_CF_TEMP_DOMAINS_JSON"]),
+            self.pool.active_domains(),
+        )
+        self.assertNotIn("stale.example.com", self.pool.active_domains())
+        self.assertEqual(saved["EMAIL_CF_TEMP_AUTO_DOMAIN"], "0")
 
 
 class DomainEnvSyncTests(unittest.TestCase):
-    def test_sync_uses_auto_mode_until_a_domain_is_enabled(self):
+    def test_sync_never_uses_auto_mode_when_pool_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
             pool = DomainPool(Path(tmp) / "domain_pool.json")
             pool.add(["new.example.com"])
@@ -127,10 +180,9 @@ class DomainEnvSyncTests(unittest.TestCase):
                 app._sync_cf_domain_env()
                 disabled_values = write_env.call_args.args[0]
                 self.assertEqual(disabled_values["EMAIL_CF_TEMP_DOMAINS_JSON"], "[]")
-                self.assertEqual(disabled_values["EMAIL_CF_TEMP_AUTO_DOMAIN"], "1")
+                self.assertEqual(disabled_values["EMAIL_CF_TEMP_AUTO_DOMAIN"], "0")
 
                 row = pool.list_public()["items"][0]
-                pool.set_email_health(row["id"], ok=True, message="ok")
                 pool.update(row["id"], {"enabled": True})
                 app._sync_cf_domain_env()
                 enabled_values = write_env.call_args.args[0]
