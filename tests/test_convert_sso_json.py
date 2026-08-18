@@ -152,6 +152,20 @@ class ConvertSSOJsonTests(unittest.TestCase):
         self.assertEqual(record["email"], "user@example.com")
         self.assertEqual(record["base_url"], GROK_BUILD_BASE_URL)
         self.assertEqual(record["headers"]["X-XAI-Token-Auth"], "xai-grok-cli")
+        self.assertTrue(record["bfs_checked"])
+        self.assertEqual(record["bfs_status"], "clean")
+        self.assertFalse(record["disabled"])
+
+    def test_bfs_claim_disables_cpa_even_when_zero(self):
+        access = fake_jwt({"sub": "user-bfs", "bfs": 0})
+
+        record = build_cpa_record(
+            {"access_token": access, "refresh_token": "refresh"}
+        )
+
+        self.assertTrue(record["bfs"])
+        self.assertEqual(record["bfs_value"], 0)
+        self.assertTrue(record["disabled"])
 
     def test_builds_sub2api_grok_account(self):
         access = fake_jwt(

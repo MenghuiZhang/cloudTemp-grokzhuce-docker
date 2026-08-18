@@ -153,6 +153,15 @@ def _normalize_bot_detail(s: str) -> str:
     return t.strip()
 
 
+def _is_numeric_bot_flag_source(value: Any) -> bool:
+    """The API's numeric source values 1/2 are explicit hard-risk signals."""
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, (int, float)):
+        return value in (1, 2)
+    return str(value or "").strip() in ("1", "2")
+
+
 def _parse_bot_flag_details(detail: str) -> dict[str, Any]:
     """从 botFlagDetails / grpc 字符串解析 policy / risk / event / castle 状态。"""
     d = _normalize_bot_detail(detail)
@@ -706,9 +715,14 @@ class AntibotService:
             # → GetUser 看起来“没 deny 字符串”，device/CLI 仍挂
             bfs = str(out.get("bot_flag_source") or "")
             castle_source = "CASTLE" in bfs.upper()
+            numeric_bot_flag = _is_numeric_bot_flag_source(out.get("bot_flag_source"))
+            if numeric_bot_flag:
+                signals.append(f"numeric_bot_flag_source:{bfs}")
             out["false_clean"] = bool(
                 (not out["denied"])
                 and (
+                    numeric_bot_flag
+                    or
                     castle_bad
                     or (risk_high and (castle_bad or castle_source or bool(detail_s)))
                     or (castle_source and bool(detail_s) and castle_bad)

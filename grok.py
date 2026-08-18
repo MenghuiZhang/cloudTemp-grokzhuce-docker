@@ -32,6 +32,9 @@ from g import (
 )
 from g.proxy_pool import ProxyLease, get_proxy_pool, parse_proxy_line
 from g.domain_pool import DomainLease, get_domain_pool
+from g.bfs_service import atomic_write_json, inspect_token_bundle_bfs
+from g.classification_store import ClassificationStore
+from g.asn_blacklist import AsnBlacklistStore
 
 try:
     from g import AntibotService
@@ -1381,6 +1384,7 @@ class RegisterEngine:
         self._worker_thread: Optional[threading.Thread] = None
         self.proxy_pool = get_proxy_pool(_BASE_DIR)
         self.domain_pool = get_domain_pool(_BASE_DIR)
+        self.asn_blacklist = AsnBlacklistStore(_BASE_DIR / "data" / "asn_blacklist.json")
         # 注册 POST 起步节流（不包整次 HTTP，允许多线程并行飞）
         self._post_min_interval = 0.25
         self._last_post_start = 0.0
@@ -1397,6 +1401,10 @@ class RegisterEngine:
         self.clean_count = 0
         self.marked_count = 0
         self.unchecked_count = 0
+        self.pending_bfs_count = 0
+        self.oauth_infra_streak = 0
+        self._classification_store: Optional[ClassificationStore] = None
+        self._bfs_lock = threading.RLock()
         # 创邮尝试次数：数量 N = 创建 N 个邮箱就停（CLEAN/MARKED/失败都计 1 次）
         self.attempt_count = 0
         self.email_create_count = 0
@@ -1482,6 +1490,7 @@ class RegisterEngine:
             "clean_count": int(getattr(self, "clean_count", 0) or 0),
             "marked_count": int(getattr(self, "marked_count", 0) or 0),
             "unchecked_count": int(getattr(self, "unchecked_count", 0) or 0),
+            "pending_bfs_count": int(getattr(self, "pending_bfs_count", 0) or 0),
             "attempt_count": attempts,
             "email_create_count": int(getattr(self, "email_create_count", 0) or 0),
             "bot_retry_count": int(getattr(self, "bot_retry_count", 0) or 0),
@@ -1777,10 +1786,18 @@ class RegisterEngine:
                 with open(emergency, "a", encoding="utf-8") as f:
                     f.write(f"{email}----{s}\n" if email else f"{s}\n")
                     ok = True
+                try:
+                    emergency.chmod(0o600)
+                except OSError:
+                    pass
                 if self.output_file:
                     with open(self.output_file, "a", encoding="utf-8") as f:
                         f.write(s + "\n")
                         ok = True
+                    try:
+                        Path(self.output_file).chmod(0o600)
+                    except OSError:
+                        pass
                 # 与 TXT 并行维护便于其他程序直接读取的账号 JSON。
                 self._write_account_json_unlocked(email=email, sso=s)
             self.log(
@@ -1812,6 +1829,13 @@ class RegisterEngine:
         auth_token：注册时 device flow 换到的 token，导入上游可直写，免二次换票。
         clean=True 表示已通过 Risk；None 表示未检测（UNCHECKED）。
         """
+        classification_store = self._classification_store
+        if classification_store is None and self.output_file:
+            classification_path = Path(self.output_file)
+            if not classification_path.is_absolute():
+                classification_path = _BASE_DIR / classification_path
+            classification_store = ClassificationStore(classification_path)
+            self._classification_store = classification_store
         with self.file_lock:
             email_meta = (
                 email_service.get_email_metadata(email)
@@ -1833,6 +1857,10 @@ class RegisterEngine:
                         emergency = _BASE_DIR / "keys" / "emergency_sso.txt"
                         with open(emergency, "a", encoding="utf-8") as f:
                             f.write(f"{email}----{sso}\n")
+                        try:
+                            emergency.chmod(0o600)
+                        except OSError:
+                            pass
                         self._write_account_json_unlocked(email=email, sso=sso, **email_meta)
                         self.log(f"{email} 已达目标，SSO 写入 emergency_sso.txt", "warn")
                     except Exception:
@@ -1847,12 +1875,20 @@ class RegisterEngine:
                 try:
                     with open(self.output_file, "a", encoding="utf-8") as f:
                         f.write(sso + "\n")
+                    try:
+                        Path(self.output_file).chmod(0o600)
+                    except OSError:
+                        pass
                 except Exception as write_err:
                     self.log(f"{email} 写入文件失败: {write_err}，尝试紧急落盘", "error")
                     try:
                         emergency = _BASE_DIR / "keys" / "emergency_sso.txt"
                         with open(emergency, "a", encoding="utf-8") as f:
                             f.write(f"{email}----{sso}\n")
+                        try:
+                            emergency.chmod(0o600)
+                        except OSError:
+                            pass
                     except Exception as e2:
                         self.log(f"{email} 紧急落盘也失败: {e2}", "error")
                         self.fail_count += 1
@@ -1866,13 +1902,16 @@ class RegisterEngine:
 
             if clean is None:
                 self.unchecked_count += 1
-                if self.output_file:
-                    unchecked_path = Path(self.output_file).with_name(
-                        Path(self.output_file).stem + "_unchecked.txt"
+                if classification_store is not None:
+                    classification_store.finalize(
+                        email=email, sso=sso, state="unchecked", reason="RISK_DISABLED"
                     )
-                    unchecked_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(unchecked_path, "a", encoding="utf-8") as f:
-                        f.write(f"{email}----{sso}\n")
+            elif clean is True:
+                self.clean_count += 1
+                if classification_store is not None:
+                    classification_store.finalize(
+                        email=email, sso=sso, state="clean", reason="BFS_CLEAN"
+                    )
 
             self.success_count += 1
             avg = (time.time() - self.start_time) / max(1, self.success_count)
@@ -2001,6 +2040,10 @@ class RegisterEngine:
         with self.file_lock:
             with open(p, "a", encoding="utf-8") as f:
                 f.write(line if line.endswith("\n") else line + "\n")
+            try:
+                p.chmod(0o600)
+            except OSError:
+                pass
 
     def _accounts_json_path(self) -> Optional[Path]:
         """返回当前任务的结构化账号文件路径。"""
@@ -2181,30 +2224,22 @@ class RegisterEngine:
                 user_id=str(risk.get("user_id") or ""),
             )
             if clean:
-                with self.file_lock:
-                    self.clean_count += 1
-                if self.output_file:
-                    clean_path = Path(self.output_file).with_name(
-                        Path(self.output_file).stem + "_clean.txt"
-                    )
-                    self._append_line(clean_path, f"{email}----{sso}")
                 if success_id:
                     self._update_success_meta(
                         success_id, clean=True, note=f"risk=CLEAN {summary}"
                     )
                 self.log(
                     f"{email} risk CLEAN · {summary} · {elapsed}s · "
-                    f"CLEAN累计 {self.clean_count}",
+                    "已进入 PENDING_BFS",
                     "success",
                 )
                 return True
             # TLS/代理基建失败：SSO 可能仍是好号，禁止记 MARKED、不进 _marked
             if AntibotService.is_risk_infra_error(risk):
-                if self.output_file:
-                    infra_path = Path(self.output_file).with_name(
-                        Path(self.output_file).stem + "_infra_retry.txt"
+                if self._classification_store is not None:
+                    self._classification_store.finalize(
+                        email=email, sso=sso, state="infra_retry", reason="RISK_INFRA"
                     )
-                    self._append_line(infra_path, f"{email}----{sso}")
                 self.log(
                     f"{email} risk INFRA（TLS/代理探测失败，非业务 MARKED）· "
                     f"{summary} · {elapsed}s · SSO 已落 emergency，本号暂不进成功列表",
@@ -2215,23 +2250,20 @@ class RegisterEngine:
             # 真 MARKED（DENIED / false_clean / botFlag）：落盘，不进成功/导入
             with self.file_lock:
                 self.marked_count += 1
-            if self.output_file:
-                marked = Path(self.output_file).with_name(
-                    Path(self.output_file).stem + "_marked.txt"
-                )
-                self._append_line(marked, f"{email}----{sso}")
-                meta = Path(self.output_file).with_name(
-                    Path(self.output_file).stem + "_marked_meta.txt"
-                )
-                detail_bits = [
-                    summary,
-                    f"policy={risk.get('policy')}",
-                    f"event={risk.get('event')}",
-                    f"src={risk.get('bot_flag_source')}",
-                    f"score={risk.get('risk_score')}",
-                ]
-                self._append_line(
-                    meta, f"{email}\t" + " | ".join(str(x) for x in detail_bits if x)
+            if self._classification_store is not None:
+                self._classification_store.finalize(
+                    email=email,
+                    sso=sso,
+                    state="marked",
+                    reason="RISK_MARKED",
+                    metadata={
+                        "source": "risk",
+                        "summary": summary[:240],
+                        "policy": risk.get("policy"),
+                        "event": risk.get("event"),
+                        "bot_flag_source": risk.get("bot_flag_source"),
+                        "risk_score": risk.get("risk_score"),
+                    },
                 )
             if success_id:
                 # 若历史上已进成功列表，踢掉并回滚成功计数
@@ -2403,6 +2435,7 @@ class RegisterEngine:
         impersonate: str,
         user_agent: str,
         skip_token: bool = False,
+        risk_gated: bool = False,
         proxy_lease: Optional[ProxyLease] = None,
     ) -> None:
         """
@@ -2434,6 +2467,80 @@ class RegisterEngine:
                     note_parts.append("token=async_pending_or_fail")
             else:
                 note_parts.append("token=skipped")
+
+            if risk_gated:
+                if not isinstance(auth_token, dict) or not is_auth_token_usable(auth_token):
+                    if self._classification_store is not None:
+                        self._classification_store.finalize(
+                            email=email,
+                            sso=sso,
+                            state="infra_retry",
+                            reason="OAUTH_NO_TOKEN",
+                        )
+                    with self._bfs_lock:
+                        self.oauth_infra_streak += 1
+                        streak = self.oauth_infra_streak
+                    self.log(
+                        f"{email} OAuth 未取得 token · 归入 INFRA_RETRY · 连续 {streak}/3",
+                        "warn",
+                    )
+                    if streak >= 3:
+                        self.resource_exhausted_reason = "OAUTH_INFRA_EXHAUSTED"
+                        self.error_message = "连续 3 个账号 OAuth 基础设施失败"
+                        self.stop_event.set()
+                    return
+
+                bfs = inspect_token_bundle_bfs(
+                    access_token=str(auth_token.get("access_token") or auth_token.get("key") or ""),
+                    id_token=str(auth_token.get("id_token") or ""),
+                    refresh_token=str(auth_token.get("refresh_token") or ""),
+                    sso=sso,
+                )
+                if bfs.get("has_bfs") or not bfs.get("ok"):
+                    from convert_sso_json import SSORecord, build_cpa_record, cpa_path_for_record
+
+                    cpa_path = cpa_path_for_record(
+                        _BASE_DIR / "converted_auth",
+                        SSORecord(source=Path("runtime.json"), email=email, sso=sso),
+                    )
+                    auth = build_cpa_record(auth_token, email=email, sso=sso, disabled=True)
+                    atomic_write_json(cpa_path, auth)
+                    reason = "BFS_MARKED" if bfs.get("has_bfs") else "BFS_UNKNOWN"
+                    if self._classification_store is not None:
+                        self._classification_store.finalize(
+                            email=email,
+                            sso=sso,
+                            state="marked",
+                            reason=reason,
+                            metadata={
+                                "source": "bfs",
+                                "bfs_status": "flagged" if bfs.get("has_bfs") else "unknown",
+                                "bfs_value": bfs.get("bfs"),
+                                "token_fingerprint": __import__("hashlib").sha256(
+                                    str(auth_token.get("access_token") or auth_token.get("key") or "").encode()
+                                ).hexdigest(),
+                            },
+                        )
+                    with self._bfs_lock:
+                        self.marked_count += 1
+                        self.oauth_infra_streak = 0
+                    self.log(f"{email} {reason} · CPA 已本地禁用保存 · 不进入下游", "warn")
+                    return
+
+                with self._bfs_lock:
+                    self.oauth_infra_streak = 0
+                success_id = self._record_success(
+                    email=email,
+                    sso=sso,
+                    unhinged_ok=False,
+                    note="risk=CLEAN · bfs=CLEAN",
+                    already_written=False,
+                    auth_token=auth_token,
+                    proxy_audit=self.proxy_pool.lease_audit(proxy_lease),
+                    clean=True,
+                )
+                if not success_id:
+                    return
 
             unhinged_ok = False
             try:
@@ -2490,6 +2597,9 @@ class RegisterEngine:
         finally:
             if proxy_lease is not None:
                 self.proxy_pool.release(proxy_lease, "success")
+            if risk_gated:
+                with self._bfs_lock:
+                    self.pending_bfs_count = max(0, self.pending_bfs_count - 1)
             with self._enrich_lock:
                 self._enrich_pending = max(0, self._enrich_pending - 1)
 
@@ -2503,8 +2613,16 @@ class RegisterEngine:
         impersonate: str,
         user_agent: str,
         skip_token: bool = False,
+        risk_gated: bool = False,
         proxy_lease: Optional[ProxyLease] = None,
     ) -> None:
+        if risk_gated:
+            with self._bfs_lock:
+                self.pending_bfs_count += 1
+            if self._classification_store is not None:
+                self._classification_store.add_pending(
+                    email=email, sso=sso, data={"state": "PENDING_BFS"}
+                )
         with self._enrich_lock:
             self._enrich_pending += 1
         try:
@@ -2517,6 +2635,7 @@ class RegisterEngine:
                 impersonate=impersonate,
                 user_agent=user_agent,
                 skip_token=skip_token,
+                risk_gated=risk_gated,
                 proxy_lease=proxy_lease,
             )
         except Exception as e:
@@ -2524,6 +2643,16 @@ class RegisterEngine:
                 self.proxy_pool.release(proxy_lease, "success", str(e))
             with self._enrich_lock:
                 self._enrich_pending = max(0, self._enrich_pending - 1)
+            if risk_gated:
+                with self._bfs_lock:
+                    self.pending_bfs_count = max(0, self.pending_bfs_count - 1)
+                if self._classification_store is not None:
+                    self._classification_store.finalize(
+                        email=email,
+                        sso=sso,
+                        state="infra_retry",
+                        reason="ENRICH_SUBMIT_FAILED",
+                    )
             self.log(f"{email} 调度后台 enrich 失败: {e}", "warn")
 
     def register_single_thread_same_session(self):
@@ -2596,11 +2725,21 @@ class RegisterEngine:
                 attempt_i = int(revalidation["attempt_i"])
                 domain_lease: Optional[DomainLease] = revalidation["domain_lease"]
             else:
-                # Reserve one logical slot atomically. Workers that arrive after
-                # N simply retire; in-flight workers still finish or revalidate.
-                with self._ss_attempt_lock:
-                    if int(self.attempt_count or 0) >= max_attempts:
+                # Final target is BFS CLEAN when Risk is enabled, otherwise
+                # successful SSO classified as UNCHECKED.
+                if risk_enabled:
+                    with self._bfs_lock:
+                        completed = int(self.clean_count or 0)
+                        pending = int(self.pending_bfs_count or 0)
+                    if completed >= max_attempts:
                         return
+                    if completed + pending >= max_attempts:
+                        if self._sleep(0.2):
+                            return
+                        continue
+                elif int(self.unchecked_count or 0) >= max_attempts:
+                    return
+                with self._ss_attempt_lock:
                     self.attempt_count = int(self.attempt_count or 0) + 1
                     attempt_i = self.attempt_count
                 logical_id = uuid.uuid4().hex
@@ -3068,12 +3207,16 @@ class RegisterEngine:
                     with self.file_lock:
                         with open(emergency, "a", encoding="utf-8") as f:
                             f.write(f"{email}----{sso}\n")
+                        try:
+                            emergency.chmod(0o600)
+                        except OSError:
+                            pass
                         self._write_account_json_unlocked(email=email, sso=sso)
                 except Exception:
                     pass
 
                 # 前台 risk 门禁：开启时只有 CLEAN 才计成功 / 可自动导入。
-                # 关闭时仅跳过此探测，Turnstile/Castle 与后续 enrich 仍照常运行。
+                # 关闭时保留注册必需的 Turnstile/Castle，但不执行 OAuth/BFS。
                 if risk_enabled:
                     clean = self._probe_and_mark_clean(
                         email=email,
@@ -3098,6 +3241,20 @@ class RegisterEngine:
                         marked_proxy = proxy_lease.masked if proxy_lease is not None else "direct"
                         marked_proxy_id = proxy_lease.proxy_id if proxy_lease is not None and not proxy_lease.direct else "direct"
                         marked_egress = self.proxy_pool.lease_geo(proxy_lease).get("ip", "") if proxy_lease is not None else ""
+                        marked_asn = self.proxy_pool.lease_geo(proxy_lease).get("asn", "") if proxy_lease is not None else ""
+                        if marked_asn and marked_egress:
+                            try:
+                                learned = self.asn_blacklist.record_risk_marked(
+                                    asn=marked_asn, ip=marked_egress
+                                )
+                                if learned.get("learned"):
+                                    self.proxy_pool.block_known_asn(learned["asn"])
+                                    self.log(
+                                        f"AS{learned['asn']} 达到 {learned['distinct_ips']} 个不同 Risk MARKED 出口 · 自动屏蔽 24h",
+                                        "warn",
+                                    )
+                            except ValueError:
+                                pass
                         if proxy_lease is not None:
                             self.proxy_pool.disable_for_bot(
                                 proxy_lease,
@@ -3237,6 +3394,29 @@ class RegisterEngine:
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/131.0.0.0 Safari/537.36"
                 )
+                if risk_enabled:
+                    self.log(f"{email} Risk CLEAN · 进入 PENDING_BFS · 异步 OAuth/BFS", "info")
+                    self._schedule_enrich(
+                        email=email,
+                        sso=sso,
+                        sso_rw=sso_rw,
+                        success_id="",
+                        impersonate="chrome131",
+                        user_agent=ua,
+                        skip_token=False,
+                        risk_gated=True,
+                        proxy_lease=proxy_lease,
+                    )
+                    proxy_handed_off = proxy_lease is not None
+                    proxy_lease = None
+                    try:
+                        email_service.delete_email(email)
+                    except Exception:
+                        pass
+                    current_email = None
+                    if stopped_mid or self.stop_event.is_set():
+                        return
+                    continue
                 sid = self._record_success(
                     email=email,
                     sso=sso,
@@ -3270,7 +3450,8 @@ class RegisterEngine:
                         success_id=sid,
                         impersonate="chrome131",
                         user_agent=ua,
-                        skip_token=False,
+                        skip_token=True,
+                        risk_gated=False,
                         proxy_lease=proxy_lease,
                     )
                     proxy_handed_off = proxy_lease is not None
@@ -3730,11 +3911,10 @@ class RegisterEngine:
                                 "error",
                             )
 
-                        # 关键提速：SSO 到手立刻计成功并开下一号；
-                        # device flow / 协议 / NSFW 全部丢后台，不堵注册主路径。
+                        # protocol 始终是 UNCHECKED：不进行 OAuth/BFS，仅后台处理协议/NSFW。
                         self.log(
                             f"{email} 已拿到 SSO（{'已落盘' if sso_saved else '落盘失败'}），"
-                            f"立即记成功，device flow/协议后台处理…",
+                            f"立即记为 UNCHECKED，协议/NSFW 后台处理…",
                             "info",
                         )
                         sid = self._record_success(
@@ -3755,6 +3935,8 @@ class RegisterEngine:
                                 success_id=sid,
                                 impersonate=impersonate_fingerprint,
                                 user_agent=account_user_agent,
+                                skip_token=True,
+                                risk_gated=False,
                                 proxy_lease=proxy_lease,
                             )
                             proxy_handed_off = True
@@ -4166,6 +4348,8 @@ class RegisterEngine:
             self.clean_count = 0
             self.marked_count = 0
             self.unchecked_count = 0
+            self.pending_bfs_count = 0
+            self.oauth_infra_streak = 0
             self.attempt_count = 0
             self.email_create_count = 0
             self.bot_retry_count = 0
@@ -4191,6 +4375,7 @@ class RegisterEngine:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             prefix = "grok_ss" if reg_mode == "same_session" else "grok"
             self.output_file = f"keys/{prefix}_{timestamp}_{target}.txt"
+            self._classification_store = ClassificationStore(_BASE_DIR / self.output_file)
             self.log(
                 "账号 Risk 检测: "
                 + ("已启用" if self.risk_check_enabled else "已关闭（成功号记为 UNCHECKED）"),

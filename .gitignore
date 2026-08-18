@@ -45,6 +45,8 @@ converted_auth/
 # 代理/个人清单（若本地存在）
 data/proxy_pool.json
 data/domain_pool.json
+data/asn_blacklist.json
+data/bfs_scans/
 proxies/
 proxies*.txt
 *_proxy*.txt

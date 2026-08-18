@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from g.bfs_service import apply_bfs_metadata, inspect_token_bundle_bfs
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_INPUT_DIR = BASE_DIR / "register_sso"
@@ -157,7 +159,7 @@ def load_cpa_token(path: Path) -> dict[str, Any] | None:
         return None
     if not data.get("access_token") or not data.get("refresh_token"):
         return None
-    return {
+    token = {
         "access_token": data.get("access_token"),
         "refresh_token": data.get("refresh_token"),
         "id_token": data.get("id_token") or "",
@@ -165,6 +167,10 @@ def load_cpa_token(path: Path) -> dict[str, Any] | None:
         "expires_in": data.get("expires_in") or 21600,
         "expires_at": data.get("expired") or "",
     }
+    override = data.get("bfs_override")
+    if isinstance(override, dict):
+        token["bfs_override"] = dict(override)
+    return token
 
 
 def configure_network(proxy: str = "") -> str:
@@ -249,6 +255,7 @@ def build_cpa_record(
     token: dict[str, Any],
     *,
     email: str = "",
+    sso: str = "",
     disabled: bool = False,
 ) -> dict[str, Any]:
     access = str(token.get("access_token") or token.get("key") or "")
@@ -270,7 +277,7 @@ def build_cpa_record(
     )
     expires_in = int(token.get("expires_in") or 21600)
 
-    return {
+    record = {
         "type": "xai",
         "auth_kind": "oauth",
         "email": resolved_email,
@@ -288,6 +295,13 @@ def build_cpa_record(
         "disabled": bool(disabled),
         "headers": dict(GROK_BUILD_HEADERS),
     }
+    bfs = inspect_token_bundle_bfs(
+        access_token=access,
+        sso=sso,
+        id_token=id_token,
+        refresh_token=refresh,
+    )
+    return apply_bfs_metadata(record, bfs)
 
 
 def build_sub2api_account(
@@ -517,6 +531,8 @@ def main(argv: list[str] | None = None) -> int:
     cpa_skipped = 0
     cached_reused = 0
     failed_moved = 0
+    bfs_marked = 0
+    bfs_unknown = 0
     sub2_accounts: list[dict[str, Any]] = []
     sub2_path = (
         output_dir / "sub2api" / f"sub2api-grok-{stamp}.json"
@@ -526,6 +542,7 @@ def main(argv: list[str] | None = None) -> int:
 
     def save_result(result: dict[str, Any]) -> None:
         nonlocal success_count, cpa_written, cpa_skipped, cached_reused, failed_moved
+        nonlocal bfs_marked, bfs_unknown
         record: SSORecord = result["record"]
         if not result.get("ok"):
             error = result.get("error") or "unknown error"
@@ -549,17 +566,35 @@ def main(argv: list[str] | None = None) -> int:
         if result.get("cached"):
             cached_reused += 1
         token: dict[str, Any] = result["token"]
+        bfs = inspect_token_bundle_bfs(
+            access_token=str(token.get("access_token") or token.get("key") or ""),
+            sso=record.sso,
+            id_token=str(token.get("id_token") or ""),
+            refresh_token=str(token.get("refresh_token") or ""),
+        )
+        blocked_downstream = bool(bfs.get("has_bfs") or not bfs.get("ok"))
+        if bfs.get("has_bfs"):
+            bfs_marked += 1
+            print(f"  BFS 已标记，仅保留禁用 CPA: {record.email or record.source.name}", flush=True)
+        elif not bfs.get("ok"):
+            bfs_unknown += 1
+            print(f"  BFS 无法判定，仅保留禁用 CPA: {record.email or record.source.name}", flush=True)
         if args.format in ("cpa", "both"):
             target = cpa_path_for_record(output_dir, record)
             if write_private_json(
                 target,
-                build_cpa_record(token, email=record.email, disabled=args.disabled),
+                build_cpa_record(
+                    token,
+                    email=record.email,
+                    sso=record.sso,
+                    disabled=bool(args.disabled or blocked_downstream),
+                ),
                 overwrite=args.overwrite,
             ):
                 cpa_written += 1
             else:
                 cpa_skipped += 1
-        if sub2_path is not None:
+        if sub2_path is not None and not blocked_downstream:
             sub2_accounts.append(
                 build_sub2api_account(
                     token,
@@ -640,6 +675,8 @@ def main(argv: list[str] | None = None) -> int:
         "cpa_skipped_existing": cpa_skipped,
         "cached_reused": cached_reused,
         "failed_moved": failed_moved,
+        "bfs_marked": bfs_marked,
+        "bfs_unknown": bfs_unknown,
         "failed_dir": str(failed_dir),
         "workers": args.workers,
         "sub2api_file": str(sub2_path) if sub2_accounts and sub2_path else None,

@@ -23,6 +23,8 @@ from typing import Any, Callable, Iterable
 
 import requests
 
+from g.bfs_service import inspect_token_bundle_bfs, token_fingerprint
+
 try:
     from filelock import FileLock
 except Exception:  # pragma: no cover - dependency is installed in production
@@ -873,7 +875,23 @@ class ImportJobManager:
                 account_targets = [x for x in selected if x in requested_set]
             else:
                 account_targets = list(selected)
-            if clean is not True and not allow_marked:
+            override_allowed = False
+            raw_token = raw.get("auth_token") if isinstance(raw.get("auth_token"), dict) else None
+            if allow_marked and raw_token and str(raw.get("risk_status") or "") != "risk_marked":
+                info = inspect_token_bundle_bfs(
+                    access_token=str(raw_token.get("access_token") or raw_token.get("key") or ""),
+                    id_token=str(raw_token.get("id_token") or ""),
+                    refresh_token=str(raw_token.get("refresh_token") or ""),
+                    sso=sso,
+                )
+                fingerprint = token_fingerprint(str(raw_token.get("access_token") or raw_token.get("key") or ""))
+                override = raw.get("bfs_override") if isinstance(raw.get("bfs_override"), dict) else {}
+                override_allowed = bool(
+                    (info.get("has_bfs") or not info.get("ok"))
+                    and fingerprint
+                    and override.get("token_fingerprint") == fingerprint
+                )
+            if clean is not True and not override_allowed:
                 account_targets = [x for x in account_targets if x in ("grok2api_web", "grok2api_console")]
             if not account_targets:
                 continue
@@ -883,6 +901,12 @@ class ImportJobManager:
                 "sso": sso,
                 "auth_token": raw.get("auth_token") if isinstance(raw.get("auth_token"), dict) else None,
                 "clean": clean,
+                "risk_status": str(raw.get("risk_status") or ""),
+                "bfs_override_fingerprint": str(
+                    raw.get("bfs_override_fingerprint")
+                    or ((raw.get("bfs_override") or {}).get("token_fingerprint") if isinstance(raw.get("bfs_override"), dict) else "")
+                    or ""
+                ),
                 "targets": account_targets,
             })
         if not normalized:
@@ -1030,6 +1054,9 @@ class ImportJobManager:
         token = account.get("auth_token") if isinstance(account.get("auth_token"), dict) else None
         force = bool(job.get("force_refresh"))
         if token and is_auth_token_usable(token) and not force:
+            override = token.get("bfs_override")
+            if isinstance(override, dict):
+                account["bfs_override_fingerprint"] = str(override.get("token_fingerprint") or "")
             return token, "registration-cache"
         # Reuse an existing valid CPA file before starting device flow.
         from convert_sso_json import SSORecord, cpa_path_for_record, load_cpa_token
@@ -1038,6 +1065,9 @@ class ImportJobManager:
         cpa_path = cpa_path_for_record(self.base_dir / "converted_auth", record)
         cached = load_cpa_token(cpa_path) if not force else None
         if cached and is_auth_token_usable(cached):
+            override = cached.get("bfs_override")
+            if isinstance(override, dict):
+                account["bfs_override_fingerprint"] = str(override.get("token_fingerprint") or "")
             return cached, "cpa-cache"
         # Multiple ordinary uploads may run concurrently, but xAI device flow
         # remains strictly serial to avoid approval/rate-limit collisions.
@@ -1054,7 +1084,12 @@ class ImportJobManager:
         record = SSORecord(source=self.base_dir / "register_sso" / "unknown.json", email=account["email"], sso=account["sso"], session_id=account["id"])
         output_dir = self.base_dir / "converted_auth"
         path = cpa_path_for_record(output_dir, record)
-        auth = build_cpa_record(token, email=account["email"])
+        auth = build_cpa_record(
+            token,
+            email=account["email"],
+            sso=account["sso"],
+            disabled=bool(account.get("_bfs_blocked")),
+        )
         written = not path.exists() or load_cpa_token(path) is None or bool(job.get("force_refresh"))
         if written:
             _atomic_json(path, auth)
@@ -1076,6 +1111,21 @@ class ImportJobManager:
 
     def _run_target(self, target: str, account: dict, token: dict | None, auth: dict | None, job: dict, register_proxy: str) -> tuple[dict, dict | None, dict | None]:
         cfg = job["config_snapshot"]
+        if account.get("_bfs_blocked"):
+            path = Path(cfg["paths"]["cpa_dir"]) / "blocked.json"
+            if token is not None and auth is None:
+                auth, path = self._write_cpa(account, token, job)
+            if target == "cpa_local" and auth is not None:
+                return {
+                    "ok": True,
+                    "path": str(path),
+                    "written": bool(auth.pop("_written", False)),
+                    "disabled": True,
+                    "bfs_status": account.get("_bfs_status"),
+                }, token, auth
+            raise RuntimeError(
+                f"BFS {account.get('_bfs_status') or 'blocked'}：只保留本地禁用 CPA，禁止下游导入"
+            )
         if target == "sub2api":
             sub2 = cfg["services"]["sub2api"]
             # The legacy importer may fall back to local device flow, so keep
@@ -1130,11 +1180,36 @@ class ImportJobManager:
     def _process_account(self, job: dict, account: dict, register_proxy: str, order: dict[str, int]) -> None:
         token = account.get("auth_token") if isinstance(account.get("auth_token"), dict) else None
         auth = None
-        oauth_targets = {"cpa_local", "cpa_remote", "grok2api_build"}
+        oauth_targets = {
+            "sub2api",
+            "cpa_local",
+            "cpa_remote",
+            "grok2api_local",
+            "grok2api_build",
+            "grok2api_jiujiu",
+        }
         if oauth_targets.intersection(account["targets"]):
             token, reason = self._token_for(account, job)
             account["_oauth_attempted"] = True
             account["_oauth_error"] = "" if token is not None else reason
+        if isinstance(token, dict):
+            bfs = inspect_token_bundle_bfs(
+                access_token=str(token.get("access_token") or token.get("key") or ""),
+                id_token=str(token.get("id_token") or ""),
+                refresh_token=str(token.get("refresh_token") or ""),
+                sso=account["sso"],
+            )
+            blocked = bool(bfs.get("has_bfs") or not bfs.get("ok"))
+            fingerprint = token_fingerprint(str(token.get("access_token") or token.get("key") or ""))
+            override_ok = bool(
+                blocked
+                and fingerprint
+                and account.get("bfs_override_fingerprint") == fingerprint
+                and account.get("risk_status") != "risk_marked"
+            )
+            if blocked and not override_ok:
+                account["_bfs_blocked"] = True
+                account["_bfs_status"] = "flagged" if bfs.get("has_bfs") else "unknown"
         for target in sorted(account["targets"], key=lambda x: order.get(x, 999)):
             if job.get("cancel_requested"):
                 self._set_target(job, account["id"], target, "skipped", "任务已取消")

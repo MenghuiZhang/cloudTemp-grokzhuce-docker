@@ -246,6 +246,7 @@ class ProxyPool:
             "health_message": "尚未测试",
             "egress_ip": "",
             "egress_cc": "",
+            "egress_asn": "",
             "region": "",
             "timezone": "",
             "tested_at": "",
@@ -510,7 +511,7 @@ class ProxyPool:
                 continue
             rt = self._runtime.setdefault(item["id"], self._new_runtime())
             cap = int(item.get("max_concurrency") or default_cap)
-            if rt["cooldown_until"] > now or rt["in_use"] >= cap or rt["health"] in ("unhealthy", "testing"):
+            if rt["cooldown_until"] > now or rt["in_use"] >= cap or rt["health"] in ("unhealthy", "testing", "blocked_asn"):
                 continue
             out.append(item)
         return out
@@ -659,10 +660,11 @@ class ProxyPool:
             if rt is None:
                 return
             ok = bool(result.get("ok"))
-            rt["health"] = "healthy" if ok else "unhealthy"
+            rt["health"] = "healthy" if ok else ("blocked_asn" if result.get("blocked_asn") else "unhealthy")
             rt["health_message"] = str(result.get("message") or result.get("error") or "")[:160]
             rt["egress_ip"] = str(result.get("egress_ip") or result.get("ip") or "")
             rt["egress_cc"] = str(result.get("egress_cc") or result.get("cc") or "").upper()
+            rt["egress_asn"] = str(result.get("egress_asn") or result.get("asn") or "")
             rt["region"] = str(result.get("egress_region") or result.get("region") or result.get("country") or "")
             rt["timezone"] = str(result.get("egress_timezone") or result.get("timezone") or "")
             rt["tested_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -674,6 +676,39 @@ class ProxyPool:
                 idx = min(rt["network_failures"] - 1, len(COOLDOWN_SECONDS) - 1)
                 rt["cooldown_until"] = time.time() + COOLDOWN_SECONDS[idx]
             self._cv.notify_all()
+
+    def block_known_asn(self, asn: Any) -> int:
+        digits = re.sub(r"\D", "", str(asn or ""))
+        if not digits:
+            return 0
+        changed = 0
+        with self._cv:
+            for rt in self._runtime.values():
+                if re.sub(r"\D", "", str(rt.get("egress_asn") or "")) != digits:
+                    continue
+                if rt.get("health") != "blocked_asn":
+                    changed += 1
+                rt["health"] = "blocked_asn"
+                rt["health_message"] = f"AS{digits} 已列入黑名单"
+            self._cv.notify_all()
+        return changed
+
+    def unblock_known_asn(self, asn: Any) -> int:
+        digits = re.sub(r"\D", "", str(asn or ""))
+        if not digits:
+            return 0
+        changed = 0
+        with self._cv:
+            for rt in self._runtime.values():
+                if (
+                    re.sub(r"\D", "", str(rt.get("egress_asn") or "")) == digits
+                    and rt.get("health") == "blocked_asn"
+                ):
+                    rt["health"] = "untested"
+                    rt["health_message"] = "ASN 规则已移除，等待重新预检"
+                    changed += 1
+            self._cv.notify_all()
+        return changed
 
     def begin_health_check(self, ids: Iterable[str] | None = None) -> list[str]:
         with self._cv:
@@ -718,6 +753,7 @@ class ProxyPool:
                 "region": str(rt.get("region") or ""),
                 "timezone": str(rt.get("timezone") or ""),
                 "ip": str(rt.get("egress_ip") or ""),
+                "asn": str(rt.get("egress_asn") or ""),
             }
 
     def lease_audit(self, lease: ProxyLease | None) -> dict[str, Any]:

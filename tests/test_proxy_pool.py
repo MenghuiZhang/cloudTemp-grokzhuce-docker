@@ -50,6 +50,19 @@ class ProxyParserTests(unittest.TestCase):
 
 
 class ProxyPoolTests(unittest.TestCase):
+    def test_new_asn_rule_blocks_only_future_leases(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pool = ProxyPool(Path(temp) / "pool.json")
+            pool.import_text("proxy.example:8080")
+            proxy_id = pool.list_public()["items"][0]["id"]
+            pool.set_health(proxy_id, {"ok": True, "egress_ip": "192.0.2.10", "egress_asn": "AS64500"})
+            active = pool.acquire("active", wait=False)
+            self.assertIsNotNone(active)
+            pool.block_known_asn("AS64500")
+            self.assertEqual(pool.list_public()["items"][0]["health"], "blocked_asn")
+            self.assertIsNone(pool.acquire("new", wait=False))
+            pool.release(active, "neutral")
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name) / "proxy_pool.json"

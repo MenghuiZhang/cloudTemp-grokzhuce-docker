@@ -38,8 +38,13 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN python -m venv "$VIRTUAL_ENV" \
     && python -m pip install --upgrade pip \
-    && python -m pip install -r requirements.txt \
-    && python -m camoufox fetch
+    && python -m pip install -r requirements.txt
+
+# Keep the large browser download in its own cacheable layer. Camoufox 0.5.x
+# may return success when every release mirror is rate-limited, so verify the
+# resulting installation explicitly instead of publishing a browserless image.
+RUN python -m camoufox fetch \
+    && python -m camoufox version | grep -Eq 'Installed[[:space:]]+Yes'
 
 COPY . .
 

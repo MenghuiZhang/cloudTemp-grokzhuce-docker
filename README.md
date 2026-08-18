@@ -9,8 +9,10 @@ Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Cas
 - Cloudflare Temp 多基础域名顺序轮替、失败切域、冷却与随机子域
 - 本地 Camoufox Turnstile Solver（也可接 YesCaptcha）
 - 多线程并发；主流程 / Risk·Token·NSFW 双栏日志
-- 运行面板可按批次关闭账号 Risk 检测（默认开启）；未检测账号独立标记为 `UNCHECKED`
-- 进度按注册成功数计；CLEAN / UNCHECKED / MARKED / 创邮次数分开展示（数量 = 创邮次数停批）
+- Risk 开启时按 `Risk → PENDING_BFS → OAuth/BFS` 分类，批次目标按最终 `CLEAN` 数计
+- Risk 关闭时不执行 Risk、OAuth 或 BFS，账号归入 `UNCHECKED`，批次目标按成功 SSO 数计
+- 统一互斥分类文件：`*_clean.txt` / `*_marked.txt` / `*_unchecked.txt` / `*_infra_retry.txt`
+- 代理出口 ASN 预检、手动永久黑名单，以及 Risk MARKED 的 24 小时自动学习
 - 独立导入中心：最近成功 / Keys / 注册 JSON / 上传文件，多目标预览、后台任务和失败重试
 - CPA/OIDC 本地生成与 CLIProxyAPI 上传；grok2api 本地池、chenyme Web/Console/Build、jiujiu 兼容
 - 每个下游独立测试、代理和自动导入开关；默认全部关闭
@@ -131,6 +133,8 @@ cp .env.example .env
 | `UI_HOST` / `UI_PORT` | Web 监听 | `127.0.0.1` / `3333` |
 | `data/proxy_pool.json` | 注册代理池的本地私密存储；由 `/proxy-settings` 管理，不提交 Git | 空池（直连） |
 | `data/domain_pool.json` | Cloudflare Temp 基础域名状态、Bot 复验和审计记录；不提交 Git | 从现有域名配置迁移 |
+| `MONITOR_TOKEN` | BFS/ASN 运维 API 的 Bearer / `X-Monitor-Token` | 必须显式配置 |
+| `data/asn_blacklist.json` | 手动/自动 ASN 黑名单及 Risk 样本；`0600` | 空 |
 | `SUB2API_URL` | 旧版 sub2api 根地址；首次进入导入中心时用于迁移 | `http://127.0.0.1:9898` |
 | `SUB2API_GROK_GROUP_NAME` | 导入目标分组**名称**（按名称解析 ID） | `grok` |
 | `SUB2API_GROK_GROUP_ID` | 可选缓存；运行时会按名称回写 | 空 |
@@ -150,7 +154,9 @@ cp .env.example .env
 - 默认**不**自动导入；服务测试通过后，可在导入中心按目标开启注册后自动导入。
 - 导入配置和写入型密钥保存在 `data/import_services.json`，API 只返回掩码；旧版
   `converted_auth/import_services.json` 会在首次读取时自动迁移且保留原文件。
-- Token 换票 / 协议 / NSFW 在成功后异步后台跑，不堵注册主路径。
+- Risk CLEAN 后先异步换票并检查 JWT `bfs` claim；只有 BFS CLEAN 才计入成功和下游导入。
+- JWT 中只要存在 `bfs` key（包括 `bfs: 0`）就是 MARKED；已取得但无法解码的 token 按 BFS UNKNOWN 处理。
+- BFS MARKED/UNKNOWN 的 CPA 仅保留在本地且强制 `disabled=true`，不进入任何下游。
 
 ## 使用
 
@@ -185,9 +191,9 @@ python start.py
 
 same_session 建议并发先 **1～2**（注册浏览器 + Solver 双开）。
 
-关闭“启用账号 Risk 检测”只会跳过 SSO 到手后的账号风险判定；
-Turnstile 和 Castle 仍是注册必需步骤。`UNCHECKED` 会正常落盘并继续 token / TOS / NSFW 收尾，
-但不会自动导入 Sub2API、CPA 或 Build；需在导入中心手动选择“覆盖风控限制”。
+关闭“启用账号 Risk 检测”后，Turnstile 和 Castle 仍作为注册必需步骤，
+但 SSO 到手后不再执行 Risk、OAuth 或 BFS。`UNCHECKED` 只能进入 SSO Web/Console 目标，
+不能手动升级为 CPA、Sub2API 或 Build 等 OAuth 目标。
 
 ### 3. 导入服务中心
 
@@ -251,6 +257,39 @@ SSO cookie 不能直接作为 CPA OAuth 凭证；正常转换会访问 xAI 完�
 遇到 `rate_limited` 时可将 `--workers` 降为 `4`；如需忽略已有 CPA 缓存并重新换票，
 使用 `--refresh-existing --overwrite`。换票返回 `invalid_grant: Access denied` 时，
 原始账号 JSON 会自动移入 `register_sso/失败/`；可用 `--failed-dir` 指定其他目录。
+
+### 7. 历史 CPA BFS 扫描
+
+必须先预览，再对指定报告 apply；报告不包含 token：
+
+```bash
+python scan_bfs_auth.py preview
+python scan_bfs_auth.py apply data/bfs_scans/bfs-scan-YYYYMMDD_HHMMSS-xxxxxxxx.json
+```
+
+Apply 只更新 CPA JSON 的 BFS 元数据和 `disabled`，不改写历史批次 TXT。经人工复核后，
+可对 BFS MARKED/UNKNOWN 文件执行与当前 token SHA-256 绑定的放行：
+
+```bash
+python scan_bfs_auth.py override converted_auth/cpa/xai-example.json --reason "manual review"
+```
+
+Risk MARKED 不允许这种放行；token 更换后旧指纹自动失效。
+
+### 8. ASN 黑名单
+
+网页首页可查看和维护 ASN 黑名单，也可以使用命令行：
+
+```bash
+python asn_blacklist_cli.py list
+python asn_blacklist_cli.py add AS64500 --note "manual review"
+python asn_blacklist_cli.py remove AS64500
+```
+
+手动项永久有效，直到明确删除。自动项只由 Risk MARKED 样本学习：同一 ASN 在 24 小时内
+出现 5 个不同出口 IP 后进入黑名单，24 小时后自动过期；BFS 结果不会参与 ASN 学习。
+静态代理命中后标记为 `blocked_asn`，动态代理会更换会话并重查；ASN 查询失败时保守阻断，
+不会静默回退到直连。
 
 ## 测试
 

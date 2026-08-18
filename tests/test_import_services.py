@@ -1,3 +1,4 @@
+import base64
 import json
 import tempfile
 import time
@@ -186,10 +187,13 @@ class ImportJobManagerTests(unittest.TestCase):
             targets = ImportTargets(root, store)
             targets.upload_cpa = Mock(return_value={"ok": True})
             targets.import_chenyme_build = Mock(return_value={"ok": True, "created": 1})
+            payload = base64.urlsafe_b64encode(
+                json.dumps({"sub": "test-user"}).encode()
+            ).decode().rstrip("=")
             exchanger = Mock(return_value={
                 "ok": True,
                 "token": {
-                    "access_token": "header.payload.signature",
+                    "access_token": f"header.{payload}.signature",
                     "refresh_token": "refresh",
                     "expires_in": 3600,
                 },

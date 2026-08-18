@@ -4,12 +4,14 @@ Grok 注册机 Web 控制台
 浏览器打开 http://127.0.0.1:3333
 """
 import json
+import hmac
 import os
 import re
 import threading
 import time
 import uuid
 import concurrent.futures
+from functools import wraps
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -45,13 +47,17 @@ from g.proxy_pool import (
     parse_proxy_lines,
 )
 from g.domain_pool import DomainPoolError, get_domain_pool
+from g.asn_blacklist import AsnBlacklistStore
+from g.bfs_scan_service import apply_scan_report, preview_scan, set_token_bound_override
 import solver_manager
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 proxy_pool = get_proxy_pool(BASE_DIR)
+asn_blacklist = AsnBlacklistStore(BASE_DIR / "data" / "asn_blacklist.json")
 
 load_dotenv(ENV_PATH)
+MONITOR_TOKEN = str(os.getenv("MONITOR_TOKEN") or "").strip()
 domain_pool = get_domain_pool(BASE_DIR)
 try:
     domain_pool.sync_configured(
@@ -62,6 +68,21 @@ except Exception:
 enforce_storage_limits(BASE_DIR)
 
 app = Flask(__name__, template_folder=str(BASE_DIR / "templates"), static_folder=str(BASE_DIR / "static"))
+
+
+def require_monitor_token(fn):
+    """Fail-closed authentication for newly added operational endpoints."""
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if not MONITOR_TOKEN:
+            return jsonify({"ok": False, "message": "MONITOR_TOKEN 未配置"}), 503
+        authorization = str(request.headers.get("Authorization") or "")
+        supplied = authorization[7:].strip() if authorization.lower().startswith("bearer ") else ""
+        supplied = supplied or str(request.headers.get("X-Monitor-Token") or "").strip()
+        if not supplied or not hmac.compare_digest(supplied, MONITOR_TOKEN):
+            return jsonify({"ok": False, "message": "unauthorized"}), 401
+        return fn(*args, **kwargs)
+    return wrapped
 
 # 主流程日志（建邮/camoufox/castle/发码/signup/SSO…）
 logs = LogBuffer(maxlen=3000)
@@ -3462,6 +3483,31 @@ def _probe_register_proxy(raw: str, timeout: float = 12.0) -> dict:
 
     result["ms"] = round((_time.time() - t0) * 1000)
 
+    if result.get("egress_ok"):
+        asn = str(result.get("egress_asn") or "").strip()
+        if not asn:
+            result.update(
+                ok=False,
+                blocked_asn=True,
+                asn_reason="lookup_failed",
+                error="ASN 查询失败",
+                message=f"出口 {result.get('egress_ip') or '未知'} 的 ASN 无法确认，本次预检已阻止",
+            )
+            return result
+        try:
+            blocked, detail = asn_blacklist.is_blocked(asn)
+        except ValueError:
+            blocked, detail = True, {"source": "lookup_failed"}
+        if blocked:
+            result.update(
+                ok=False,
+                blocked_asn=True,
+                asn_reason=detail.get("source") or "blacklist",
+                error="出口 ASN 已屏蔽",
+                message=f"出口 {result.get('egress_ip')} · {asn} 命中 ASN 黑名单，已阻止",
+            )
+            return result
+
     # 拼展示文案：出口 + xAI
     eg_part = ""
     if result.get("egress_ok") and result.get("egress_label"):
@@ -3495,6 +3541,20 @@ def _probe_register_proxy(raw: str, timeout: float = 12.0) -> dict:
     return result
 
 
+def _probe_saved_proxy(proxy_id: str, *, timeout: float = 12.0) -> dict:
+    template = proxy_pool.secret_spec(proxy_id)
+    attempts = 3 if ("{session}" in template or "{account}" in template) else 1
+    result: dict = {"ok": False, "error": "未执行预检"}
+    for _ in range(attempts):
+        probe_spec = expand_proxy_template(
+            template, account="health-check", session=uuid.uuid4().hex[:16]
+        )
+        result = _probe_register_proxy(probe_spec, timeout=timeout)
+        if not result.get("blocked_asn"):
+            break
+    return result
+
+
 @app.post("/api/proxy/test")
 def proxy_test():
     """
@@ -3520,6 +3580,92 @@ def proxy_test():
         pass
     code = 200 if result.get("ok") else 502
     return jsonify(result), code
+
+
+@app.get("/api/asn-blacklist")
+@require_monitor_token
+def asn_blacklist_list():
+    return jsonify({"ok": True, **asn_blacklist.public()})
+
+
+@app.post("/api/asn-blacklist")
+@require_monitor_token
+def asn_blacklist_add():
+    body = request.get_json(silent=True) or {}
+    try:
+        item = asn_blacklist.add_manual(body.get("asn"), str(body.get("note") or ""))
+        proxy_pool.block_known_asn(item["asn"])
+        return jsonify({"ok": True, "item": item, **asn_blacklist.public()}), 201
+    except ValueError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.delete("/api/asn-blacklist/<asn>")
+@require_monitor_token
+def asn_blacklist_delete(asn: str):
+    try:
+        removed = asn_blacklist.remove(asn)
+        if removed:
+            proxy_pool.unblock_known_asn(asn)
+        return jsonify({"ok": True, "removed": removed, **asn_blacklist.public()})
+    except ValueError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.post("/api/bfs-scan/preview")
+@require_monitor_token
+def bfs_scan_preview():
+    report = preview_scan(
+        [BASE_DIR / "converted_auth" / "cpa"],
+        BASE_DIR / "data" / "bfs_scans",
+    )
+    # Service output is redacted by construction; expose only basename for apply.
+    report["report"] = Path(report.pop("report_path")).name
+    report["items"] = [
+        {**{k: v for k, v in item.items() if k != "path"}, "file": Path(str(item.get("path") or "")).name}
+        for item in report.get("items") or []
+    ]
+    return jsonify({"ok": True, **report}), 201
+
+
+def _safe_bfs_report(name: str) -> Path:
+    if not name or Path(name).name != name or not name.startswith("bfs-scan-") or not name.endswith(".json"):
+        raise ValueError("报告名无效")
+    return BASE_DIR / "data" / "bfs_scans" / name
+
+
+@app.post("/api/bfs-scan/apply")
+@require_monitor_token
+def bfs_scan_apply():
+    body = request.get_json(silent=True) or {}
+    try:
+        result = apply_scan_report(_safe_bfs_report(str(body.get("report") or "")))
+        result["report"] = Path(result.pop("report_path")).name
+        return jsonify(result)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.post("/api/bfs-scan/override")
+@require_monitor_token
+def bfs_scan_override():
+    body = request.get_json(silent=True) or {}
+    filename = str(body.get("file") or "")
+    if not filename or Path(filename).name != filename or not filename.endswith(".json"):
+        return jsonify({"ok": False, "message": "文件名无效"}), 400
+    try:
+        result = set_token_bound_override(
+            BASE_DIR / "converted_auth" / "cpa" / filename,
+            reason=str(body.get("reason") or "manual review"),
+        )
+        return jsonify({
+            "ok": True,
+            "file": Path(result["path"]).name,
+            "status": result["status"],
+            "token_fingerprint": result["token_fingerprint"],
+        })
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
 
 
 @app.get("/api/proxies")
@@ -3649,10 +3795,7 @@ def proxy_pool_test_many():
 
     def _one(proxy_id: str) -> dict:
         try:
-            probe_spec = expand_proxy_template(
-                proxy_pool.secret_spec(proxy_id), account="health-check", session=uuid.uuid4().hex[:16]
-            )
-            result = _probe_register_proxy(probe_spec, timeout=12)
+            result = _probe_saved_proxy(proxy_id, timeout=12)
             proxy_pool.set_health(proxy_id, result)
             return {
                 "id": proxy_id,
@@ -3694,10 +3837,7 @@ def proxy_pool_bulk():
 
     def _test_and_enable(proxy_id: str) -> dict:
         try:
-            probe_spec = expand_proxy_template(
-                proxy_pool.secret_spec(proxy_id), account="health-check", session=uuid.uuid4().hex[:16]
-            )
-            result = _probe_register_proxy(probe_spec, timeout=12)
+            result = _probe_saved_proxy(proxy_id, timeout=12)
             proxy_pool.set_health(proxy_id, result)
             if not result.get("ok"):
                 return {"id": proxy_id, "ok": False, "message": result.get("message") or result.get("error") or "测试失败"}
@@ -3761,10 +3901,7 @@ def _start_proxy_pool_health_checks(selected_ids: list[str] | None = None) -> in
                     if stop_event.is_set():
                         return False
                     try:
-                        probe_spec = expand_proxy_template(
-                            proxy_pool.secret_spec(proxy_id), account="health-check", session=uuid.uuid4().hex[:16]
-                        )
-                        result = _probe_register_proxy(probe_spec, timeout=12)
+                        result = _probe_saved_proxy(proxy_id, timeout=12)
                     except Exception as exc:
                         result = {"ok": False, "error": str(exc)}
                     proxy_pool.set_health(proxy_id, result)

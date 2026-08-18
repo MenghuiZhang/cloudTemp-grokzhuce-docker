@@ -24,6 +24,8 @@ class RegisterEngineAccountJsonTests(unittest.TestCase):
             self.assertTrue(success_id)
             account_path = Path(tmp) / "grok_ss_test_1_accounts.json"
             accounts = json.loads(account_path.read_text(encoding="utf-8"))
+            self.assertEqual(output.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(account_path.stat().st_mode & 0o777, 0o600)
             self.assertEqual(
                 accounts,
                 [
@@ -105,6 +107,10 @@ class RegisterEngineAccountJsonTests(unittest.TestCase):
             self.assertEqual(
                 (Path(tmp) / "result_unchecked.txt").read_text(encoding="utf-8"),
                 "unchecked@example.com----unchecked-sso\n",
+            )
+            self.assertEqual(
+                (Path(tmp) / "result_unchecked.txt").stat().st_mode & 0o777,
+                0o600,
             )
 
     def test_clean_success_is_not_written_to_unchecked_file(self):
