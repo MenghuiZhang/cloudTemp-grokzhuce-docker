@@ -3,12 +3,13 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from g.account_check import (AccountChecker, CheckRegistry, DEFAULTS, STATES, chat_url,
@@ -17,6 +18,15 @@ from g.bfs_service import atomic_write_json, token_fingerprint
 from g.classification_store import ClassificationStore
 
 SOURCE_DIRS = {"keys": "keys", "register_sso": "register_sso", "cpa": "converted_auth/cpa", "accounts": "keys"}
+
+
+def account_check_delay_seconds(raw=None) -> int:
+    value = raw if raw is not None else os.getenv("GROK_ACCOUNT_CHECK_DELAY_SECONDS", "60")
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        seconds = 60
+    return max(0, min(seconds, 3600))
 
 
 def record_rows(payload):
@@ -47,42 +57,302 @@ def parse_accounts(text: str, json_format: bool) -> list[dict]:
 
 
 class CheckJobs:
-    def __init__(self, base_dir, checker=None, *, recent=None, apply_recent=None, file_lock=None, proxy_pool=None):
+    def __init__(self, base_dir, checker=None, *, recent=None, apply_recent=None,
+                 registration_result=None, file_lock=None, proxy_pool=None,
+                 delay_seconds=None, clock=None):
         self.base = Path(base_dir).resolve()
         self.directory = self.base / "data" / "account_checks"
+        self.pending_directory = self.base / "data" / "account_check_pending"
         self.config_path = self.base / "data" / "account_checks_config.json"
         self.registry = CheckRegistry(self.base)
         self.checker = checker or AccountChecker()
         self.recent = recent or (lambda: [])
         self.apply_recent = apply_recent or (lambda account, result: None)
+        self.registration_result = registration_result or (lambda account, result: None)
         self.file_lock = file_lock or threading.RLock()
         self.proxy_pool = proxy_pool
+        self.delay_seconds = account_check_delay_seconds(delay_seconds)
+        self.clock = clock or time.time
         self.lock = threading.RLock()
         self.slots = threading.BoundedSemaphore(2)
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="account-check-jobs")
+        self.delayed_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="account-check-delayed")
         self.jobs = {}
         self.cancels = {}
         self.previews = {}
         self.cooldowns = {}
+        self._scheduler_stop = threading.Event()
+        self._scheduler_wake = threading.Event()
+        self._scheduler_thread = None
+        self._scheduled_inflight = set()
         self._load()
 
     def _load(self):
         if not self.directory.exists():
             return
+        resume_scheduled = False
+        interrupted = []
+        resume_results = []
+        uncertain_applications = []
         for path in self.directory.glob("*.json"):
             try:
                 row = json.loads(path.read_text(encoding="utf-8"))
-                if row.get("status") in ("running", "queued", "cancelling"):
+                delayed = bool(row.get("delayed_registration"))
+                status = row.get("status")
+                if delayed and status == "scheduled":
+                    self.cancels[row["id"]] = threading.Event()
+                    resume_scheduled = True
+                elif delayed and status == "running" and row.get("items"):
+                    # The chat response was already durably recorded. Resume
+                    # only local result application; never replay the request.
+                    row.update(status="result_ready", message="对话结果已恢复，等待应用")
+                    atomic_write_json(path, row)
+                    self.cancels[row["id"]] = threading.Event()
+                    resume_results.append(row)
+                elif delayed and status in ("running", "queued", "cancelling"):
+                    # The request may already have left the process and no
+                    # response was committed. Never replay it after a crash.
+                    self.cancels[row["id"]] = threading.Event()
+                    interrupted.append(row)
+                elif delayed and status == "result_ready":
+                    self.cancels[row["id"]] = threading.Event()
+                    resume_results.append(row)
+                elif delayed and status == "applying":
+                    # The callback may already have queued an import. Preserve
+                    # the real check result, but do not replay its side effects.
+                    uncertain_applications.append(row)
+                elif status in ("running", "queued", "cancelling", "scheduled"):
                     row.update(status="interrupted", finished_at=now())
                     atomic_write_json(path, row)
                 self.jobs[row["id"]] = row
             except (OSError, ValueError, KeyError):
                 continue
+        for job in interrupted:
+            self._finalize_interrupted_registration(job)
+        for job in resume_results:
+            self._apply_delayed_result(job["id"])
+        for job in uncertain_applications:
+            self._finalize_uncertain_application(job)
         self._prune()
+        if resume_scheduled:
+            self._ensure_scheduler()
+
+    def _pending_path(self, job_id):
+        return self.pending_directory / (str(job_id) + ".json")
+
+    def _write_pending_account(self, job_id, account):
+        atomic_write_json(self._pending_path(job_id), {"account": account})
+
+    def _read_pending_account(self, job_id):
+        path = self._pending_path(job_id)
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+            account = value.get("account") if isinstance(value, dict) else None
+            return account if isinstance(account, dict) else None
+        except (OSError, ValueError):
+            return None
+
+    def _remove_pending_account(self, job_id):
+        try:
+            self._pending_path(job_id).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _pending_row(self, account, *, state, reason):
+        fp = fingerprints(account)
+        return {
+            "email": masked_email(account.get("email")),
+            "fingerprint": fp[0][:16] if fp else "",
+            "state": state,
+            "reason": reason,
+            "checked_at": now(),
+            "_fingerprints": fp,
+            "_version": credential_version(account),
+            "_origin": None,
+            "applied": False,
+        }
+
+    def _finalize_interrupted_registration(self, job):
+        account = self._read_pending_account(job["id"])
+        if not account:
+            with self.lock:
+                job.update(status="failed", finished_at=now(), message="运行中断，且待检测凭据无法恢复")
+                self._persist(job)
+                self.cancels.pop(job["id"], None)
+            self._remove_pending_account(job["id"])
+            return
+        row = self._pending_row(account, state="infra_retry", reason="CHECK_INTERRUPTED")
+        with self.lock:
+            job["items"] = [row]
+            job["completed"] = 1
+            job["counts"] = {state: 0 for state in STATES}
+            job["counts"]["infra_retry"] = 1
+            job["status"] = "result_ready"
+            job["interrupted_request"] = True
+            job["message"] = "请求阶段中断，不重放对话"
+            self._persist(job)
+        self._apply_delayed_result(job["id"])
+
+    def _apply_delayed_result(self, job_id):
+        account = self._read_pending_account(job_id)
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if not job or job.get("status") != "result_ready":
+                return
+            row = job.get("items", [])[-1] if job.get("items") else None
+            if not account or not isinstance(row, dict):
+                job.update(status="failed", finished_at=now(), message="待应用的检测结果无法恢复")
+                self._persist(job)
+                self.cancels.pop(job_id, None)
+                self._scheduled_inflight.discard(job_id)
+                self._remove_pending_account(job_id)
+                return
+
+        errors = []
+        try:
+            self.registry.put(account, row)
+        except Exception:
+            errors.append("门禁状态保存失败")
+
+        # Persist before invoking the callback. If the process dies during the
+        # callback, startup sees ``applying`` and does not replay side effects.
+        with self.lock:
+            job["status"] = "applying"
+            job["application_started_at"] = now()
+            job["message"] = "正在应用延迟检测结果"
+            self._persist(job)
+        try:
+            self.registration_result(account, row)
+            row["applied"] = True
+        except Exception:
+            errors.append("结果应用失败")
+
+        with self.lock:
+            cancelled = bool(job.get("cancel_requested"))
+            interrupted = bool(job.get("interrupted_request"))
+            job["status"] = "interrupted" if interrupted else "cancelled" if cancelled else "completed"
+            job["message"] = "、".join(errors) if errors else (
+                "请求阶段中断，已按 INFRA_RETRY 收尾"
+                if interrupted else "延迟检测已取消"
+                if cancelled else "延迟对话检测完成"
+            )
+            job["finished_at"] = now()
+            self._persist(job)
+            self.cancels.pop(job_id, None)
+            self._scheduled_inflight.discard(job_id)
+        self._remove_pending_account(job_id)
+        self._scheduler_wake.set()
+
+    def _finalize_uncertain_application(self, job):
+        account = self._read_pending_account(job["id"])
+        row = job.get("items", [])[-1] if job.get("items") else None
+        registry_failed = False
+        if account and isinstance(row, dict):
+            try:
+                # Idempotent and safe to repeat; the external callback below is
+                # intentionally not repeated.
+                self.registry.put(account, row)
+            except Exception:
+                registry_failed = True
+        with self.lock:
+            job.update(
+                status="interrupted",
+                finished_at=now(),
+                message=("结果应用阶段中断；未重放副作用"
+                         + ("；门禁状态保存失败" if registry_failed else "")),
+            )
+            self._persist(job)
+            self.cancels.pop(job["id"], None)
+            self._scheduled_inflight.discard(job["id"])
+        self._remove_pending_account(job["id"])
+
+    def _ensure_scheduler(self):
+        with self.lock:
+            if self._scheduler_thread is not None and self._scheduler_thread.is_alive():
+                self._scheduler_wake.set()
+                return
+            self._scheduler_stop.clear()
+            self._scheduler_thread = threading.Thread(
+                target=self._scheduler_loop,
+                name="account-check-scheduler",
+                daemon=True,
+            )
+            thread = self._scheduler_thread
+        thread.start()
+
+    def _scheduler_loop(self):
+        while not self._scheduler_stop.is_set():
+            due_job = None
+            wait_for = None
+            with self.lock:
+                scheduled = [
+                    job for job in self.jobs.values()
+                    if job.get("delayed_registration")
+                    and job.get("status") == "scheduled"
+                    and job.get("id") not in self._scheduled_inflight
+                ]
+                if scheduled:
+                    job = min(scheduled, key=lambda item: float(item.get("scheduled_epoch") or 0))
+                    wait_for = max(0.0, float(job.get("scheduled_epoch") or 0) - float(self.clock()))
+                    if wait_for <= 0:
+                        due_job = str(job["id"])
+                        self._scheduled_inflight.add(due_job)
+            if due_job:
+                try:
+                    self.delayed_executor.submit(self._run_delayed_registration, due_job)
+                except RuntimeError:
+                    with self.lock:
+                        self._scheduled_inflight.discard(due_job)
+                continue
+            self._scheduler_wake.wait(timeout=wait_for if wait_for is not None else 3600)
+            self._scheduler_wake.clear()
+
+    def _run_delayed_registration(self, job_id):
+        account = self._read_pending_account(job_id)
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if not job or job.get("status") != "scheduled":
+                self._scheduled_inflight.discard(job_id)
+                return
+            if not account:
+                job.update(status="failed", finished_at=now(), message="待检测凭据无法恢复")
+                self._persist(job)
+                self._scheduled_inflight.discard(job_id)
+                self.cancels.pop(job_id, None)
+                self._remove_pending_account(job_id)
+                return
+            job.update(status="running", started_at=now(), attempt_started_at=now(),
+                       message="正在执行延迟对话检测")
+            job["counts"]["pending_check"] = 0
+            self._persist(job)
+        row = self._one(job, account, risk_prechecked=True, chat_once=True)
+        if row is None:
+            row = self._pending_row(account, state="unchecked", reason="CANCELLED")
+            with self.lock:
+                job["items"].append(row)
+                job["completed"] = 1
+                job["counts"]["unchecked"] = 1
+                self._persist(job)
+        with self.lock:
+            job["status"] = "result_ready"
+            job["message"] = "对话结果已持久化，等待应用"
+            self._persist(job)
+        self._apply_delayed_result(job_id)
+
+    def shutdown(self, wait=True):
+        self._scheduler_stop.set()
+        self._scheduler_wake.set()
+        thread = self._scheduler_thread
+        if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=2 if wait else 0)
+        self.executor.shutdown(wait=wait)
+        self.delayed_executor.shutdown(wait=wait)
 
     def _prune(self):
         # Only generated, completed report files are subject to retention.
-        finished = sorted((j for j in self.jobs.values() if j["status"] not in ("running", "queued", "cancelling")),
+        finished = sorted((j for j in self.jobs.values() if j["status"] not in (
+            "running", "queued", "cancelling", "scheduled", "result_ready", "applying"
+        )),
                           key=lambda j: j["created_at"], reverse=True)
         cutoff = time.time() - 30 * 86400
         for index, job in enumerate(finished):
@@ -90,6 +360,7 @@ class CheckJobs:
             created = datetime.fromisoformat(job["created_at"]).timestamp()
             if index >= 100 or created < cutoff:
                 path.unlink(missing_ok=True)
+                self._remove_pending_account(job["id"])
                 self.jobs.pop(job["id"], None)
 
     def config(self):
@@ -226,20 +497,53 @@ class CheckJobs:
                "completed": 0, "total": total, "counts": {s: 0 for s in STATES}, "items": [], "config": self.config()}
         self.jobs[job_id] = job
         self.cancels[job_id] = threading.Event()
-        self._persist(job)
+        try:
+            self._persist(job)
+        except Exception:
+            self.jobs.pop(job_id, None)
+            self.cancels.pop(job_id, None)
+            raise
         return job
 
     def cancel(self, job_id):
+        apply_now = False
         with self.lock:
             if job_id not in self.jobs:
                 raise KeyError("任务不存在")
             if job_id in self.cancels:
                 self.cancels[job_id].set()
-                self.jobs[job_id]["status"] = "cancelling"
-                self._persist(self.jobs[job_id])
-            return self.public(self.jobs[job_id])
+                job = self.jobs[job_id]
+                status = job.get("status")
+                if job.get("delayed_registration") and status == "scheduled":
+                    account = self._read_pending_account(job_id)
+                    if account:
+                        row = self._pending_row(account, state="unchecked", reason="CANCELLED")
+                        job["items"] = [row]
+                        job["completed"] = 1
+                        job["counts"] = {state: 0 for state in STATES}
+                        job["counts"]["unchecked"] = 1
+                        job.update(status="result_ready", cancel_requested=True,
+                                   message="延迟检测取消中")
+                        apply_now = True
+                    else:
+                        job.update(status="failed", finished_at=now(), message="取消时待检测凭据无法恢复")
+                        self.cancels.pop(job_id, None)
+                        self._remove_pending_account(job_id)
+                    self._scheduler_wake.set()
+                elif job.get("delayed_registration") and status in ("running", "result_ready", "applying"):
+                    job["cancel_requested"] = True
+                    job["message"] = "正在取消；不会再发起新的对话请求"
+                else:
+                    job["status"] = "cancelling"
+                self._persist(job)
+            result = self.public(self.jobs[job_id])
+        if apply_now:
+            self._apply_delayed_result(job_id)
+            with self.lock:
+                result = self.public(self.jobs[job_id])
+        return result
 
-    def _one(self, job, account, *, risk_prechecked=False):
+    def _one(self, job, account, *, risk_prechecked=False, chat_once=False):
         cancel = self.cancels[job["id"]]
         original = copy.deepcopy(account)
         lease = None
@@ -271,8 +575,13 @@ class CheckJobs:
                         else:
                             lease = self.proxy_pool.acquire("account-check", wait=False)
                             account["_proxy_spec"] = lease.spec if lease else ""
-                    result = self.checker.check(account, job["config"], passive=job["passive"],
-                                                risk_prechecked=risk_prechecked, cancel=cancel)
+                    if chat_once:
+                        result = self.checker.check_chat_once(
+                            account, job["config"], cancel=cancel
+                        )
+                    else:
+                        result = self.checker.check(account, job["config"], passive=job["passive"],
+                                                    risk_prechecked=risk_prechecked, cancel=cancel)
                 delay = (result.get("quality") or {}).get("retry_after")
                 if delay:
                     with self.lock:
@@ -328,25 +637,51 @@ class CheckJobs:
     def check_registration(self, account):
         if not self.config()["automatic"]:
             return {"state": "unchecked", "reason": "AUTO_CHECK_DISABLED", "checked_at": now()}
+        if not fingerprints(account):
+            return {"state": "unchecked", "reason": "MISSING_CREDENTIALS", "checked_at": now()}
+        scheduled_epoch = float(self.clock()) + self.delay_seconds
+        scheduled_for = datetime.fromtimestamp(scheduled_epoch, timezone.utc).isoformat(timespec="seconds")
         with self.lock:
             job = self._new_job(1, "automatic")
-            job["status"] = "running"
+            try:
+                job.update(
+                    status="scheduled",
+                    delayed_registration=True,
+                    scheduled_epoch=scheduled_epoch,
+                    scheduled_for=scheduled_for,
+                    message=f"等待 {self.delay_seconds} 秒后执行首次对话检测",
+                )
+                job["counts"]["pending_check"] = 1
+                self._write_pending_account(job["id"], copy.deepcopy(account))
+                self._persist(job)
+            except Exception:
+                job.update(status="failed", finished_at=now(), message="延迟检测任务持久化失败")
+                self.cancels.pop(job["id"], None)
+                self._remove_pending_account(job["id"])
+                try:
+                    self._persist(job)
+                except Exception:
+                    pass
+                raise
+        pending = {
+            "state": "pending_check",
+            "reason": "CHECK_PENDING",
+            "checked_at": now(),
+            "scheduled_for": scheduled_for,
+            "job_id": job["id"],
+        }
         try:
-            row = self._one(job, account, risk_prechecked=True)
-            if row is None:
-                row = {"state": "unchecked", "reason": "CANCELLED", "checked_at": now()}
-            self.registry.put(account, row)
-            row["applied"] = True
-            job["status"] = "completed"
-            return row
-        finally:
+            self.registry.put(account, pending)
+        except Exception:
             with self.lock:
-                job["finished_at"] = now()
-                if job["status"] == "running":
-                    job["status"] = "failed"
+                job.update(status="failed", finished_at=now(), message="PENDING_CHECK 门禁状态保存失败")
                 self._persist(job)
                 self.cancels.pop(job["id"], None)
-                self._prune()
+            self._remove_pending_account(job["id"])
+            raise
+        self._ensure_scheduler()
+        self._scheduler_wake.set()
+        return pending
 
     def record_registration_observation(self, account, result):
         """Record an early Risk/BFS rejection without starting a chat request."""
@@ -385,6 +720,8 @@ class CheckJobs:
             job = self.jobs.get(job_id)
             if not job:
                 raise KeyError("任务不存在")
+            if job.get("delayed_registration"):
+                raise ValueError("自动延迟检测结果由系统应用，不允许手动重放")
             if job["status"] not in ("completed", "cancelled", "interrupted"):
                 raise ValueError("任务尚未结束")
             changed = skipped = 0

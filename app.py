@@ -2085,7 +2085,8 @@ def _apply_recent_check(account: dict, result: dict) -> None:
         previous = item.get("risk_status") or "unchecked"
         state = result["state"]
         count_fields = {"clean": "clean_count", "marked": "marked_count", "review": "review_count",
-                        "infra_retry": "infra_retry_count", "unchecked": "unchecked_count"}
+                        "infra_retry": "infra_retry_count", "unchecked": "unchecked_count",
+                        "pending_check": "pending_check_count"}
         if previous != state:
             old_field, new_field = count_fields.get(previous), count_fields.get(state)
             if old_field:
@@ -2105,12 +2106,23 @@ def _apply_recent_check(account: dict, result: dict) -> None:
             records = json.loads(path.read_text(encoding="utf-8"))
             for record in records:
                 if record.get("sso_token") == item.get("sso"):
-                    record.update(account_check=item["account_check"], risk_status=state, clean=state == "clean")
+                    record.update(
+                        account_check=item["account_check"],
+                        risk_status=state,
+                        clean=True if state == "clean" else False if state == "marked" else None,
+                    )
             atomic_write_json(path, records)
 
 
-ACCOUNT_CHECKS = CheckJobs(BASE_DIR, runtime_checker(), recent=lambda: list(engine.recent_success),
-                          apply_recent=_apply_recent_check, file_lock=engine.file_lock, proxy_pool=proxy_pool)
+ACCOUNT_CHECKS = CheckJobs(
+    BASE_DIR,
+    runtime_checker(),
+    recent=lambda: list(engine.recent_success),
+    apply_recent=_apply_recent_check,
+    registration_result=engine.apply_delayed_account_check,
+    file_lock=engine.file_lock,
+    proxy_pool=proxy_pool,
+)
 engine.account_check_callback = ACCOUNT_CHECKS.check_registration
 engine.account_check_observer = ACCOUNT_CHECKS.record_registration_observation
 app.register_blueprint(create_check_blueprint(ACCOUNT_CHECKS, require_monitor_token))
@@ -4365,6 +4377,7 @@ def create_import_job():
             source=preview["source"],
             force_refresh=bool(body.get("force_refresh")),
             allow_marked=bool(body.get("allow_marked")),
+            allow_review=bool(body.get("allow_review")),
         )
         return jsonify({"ok": True, "message": "导入任务已创建", "job": job}), 202
     except Exception as exc:

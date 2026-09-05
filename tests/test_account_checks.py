@@ -13,7 +13,7 @@ from flask import Flask
 from g.account_check import (AccountChecker, CheckRegistry, chat_url, credential_version,
                              inspect_stream, now, parse_bot_page, risk_state)
 from g.account_check_api import create_check_blueprint
-from g.account_check_jobs import CheckJobs
+from g.account_check_jobs import CheckJobs, account_check_delay_seconds
 from g.classification_store import ClassificationStore
 
 
@@ -163,6 +163,20 @@ class DetectorTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 chat_url(url)
 
+    def test_delayed_registration_path_sends_exactly_one_chat_on_same_proxy(self):
+        raw = {**account(), "_proxy_spec": "http://register-proxy.test:8080"}
+        checker = AccountChecker()
+        checker._chat = Mock(return_value=healthy())
+        result = checker.check_chat_once(raw)
+        self.assertEqual(result["state"], "clean")
+        checker._chat.assert_called_once()
+        self.assertEqual(checker._chat.call_args.args[2], raw["_proxy_spec"])
+
+    def test_delay_setting_defaults_and_clamps(self):
+        self.assertEqual(account_check_delay_seconds("invalid"), 60)
+        self.assertEqual(account_check_delay_seconds(-1), 0)
+        self.assertEqual(account_check_delay_seconds(5000), 3600)
+
 
 class CheckJobTests(unittest.TestCase):
     def setUp(self):
@@ -172,7 +186,7 @@ class CheckJobTests(unittest.TestCase):
         self.checker = Mock()
         self.checker.check.side_effect = healthy
         self.jobs = CheckJobs(self.root, self.checker)
-        self.addCleanup(self.jobs.executor.shutdown)
+        self.addCleanup(self.jobs.shutdown)
 
     def wait(self):
         self.jobs.executor.submit(lambda: None).result(timeout=5)
@@ -244,9 +258,178 @@ class CheckJobTests(unittest.TestCase):
         with self.jobs.lock:
             job = self.jobs._new_job(1, "upload")
         recovered = CheckJobs(self.root, self.checker)
-        self.addCleanup(recovered.executor.shutdown)
+        self.addCleanup(recovered.shutdown)
         self.assertEqual(recovered.get(job["id"])["status"], "interrupted")
         self.checker.check.assert_not_called()
+
+    def test_registration_check_waits_then_finishes_with_private_state_removed(self):
+        checker = Mock()
+        checker.check_chat_once.side_effect = healthy
+        applied = Mock()
+        clock = [1000.0]
+        jobs = CheckJobs(
+            self.root / "delayed",
+            checker,
+            registration_result=applied,
+            delay_seconds=60,
+            clock=lambda: clock[0],
+        )
+        self.addCleanup(jobs.shutdown)
+        raw = {**account(), "_proxy_spec": "http://same-session.test:8080"}
+        pending = jobs.check_registration(raw)
+        self.assertEqual(pending["state"], "pending_check")
+        checker.check_chat_once.assert_not_called()
+        pending_path = jobs._pending_path(pending["job_id"])
+        self.assertEqual(pending_path.stat().st_mode & 0o777, 0o600)
+        report = (jobs.directory / f"{pending['job_id']}.json").read_text()
+        for secret in (raw["email"], raw["sso"], raw["_proxy_spec"], "private-refresh"):
+            self.assertNotIn(secret, report)
+
+        clock[0] = 1060.0
+        jobs._scheduler_wake.set()
+        deadline = time.time() + 5
+        while time.time() < deadline and jobs.get(pending["job_id"])["status"] != "completed":
+            time.sleep(0.01)
+        final = jobs.get(pending["job_id"])
+        self.assertEqual(final["status"], "completed")
+        self.assertEqual(final["items"][0]["state"], "clean")
+        checker.check_chat_once.assert_called_once()
+        self.assertEqual(checker.check_chat_once.call_args.args[0]["_proxy_spec"], raw["_proxy_spec"])
+        applied.assert_called_once()
+        self.assertEqual(jobs.registry.get(raw)["state"], "clean")
+        self.assertFalse(pending_path.exists())
+
+    def test_scheduled_registration_check_resumes_after_restart(self):
+        root = self.root / "resume"
+        clock = [1000.0]
+        first = CheckJobs(root, Mock(), delay_seconds=60, clock=lambda: clock[0])
+        pending = first.check_registration(account())
+        first.shutdown()
+
+        clock[0] = 1060.0
+        checker = Mock()
+        checker.check_chat_once.side_effect = healthy
+        applied = Mock()
+        recovered = CheckJobs(
+            root,
+            checker,
+            registration_result=applied,
+            delay_seconds=60,
+            clock=lambda: clock[0],
+        )
+        self.addCleanup(recovered.shutdown)
+        deadline = time.time() + 5
+        while time.time() < deadline and recovered.get(pending["job_id"])["status"] != "completed":
+            time.sleep(0.01)
+        self.assertEqual(recovered.get(pending["job_id"])["status"], "completed")
+        checker.check_chat_once.assert_called_once()
+        applied.assert_called_once()
+
+    def test_running_registration_check_is_not_replayed_after_restart(self):
+        root = self.root / "at-most-once"
+        first = CheckJobs(root, Mock(), delay_seconds=60, clock=lambda: 1000.0)
+        pending = first.check_registration(account())
+        with first.lock:
+            job = first.jobs[pending["job_id"]]
+            job.update(status="running", started_at=now(), attempt_started_at=now())
+            first._persist(job)
+        first.shutdown()
+
+        checker = Mock()
+        applied = Mock()
+        recovered = CheckJobs(root, checker, registration_result=applied)
+        self.addCleanup(recovered.shutdown)
+        job = recovered.get(pending["job_id"])
+        self.assertEqual(job["status"], "interrupted")
+        self.assertEqual(job["items"][0]["reason"], "CHECK_INTERRUPTED")
+        checker.check_chat_once.assert_not_called()
+        applied.assert_called_once()
+        self.assertEqual(recovered.registry.get(account())["state"], "infra_retry")
+
+    def test_committed_chat_result_is_preserved_and_only_application_resumes(self):
+        root = self.root / "result-ready"
+        first = CheckJobs(root, Mock(), delay_seconds=60, clock=lambda: 1000.0)
+        pending = first.check_registration(account())
+        with first.lock:
+            job = first.jobs[pending["job_id"]]
+            row = first._pending_row(account(), state="clean", reason="HEALTHY")
+            job.update(status="running", completed=1, items=[row])
+            job["counts"]["pending_check"] = 0
+            job["counts"]["clean"] = 1
+            first._persist(job)
+            # Simulate a crash after the idempotent registry write but before
+            # the durable ``applying`` marker. The callback has not started.
+            first.registry.put(account(), row)
+        first.shutdown()
+
+        checker = Mock()
+        applied = Mock()
+        recovered = CheckJobs(root, checker, registration_result=applied)
+        self.addCleanup(recovered.shutdown)
+        job = recovered.get(pending["job_id"])
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["items"][0]["state"], "clean")
+        checker.check_chat_once.assert_not_called()
+        applied.assert_called_once()
+        self.assertEqual(recovered.registry.get(account())["state"], "clean")
+
+    def test_application_stage_is_not_replayed_after_restart(self):
+        root = self.root / "application-at-most-once"
+        first = CheckJobs(root, Mock(), delay_seconds=60, clock=lambda: 1000.0)
+        pending = first.check_registration(account())
+        with first.lock:
+            job = first.jobs[pending["job_id"]]
+            row = first._pending_row(account(), state="clean", reason="HEALTHY")
+            job.update(status="applying", completed=1, items=[row], application_started_at=now())
+            job["counts"]["pending_check"] = 0
+            job["counts"]["clean"] = 1
+            first._persist(job)
+        first.shutdown()
+
+        checker = Mock()
+        applied = Mock()
+        recovered = CheckJobs(root, checker, registration_result=applied)
+        self.addCleanup(recovered.shutdown)
+        job = recovered.get(pending["job_id"])
+        self.assertEqual(job["status"], "interrupted")
+        self.assertEqual(job["items"][0]["state"], "clean")
+        self.assertIn("未重放副作用", job["message"])
+        checker.check_chat_once.assert_not_called()
+        applied.assert_not_called()
+        self.assertEqual(recovered.registry.get(account())["state"], "clean")
+        self.assertFalse(recovered._pending_path(pending["job_id"]).exists())
+        with self.assertRaisesRegex(ValueError, "不允许手动重放"):
+            recovered.apply(pending["job_id"])
+
+    def test_initial_job_persist_failure_leaves_no_in_memory_orphan(self):
+        root = self.root / "persist-failure"
+        jobs = CheckJobs(root, Mock(), delay_seconds=60)
+        self.addCleanup(jobs.shutdown)
+        with patch.object(jobs, "_persist", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                jobs.check_registration(account())
+        self.assertEqual(jobs.jobs, {})
+        self.assertEqual(jobs.cancels, {})
+
+    def test_result_callback_failure_does_not_replace_real_check_state(self):
+        root = self.root / "callback-failure"
+        checker = Mock()
+        checker.check_chat_once.side_effect = healthy
+        jobs = CheckJobs(
+            root,
+            checker,
+            registration_result=Mock(side_effect=RuntimeError("apply failed")),
+            delay_seconds=0,
+        )
+        self.addCleanup(jobs.shutdown)
+        pending = jobs.check_registration(account())
+        deadline = time.time() + 5
+        while time.time() < deadline and jobs.get(pending["job_id"])["status"] != "completed":
+            time.sleep(0.01)
+        job = jobs.get(pending["job_id"])
+        self.assertEqual(job["items"][0]["state"], "clean")
+        self.assertFalse(job["items"][0]["applied"])
+        self.assertEqual(jobs.registry.get(account())["state"], "clean")
 
     def test_cancelled_queued_job_does_not_call_checker(self):
         gate = threading.Event()
@@ -315,7 +498,7 @@ class CheckJobTests(unittest.TestCase):
         manager = ImportJobManager(self.root, config, ImportTargets(self.root, config),
                                    sub2api_importer=Mock(), token_exchanger=Mock())
         self.addCleanup(manager._executor.shutdown)
-        for state, reason in [("unchecked", "CHECK_PENDING"), ("review", "MISSING_THINKING")]:
+        for state, reason in [("pending_check", "CHECK_PENDING"), ("review", "MISSING_THINKING")]:
             self.jobs.registry.put(account(), {"state": state, "reason": reason})
             with self.assertRaises(ValueError):
                 manager.create_job([{**account(), "clean": True}], ["grok2api_web"], source={})
@@ -366,7 +549,7 @@ class CheckRegistrationTests(unittest.TestCase):
                 engine.output_file = str(root / "keys" / "batch.txt")
                 engine._classification_store = ClassificationStore(engine.output_file)
                 engine._enrich_pending = engine.pending_bfs_count = 1
-                engine.account_check_callback = Mock(return_value={"state": state, "reason": "TEST"})
+                engine.account_check_callback = Mock(return_value={"state": "pending_check", "reason": "CHECK_PENDING"})
                 engine.auto_import_callback = Mock()
                 token = {**account()["auth_token"], "expires_in": 3600}
                 with patch.object(grok, "_BASE_DIR", root), patch.object(engine, "_exchange_token_after_clean", return_value=token), \
@@ -376,6 +559,12 @@ class CheckRegistrationTests(unittest.TestCase):
                                              impersonate="", user_agent="", risk_gated=True)
                 self.assertEqual(engine.pending_bfs_count, 0)
                 self.assertEqual(engine._enrich_pending, 0)
+                self.assertEqual(engine.recent_success[0]["risk_status"], "pending_check")
+                engine.auto_import_callback.assert_not_called()
+                queued_account = engine.account_check_callback.call_args.args[0]
+                result = {"state": state, "reason": "TEST", "checked_at": now()}
+                CheckRegistry(root).put(queued_account, result)
+                engine.apply_delayed_account_check(queued_account, result)
                 self.assertEqual(engine.recent_success[0]["risk_status"], state)
                 if state == "review":
                     engine.auto_import_callback.assert_not_called()

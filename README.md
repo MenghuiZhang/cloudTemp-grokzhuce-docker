@@ -2,9 +2,9 @@
 
 Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Castle 同页 mint，以及 Sub2API、CLIProxyAPI（CPA）和 grok2api 多目标导入。
 
-> v1.5.1 修复发布镜像的运行时漂移：正式镜像继承 v1.4.0 已验证的
-> Camoufox、浏览器和 Python 依赖层，再覆盖 v1.5 应用代码。开发用
-> `Dockerfile` 保持独立，正式发布使用 `Dockerfile.release`。
+> v1.5.2 在 Risk / OAuth / BFS 通过 60 秒后异步执行一次真实对话检测，
+> 并新增 REVIEW 显式手动导入通道。正式镜像继续继承 v1.4.0 已验证的
+> Camoufox、浏览器和 Python 依赖层，再覆盖 v1.5 应用代码。
 
 ## 功能
 
@@ -138,6 +138,7 @@ cp .env.example .env
 | `UI_HOST` / `UI_PORT` | Web 监听 | `127.0.0.1` / `3333` |
 | `data/proxy_pool.json` | 注册代理池的本地私密存储；由 `/proxy-settings` 管理，不提交 Git | 空池（直连） |
 | `data/domain_pool.json` | Cloudflare Temp 基础域名状态和审计历史；不提交 Git | 从现有域名配置迁移 |
+| `GROK_ACCOUNT_CHECK_DELAY_SECONDS` | Risk / OAuth / BFS 通过后，首次异步对话检测的延迟，限 0～3600 秒 | `60` |
 | `MONITOR_TOKEN` | BFS 运维 API 的 Bearer / `X-Monitor-Token` | 必须显式配置 |
 | `SUB2API_URL` | 旧版 sub2api 根地址；首次进入导入中心时用于迁移 | `http://127.0.0.1:9898` |
 | `SUB2API_GROK_GROUP_NAME` | 导入目标分组**名称**（按名称解析 ID） | `grok` |
@@ -158,7 +159,7 @@ cp .env.example .env
 - 默认**不**自动导入；服务测试通过后，可在导入中心按目标开启注册后自动导入。
 - 导入配置和写入型密钥保存在 `data/import_services.json`，API 只返回掩码；旧版
   `converted_auth/import_services.json` 会在首次读取时自动迁移且保留原文件。
-- Risk CLEAN 后先异步换票并检查 JWT `bfs` claim，再执行账号检测；完整检测 CLEAN 后才自动导入。
+- Risk CLEAN 后先异步换票并检查 JWT `bfs` claim，再进入 `PENDING_CHECK`；默认 60 秒后独立执行首次真实对话检测，仅 CLEAN 自动导入。
 - JWT 中只要存在 `bfs` key（包括 `bfs: 0`）就是 MARKED；已取得但无法解码的 token 按 BFS UNKNOWN 处理。
 - BFS MARKED/UNKNOWN 的 CPA 仅保留在本地且强制 `disabled=true`，不进入任何下游；注册路径中 BFS UNKNOWN 归入 REVIEW。
 
@@ -296,23 +297,24 @@ Risk MARKED 不允许这种放行；token 更换后旧指纹自动失效。
    只有 OAuth 的 CPA 可执行 BFS 和聊天检测；不把缺少 SSO 当成账号异常。
 3. 真实聊天默认并发 2、单次超时 90 秒、最多 256 输出 tokens。没有 thinking、输出不足 32 tokens、缺少 usage 或 TPS 异常只提示复核，不能证明模型降智。
 4. “仅本地 BFS”不会联网或换票。没有 bfs 仅表示本地检查未发现该字段，结果仍为 UNCHECKED；不会据此放行完整检测。
-5. 新注册账号在现有后台 enrich 池完成检测，CLEAN 后单独排队自动导入。批次结束后仍有后台工作时禁止启动新批次，避免串写输出文件。
+5. 新注册账号在 Risk / OAuth / BFS 通过后先持久化为 `PENDING_CHECK`；注册批次无需等待，默认 60 秒后使用该账号的注册代理独立发起且只发起一次真实对话。CLEAN 后单独排队自动导入。
 6. 历史任务先生成报告，点击“应用结果”后才更新本地状态。Apply 会验证原始凭据版本，跳过已换票、已应用或被更新报告覆盖的记录。
 
 | 状态 | 含义与处理 |
 | --- | --- |
 | CLEAN | 检测通过，可自动导入 |
 | MARKED | BFS 字段存在，或明确 deny / 账号权限错误得到确认；禁止导入 |
-| REVIEW | 单独 botFlag、样本不足、质量信号、额度/限流或结果不一致；暂停导入，复检后再应用 |
+| REVIEW | 单独 botFlag、样本不足、质量信号、额度/限流或结果不一致；永不自动导入，仅可在导入页明确勾选警告选项后手动导入 |
 | INFRA_RETRY | 网络、代理或服务错误；暂停导入，可稍后复检 |
 | UNCHECKED | 缺凭据、未完整检测或关闭自动检测；不自动导入 |
+| PENDING_CHECK | 已完成 Risk / OAuth / BFS，等待首次延迟对话检测；禁止导入 |
 
 401 尝试刷新一次 OAuth；明确账号权限 403 和质量异常复测一次；网络/5xx 最多重试两次。
 429 尊重 `Retry-After`：不超过 60 秒时等待后重试一次，较长时间交给后续复检；当前进程会阻止同账号在该等待期内再次发起检测。
 错误重试保持同一出口，不通过更换代理绕过限流或权限拒绝。选择出口时优先账号原代理（历史动态代理模板只能恢复配置，不能保证原会话出口），再使用当前池，无可用代理则直连。
 
 检测设置保存在 `data/account_checks_config.json`；脱敏报告在 `data/account_checks/`，
-最多保留 100 个已结束任务或 30 天；重启中的任务标为 `interrupted`，不自动重放请求。
+最多保留 100 个已结束任务或 30 天。尚未到时的延迟任务会在重启后续跑；已进入请求的任务不重放，会以 `CHECK_INTERRUPTED` 归入 `INFRA_RETRY`。
 导入门禁状态保存在 `data/account_check_states.json`，以凭据 SHA-256 关联，不因报告过期而自动解除异常。
 检测期间换票/刷新得到的新凭据单独以 0600 权限保存于 `data/account_check_credentials/`，Apply 时用于更新原始账号记录，
 报告与 API 不包含完整邮箱、SSO/OAuth、代理密码或聊天正文。这些目录均已加入 Git 忽略规则。

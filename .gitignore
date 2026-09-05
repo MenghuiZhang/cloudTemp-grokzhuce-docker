@@ -51,6 +51,7 @@ data/account_checks/
 data/account_checks_config.json
 data/account_check_states.json
 data/account_check_credentials/
+data/account_check_pending/
 proxies/
 proxies*.txt
 *_proxy*.txt

@@ -26,6 +26,7 @@
     overview = await api('');
     for (const key of ['model','workers','timeout']) $(key).value = overview.config[key];
     $('base').value = overview.config.base_url; $('automatic').checked = overview.config.automatic;
+    $('automaticDelay').textContent = overview.delay_seconds ?? 60;
     $('content').hidden = false; $('authPanel').hidden = true; sources(); renderJobs(overview.jobs);
   }
   async function save() {
@@ -46,7 +47,7 @@
     $('previewInfo').textContent = `${data.total} 个账号已去重；仅展示脱敏信息。`;
     $('previewRows').innerHTML = data.accounts.map(a => `<div>${esc(a.email)} · ${esc(a.fingerprint)} · ${esc(a.state.toUpperCase())}</div>`).join('');
   }
-  const active = status => ['running','queued','cancelling'].includes(status);
+  const active = status => ['running','queued','scheduled','result_ready','applying','cancelling'].includes(status);
   function renderJobs(jobs) {
     $('jobs').innerHTML = jobs.length ? jobs.map(j => `<div class="job"><div class="actions"><span>${esc(j.created_at)} · ${esc(j.source)} · <b>${esc(j.status)}</b> · ${j.completed}/${j.total}</span><span><button data-action="view" data-id="${esc(j.id)}">查看</button> ${active(j.status) ? `<button data-action="cancel" data-id="${esc(j.id)}">取消</button>` : j.source !== 'automatic' && j.status !== 'failed' ? `<button data-action="apply" data-id="${esc(j.id)}">应用结果</button>` : ''}</span></div><progress max="${j.total}" value="${j.completed}"></progress><div class="hint">${Object.entries(j.counts).map(([s,n]) => `${esc(s.toUpperCase())} ${n}`).join(' · ')}</div></div>`).join('') : '<div class="empty">暂无检测任务</div>';
   }

@@ -17,7 +17,7 @@ from g.bfs_service import atomic_write_json, inspect_token_bundle_bfs, token_fin
 
 DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 DEFAULT_MODEL = "grok-4.5"
-STATES = ("clean", "marked", "review", "infra_retry", "unchecked")
+STATES = ("clean", "marked", "review", "infra_retry", "unchecked", "pending_check")
 DEFAULTS = {"automatic": True, "base_url": DEFAULT_BASE_URL, "model": DEFAULT_MODEL,
             "workers": 2, "timeout": 90, "max_tokens": 256}
 
@@ -191,9 +191,12 @@ class CheckRegistry:
             raise ValueError("无效检测状态")
         with self._lock:
             data = self._read()
+            row = {"state": result["state"], "reason": result["reason"],
+                   "checked_at": result.get("checked_at") or now()}
+            if result.get("scheduled_for"):
+                row["scheduled_for"] = str(result["scheduled_for"])
             for fp in fingerprints(account):
-                data[fp] = {"state": result["state"], "reason": result["reason"],
-                            "checked_at": result.get("checked_at") or now()}
+                data[fp] = dict(row)
             atomic_write_json(self.path, data)
 
     def blocked(self, account: dict) -> bool:
@@ -264,6 +267,48 @@ class AccountChecker:
         finally:
             if response is not None:
                 response.close()
+
+    def check_chat_once(self, raw, config=None, *, cancel=None):
+        """Run exactly one delayed registration chat check.
+
+        Risk, OAuth and BFS have already completed before a registration enters
+        the delayed queue.  Re-check BFS locally to avoid sending a token whose
+        claims changed, but do not perform page probes, refreshes or chat
+        retries here: the first and only conversation request must happen after
+        the configured delay.
+        """
+        config = {**DEFAULTS, **(config or {})}
+        account = normalize_account(raw)
+        cancel = cancel or threading.Event()
+        signals = []
+
+        def finish(state, reason, **extra):
+            return {"state": state, "reason": reason, "checked_at": now(),
+                    "signals": signals, **extra}
+
+        if cancel.is_set():
+            return finish("unchecked", "CANCELLED")
+        if not fingerprints(account):
+            return finish("unchecked", "MISSING_CREDENTIALS")
+        bundle = account["auth_token"]
+        bfs = inspect_token_bundle_bfs(
+            sso=account["sso"],
+            access_token=str(bundle.get("access_token") or bundle.get("key") or ""),
+            id_token=str(bundle.get("id_token") or ""),
+            refresh_token=str(bundle.get("refresh_token") or ""),
+        )
+        signals.append({"layer": "bfs", "state": "marked" if bfs.get("has_bfs")
+                        else "clean" if bfs.get("ok") else "unknown"})
+        if bfs.get("has_bfs"):
+            return finish("marked", "BFS_PRESENT")
+        if not bfs.get("ok"):
+            return finish("review" if bundle else "unchecked", "BFS_UNKNOWN")
+        if cancel.is_set():
+            return finish("unchecked", "CANCELLED")
+        proxy = self.proxy_resolver(account)
+        result = self._chat(account, config, proxy, cancel.is_set)
+        signals.append({"layer": "chat", **result})
+        return finish(result["state"], result["reason"], quality=result)
 
     def check(self, raw, config=None, *, passive=False, risk_prechecked=False, cancel=None):
         config = {**DEFAULTS, **(config or {})}

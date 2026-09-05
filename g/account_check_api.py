@@ -33,7 +33,8 @@ def create_check_blueprint(jobs, authenticate):
     @bp.get("/api/account-checks")
     @authenticate
     def overview():
-        return jsonify(ok=True, config=jobs.config(), sources=jobs.files(), jobs=jobs.list_jobs(),
+        return jsonify(ok=True, config=jobs.config(), delay_seconds=jobs.delay_seconds,
+                       sources=jobs.files(), jobs=jobs.list_jobs(),
                        recent=[{"id": r.get("id"), "email": masked_email(r.get("email"))} for r in jobs.recent()])
 
     @bp.post("/api/account-checks/config")

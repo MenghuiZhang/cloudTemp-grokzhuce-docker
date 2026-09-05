@@ -180,6 +180,57 @@ class ImportTargetTests(unittest.TestCase):
 
 
 class ImportJobManagerTests(unittest.TestCase):
+    def test_review_requires_explicit_manual_override_and_never_automatic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ImportConfigStore(root, env_reader=lambda: {})
+            targets = ImportTargets(root, store)
+            targets.import_chenyme_sso = Mock(return_value={"ok": True, "created": 1})
+            manager = ImportJobManager(
+                root,
+                store,
+                targets,
+                sub2api_importer=Mock(),
+                token_exchanger=Mock(),
+            )
+            self.addCleanup(manager._executor.shutdown)
+            raw = {
+                "id": "review-1",
+                "email": "review@example.com",
+                "sso": "aaa.bbb.ccc",
+                "clean": None,
+                "risk_status": "review",
+            }
+            manager.check_registry.put(raw, {"state": "review", "reason": "UNCONFIRMED_FORBIDDEN"})
+
+            with self.assertRaisesRegex(ValueError, "允许手动导入 REVIEW"):
+                manager.create_job([raw], ["grok2api_web"], source={"type": "test"})
+            with self.assertRaisesRegex(ValueError, "允许手动导入 REVIEW"):
+                manager.create_job(
+                    [raw],
+                    ["grok2api_web"],
+                    source={"type": "automatic"},
+                    allow_review=True,
+                    automatic=True,
+                )
+
+            job = manager.create_job(
+                [raw],
+                ["grok2api_web"],
+                source={"type": "test"},
+                allow_review=True,
+            )
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                current = manager.get(job["id"])
+                if current and current["status"] not in ("queued", "running", "cancelling"):
+                    break
+                time.sleep(0.02)
+            current = manager.get(job["id"])
+            self.assertEqual(current["status"], "completed")
+            self.assertEqual(current["accounts"][0]["targets"]["grok2api_web"]["status"], "success")
+            targets.import_chenyme_sso.assert_called_once()
+
     def test_oauth_is_exchanged_once_and_reused_across_cpa_targets(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

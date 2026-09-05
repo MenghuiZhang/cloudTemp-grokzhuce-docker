@@ -859,18 +859,24 @@ class ImportJobManager:
             job = self._jobs.get(str(job_id))
             return self._safe_job(job) if job else None
 
-    def create_job(self, accounts: list[dict], target_names: Iterable[str], *, source: dict, force_refresh: bool = False, allow_marked: bool = False, automatic: bool = False) -> dict:
+    def create_job(self, accounts: list[dict], target_names: Iterable[str], *, source: dict,
+                   force_refresh: bool = False, allow_marked: bool = False,
+                   allow_review: bool = False, automatic: bool = False) -> dict:
         selected = list(dict.fromkeys(str(x) for x in target_names if str(x) in TARGETS))
         if not selected:
             raise ValueError("至少选择一个导入目标")
+        allow_review = bool(allow_review) and not bool(automatic)
         normalized: list[dict] = []
         seen: set[str] = set()
+        blocked_review = False
         for raw in accounts[:10000]:
-            if self.check_registry.blocked(raw):
-                continue
             saved_check = self.check_registry.get(raw)
             if saved_check:
                 raw = {**raw, "clean": saved_check.get("state") == "clean", "risk_status": saved_check.get("state")}
+            review_override = bool(allow_review and str(raw.get("risk_status") or "") == "review")
+            if self.check_registry.blocked(raw) and not review_override:
+                blocked_review |= str(raw.get("risk_status") or "") == "review"
+                continue
             sso = str(raw.get("sso") or "").strip()
             if not sso or sso in seen:
                 continue
@@ -898,7 +904,7 @@ class ImportJobManager:
                     and fingerprint
                     and override.get("token_fingerprint") == fingerprint
                 )
-            if clean is not True and not override_allowed:
+            if clean is not True and not override_allowed and not review_override:
                 account_targets = [x for x in account_targets if x in ("grok2api_web", "grok2api_console")]
             if not account_targets:
                 continue
@@ -909,6 +915,7 @@ class ImportJobManager:
                 "auth_token": raw.get("auth_token") if isinstance(raw.get("auth_token"), dict) else None,
                 "clean": clean,
                 "risk_status": str(raw.get("risk_status") or ""),
+                "_review_override": review_override,
                 "bfs_override_fingerprint": str(
                     raw.get("bfs_override_fingerprint")
                     or ((raw.get("bfs_override") or {}).get("token_fingerprint") if isinstance(raw.get("bfs_override"), dict) else "")
@@ -917,6 +924,8 @@ class ImportJobManager:
                 "targets": account_targets,
             })
         if not normalized:
+            if blocked_review and not allow_review:
+                raise ValueError("REVIEW 账号需要勾选“允许手动导入 REVIEW”后才能创建任务")
             raise ValueError("没有符合当前目标和风控规则的有效账号")
         job_id = uuid.uuid4().hex[:16]
         cfg = self.config_store.load()
@@ -937,6 +946,8 @@ class ImportJobManager:
             "source": copy.deepcopy(source),
             "selected_targets": selected,
             "force_refresh": bool(force_refresh),
+            "allow_marked": bool(allow_marked),
+            "allow_review": bool(allow_review),
             "created_at": _utc_now(),
             "started_at": "",
             "finished_at": "",
@@ -1002,7 +1013,8 @@ class ImportJobManager:
             selected,
             source={"type": "retry", "job_id": str(job_id)},
             force_refresh=bool(previous.get("force_refresh")),
-            allow_marked=True,
+            allow_marked=bool(previous.get("allow_marked", True)),
+            allow_review=bool(previous.get("allow_review")),
             automatic=False,
         )
         return result
@@ -1116,8 +1128,21 @@ class ImportJobManager:
                 time.sleep(0.5 * (2**attempt))
         raise last or RuntimeError("导入失败")
 
+    def _review_override_allowed(self, job: dict, account: dict) -> bool:
+        saved_state = str(
+            self.check_registry.get(account).get("state")
+            or account.get("risk_status")
+            or ""
+        )
+        return bool(
+            job.get("allow_review")
+            and not job.get("automatic")
+            and account.get("_review_override")
+            and saved_state == "review"
+        )
+
     def _run_target(self, target: str, account: dict, token: dict | None, auth: dict | None, job: dict, register_proxy: str) -> tuple[dict, dict | None, dict | None]:
-        if self.check_registry.blocked(account):
+        if self.check_registry.blocked(account) and not self._review_override_allowed(job, account):
             raise RuntimeError("账号检测未通过，禁止导入；请先完成复检并应用结果")
         cfg = job["config_snapshot"]
         if account.get("_bfs_blocked"):
@@ -1187,7 +1212,7 @@ class ImportJobManager:
         raise ValueError(f"未知目标: {target}")
 
     def _process_account(self, job: dict, account: dict, register_proxy: str, order: dict[str, int]) -> None:
-        if self.check_registry.blocked(account):
+        if self.check_registry.blocked(account) and not self._review_override_allowed(job, account):
             for target in account["targets"]:
                 self._set_target(job, account["id"], target, "skipped", "账号检测未通过，暂停导入")
             return

@@ -1403,6 +1403,7 @@ class RegisterEngine:
         self.infra_retry_count = 0
         self.unchecked_count = 0
         self.pending_bfs_count = 0
+        self.pending_check_count = 0
         self.oauth_infra_streak = 0
         self._classification_store: Optional[ClassificationStore] = None
         self._bfs_lock = threading.RLock()
@@ -1512,6 +1513,7 @@ class RegisterEngine:
             "infra_retry_count": int(getattr(self, "infra_retry_count", 0) or 0),
             "unchecked_count": int(getattr(self, "unchecked_count", 0) or 0),
             "pending_bfs_count": int(getattr(self, "pending_bfs_count", 0) or 0),
+            "pending_check_count": int(getattr(self, "pending_check_count", 0) or 0),
             "attempt_count": attempts,
             "email_create_count": int(getattr(self, "email_create_count", 0) or 0),
             "email_create_reserved": int(getattr(self, "_email_create_reserved", 0) or 0),
@@ -1894,7 +1896,16 @@ class RegisterEngine:
                 email=email, sso=sso, proxy_audit=proxy_audit, **email_meta
             )
 
-            if check_state in ("marked", "review", "infra_retry"):
+            if check_state == "pending_check":
+                clean = None
+                self.pending_check_count += 1
+                if classification_store is not None:
+                    classification_store.add_pending(
+                        email=email,
+                        sso=sso,
+                        data={"state": "PENDING_CHECK"},
+                    )
+            elif check_state in ("marked", "review", "infra_retry"):
                 clean = False if check_state == "marked" else None
                 field = {"marked": "marked_count", "review": "review_count", "infra_retry": "infra_retry_count"}[check_state]
                 setattr(self, field, getattr(self, field, 0) + 1)
@@ -1989,6 +2000,133 @@ class RegisterEngine:
                 if note:
                     item["note"] = note
                 break
+
+    def apply_delayed_account_check(self, account: dict, result: dict) -> None:
+        """Apply one persisted delayed registration check and optionally import.
+
+        The callback is safe after a process restart: artifact paths are stored
+        with the private pending record, so classification and the structured
+        account JSON can be updated even when ``recent_success`` is empty.
+        """
+        state = str(result.get("state") or "infra_retry")
+        if state not in ("clean", "marked", "review", "infra_retry", "unchecked"):
+            state = "infra_retry"
+        reason = str(result.get("reason") or "ACCOUNT_CHECK")
+        checked_at = str(result.get("checked_at") or datetime.now().isoformat())
+        metadata = {"state": state, "reason": reason, "checked_at": checked_at}
+        success_id = str(account.get("_success_id") or account.get("id") or "")
+        sso = str(account.get("sso") or "")
+        email = str(account.get("email") or "")
+        matched = False
+
+        def artifact_path(value: object) -> Optional[Path]:
+            raw = str(value or "").strip()
+            if not raw:
+                return None
+            path = Path(raw)
+            if not path.is_absolute():
+                path = _BASE_DIR / path
+            try:
+                resolved = path.resolve()
+                if not resolved.is_relative_to(_BASE_DIR.resolve()):
+                    return None
+                return resolved
+            except (OSError, ValueError):
+                return None
+
+        with self.file_lock:
+            for item in self.recent_success:
+                if not ((success_id and str(item.get("id") or "") == success_id)
+                        or (sso and str(item.get("sso") or "") == sso)):
+                    continue
+                matched = True
+                previous = str(item.get("risk_status") or "unchecked")
+                count_fields = {
+                    "clean": "clean_count",
+                    "marked": "marked_count",
+                    "review": "review_count",
+                    "infra_retry": "infra_retry_count",
+                    "unchecked": "unchecked_count",
+                    "pending_check": "pending_check_count",
+                }
+                if previous != state:
+                    old_field = count_fields.get(previous)
+                    new_field = count_fields.get(state)
+                    if old_field:
+                        setattr(self, old_field, max(0, getattr(self, old_field, 0) - 1))
+                    if new_field:
+                        setattr(self, new_field, getattr(self, new_field, 0) + 1)
+                item.update(
+                    clean=True if state == "clean" else False if state == "marked" else None,
+                    risk_status=state,
+                    account_check=metadata,
+                )
+                if isinstance(account.get("auth_token"), dict):
+                    item["auth_token"] = dict(account["auth_token"])
+                break
+
+            output_path = artifact_path(account.get("_output_file"))
+            if output_path is None and self.output_file:
+                output_path = artifact_path(self.output_file)
+            if output_path is not None:
+                ClassificationStore(output_path).finalize(
+                    email=email, sso=sso, state=state, reason=reason
+                )
+
+            accounts_path = artifact_path(account.get("_accounts_file"))
+            if accounts_path is None:
+                accounts_path = self._accounts_json_path()
+            if accounts_path and accounts_path.is_file():
+                try:
+                    records = json.loads(accounts_path.read_text(encoding="utf-8"))
+                    if isinstance(records, list):
+                        for record in records:
+                            if isinstance(record, dict) and record.get("sso_token") == sso:
+                                record.update(
+                                    account_check=metadata,
+                                    risk_status=state,
+                                    clean=True if state == "clean" else False if state == "marked" else None,
+                                )
+                        atomic_write_json(accounts_path, records)
+                except (OSError, ValueError):
+                    pass
+
+        if state in ("marked", "review", "infra_retry"):
+            try:
+                from convert_sso_json import SSORecord, build_cpa_record, cpa_path_for_record
+
+                token = account.get("auth_token") if isinstance(account.get("auth_token"), dict) else {}
+                cpa_path = cpa_path_for_record(
+                    _BASE_DIR / "converted_auth",
+                    SSORecord(source=Path("runtime.json"), email=email, sso=sso),
+                )
+                auth = build_cpa_record(token, email=email, sso=sso, disabled=True)
+                auth.update(account_check=metadata, account_check_disabled=True)
+                atomic_write_json(cpa_path, auth)
+            except Exception as exc:
+                self.log(f"{email} 延迟检测结果已记录，但 CPA 禁用保存失败: {exc}", "warn")
+
+        self.log(f"{email} [后台] 延迟对话检测完成 · {state.upper()} · {reason}",
+                 "success" if state == "clean" else "warn")
+        if state != "clean":
+            return
+        callback = self.auto_import_callback
+        if callable(callback):
+            try:
+                callback([{
+                    **account,
+                    "id": success_id,
+                    "clean": True,
+                    "risk_status": "clean",
+                }])
+                if matched:
+                    with self.file_lock:
+                        for item in self.recent_success:
+                            if str(item.get("id") or "") == success_id:
+                                item["auto_queued"] = True
+                                break
+            except Exception:
+                self.log("账号延迟检测通过，但自动导入排队失败，可手动重试", "warn")
 
     def _revoke_marked_success(
         self,
@@ -2551,64 +2689,56 @@ class RegisterEngine:
                     self.oauth_infra_streak = 0
                 account = {"email": email, "sso": sso, "auth_token": auth_token,
                            "_proxy_spec": proxy_lease.spec if proxy_lease else ""}
-                callback = self.account_check_callback
-                if callback is None:
-                    from g.account_check_jobs import CheckJobs, runtime_checker
-                    with self._bfs_lock:
-                        if not hasattr(self, "_standalone_checks"):
-                            self._standalone_checks = CheckJobs(_BASE_DIR, runtime_checker(), proxy_pool=self.proxy_pool)
-                    callback = self._standalone_checks.check_registration
-                self.log(f"{email} [后台] 账号检测开始 · Risk/BFS 初筛通过", "info")
-                try:
-                    outcome = callback(account)
-                except Exception:
-                    outcome = {"state": "infra_retry", "reason": "CHECK_FAILED"}
-                state = outcome.get("state", "infra_retry")
-                CheckRegistry(_BASE_DIR).put(account, {"state": state, "reason": outcome.get("reason", "ACCOUNT_CHECK")})
-                auth_token = account.get("auth_token") or auth_token
                 success_id = self._record_success(
                     email=email,
                     sso=sso,
                     unhinged_ok=False,
-                    note=f"account_check={state.upper()} · {outcome.get('reason', '')}",
+                    note="account_check=PENDING_CHECK · 延迟对话检测已排队",
                     already_written=False,
                     auth_token=auth_token,
                     proxy_audit=self.proxy_pool.lease_audit(proxy_lease),
-                    clean=True if state == "clean" else None,
-                    check_state=state,
+                    clean=None,
+                    check_state="pending_check",
                 )
                 if not success_id:
                     return
+                account.update(
+                    _success_id=success_id,
+                    _output_file=str(self.output_file or ""),
+                    _accounts_file=str(self._accounts_json_path() or ""),
+                )
                 with self.file_lock:
                     path = self._accounts_json_path()
                     if path and path.is_file():
                         records = json.loads(path.read_text(encoding="utf-8"))
                         for record in records:
                             if record.get("sso_token") == sso:
-                                record.update(account_check={"state": state, "reason": outcome.get("reason", "ACCOUNT_CHECK")},
-                                              risk_status=state, clean=state == "clean")
+                                record.update(
+                                    account_check={"state": "pending_check", "reason": "CHECK_PENDING"},
+                                    risk_status="pending_check",
+                                    clean=None,
+                                )
                         atomic_write_json(path, records)
-                if state != "clean":
-                    from convert_sso_json import SSORecord, build_cpa_record, cpa_path_for_record
-                    cpa_path = cpa_path_for_record(_BASE_DIR / "converted_auth", SSORecord(source=Path("runtime.json"), email=email, sso=sso))
-                    auth = build_cpa_record(auth_token, email=email, sso=sso, disabled=True)
-                    auth.update(account_check={"state": state, "reason": outcome.get("reason", "ACCOUNT_CHECK")}, account_check_disabled=True)
-                    atomic_write_json(cpa_path, auth)
-                    return
-                callback = self.auto_import_callback
-                if callable(callback):
-                    try:
-                        callback([{**account, "id": success_id, "clean": True, "risk_status": "clean"}])
-                        with self.file_lock:
-                            for item in self.recent_success:
-                                if item.get("id") == success_id:
-                                    item["auto_queued"] = True
-                    except Exception:
-                        with self.file_lock:
-                            for item in self.recent_success:
-                                if item.get("id") == success_id:
-                                    item["auto_queued"] = False
-                        self.log("账号检测通过，但自动导入排队失败，可手动重试", "warn")
+                callback = self.account_check_callback
+                if callback is None:
+                    from g.account_check_jobs import CheckJobs, runtime_checker
+                    with self._bfs_lock:
+                        if not hasattr(self, "_standalone_checks"):
+                            self._standalone_checks = CheckJobs(
+                                _BASE_DIR,
+                                runtime_checker(),
+                                registration_result=self.apply_delayed_account_check,
+                                proxy_pool=self.proxy_pool,
+                            )
+                    callback = self._standalone_checks.check_registration
+                self.log(f"{email} [后台] Risk/OAuth/BFS 已通过 · 对话检测延迟排队", "info")
+                try:
+                    outcome = callback(account)
+                except Exception:
+                    outcome = {"state": "infra_retry", "reason": "CHECK_SCHEDULE_FAILED", "checked_at": datetime.now().isoformat()}
+                    CheckRegistry(_BASE_DIR).put(account, outcome)
+                if outcome.get("state") != "pending_check":
+                    self.apply_delayed_account_check(account, outcome)
 
             unhinged_ok = False
             try:
@@ -4101,6 +4231,7 @@ class RegisterEngine:
                     f" · UNCHECKED {getattr(self, 'unchecked_count', 0)}"
                     f" · 过程失败 {self.fail_count}"
                     f" · MARKED {getattr(self, 'marked_count', 0)}"
+                    f" · PENDING_CHECK {getattr(self, 'pending_check_count', 0)}"
                     f" · 连续MARKED {getattr(self, '_ss_consecutive_deny', 0)}",
                     "success" if created >= self.target_count else "warn",
                 )
@@ -4294,6 +4425,7 @@ class RegisterEngine:
             self.infra_retry_count = 0
             self.unchecked_count = 0
             self.pending_bfs_count = 0
+            self.pending_check_count = 0
             self.oauth_infra_streak = 0
             self.attempt_count = 0
             self.email_create_count = 0

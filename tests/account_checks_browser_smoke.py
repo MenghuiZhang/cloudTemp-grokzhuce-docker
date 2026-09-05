@@ -76,7 +76,7 @@ def main():
         finally:
             server.shutdown()
             thread.join(timeout=3)
-            jobs.executor.shutdown()
+            jobs.shutdown()
 
 
 if __name__ == "__main__":
