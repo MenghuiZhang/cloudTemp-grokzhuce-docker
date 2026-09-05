@@ -1,0 +1,11 @@
+ARG GROK_RUNTIME_IMAGE=ghcr.io/menghuizhang/cloudtemp-grokzhuce-docker:v1.4.0
+FROM ${GROK_RUNTIME_IMAGE}
+
+# v1.5.1 hotfix: retain the browser, Python packages and native libraries from
+# the known-good v1.4.0 image.  The regular Dockerfile intentionally remains
+# available for fresh development builds, while release images only overlay the
+# application source on the validated runtime.
+WORKDIR /app
+COPY . .
+
+ENV RUNNING_IN_DOCKER=1

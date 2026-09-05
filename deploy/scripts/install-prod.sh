@@ -7,13 +7,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 DEPLOY_ENV="$ROOT_DIR/deploy/deploy.env"
 APP_ENV="$ROOT_DIR/.env"
-VERSION="${1:-v1.4.0}"
+VERSION="${1:-v1.5.1}"
 IMAGE_REPOSITORY="ghcr.io/menghuizhang/cloudtemp-grokzhuce-docker"
 IMAGE_REF="${IMAGE_REPOSITORY}:${VERSION}"
 
 usage() {
   echo "用法: $0 [版本标签]" >&2
-  echo "示例: $0 v1.4.0" >&2
+  echo "示例: $0 v1.5.1" >&2
 }
 
 if [[ "$VERSION" == "-h" || "$VERSION" == "--help" ]]; then

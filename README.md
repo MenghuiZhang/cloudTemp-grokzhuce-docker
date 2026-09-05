@@ -2,6 +2,10 @@
 
 Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Castle 同页 mint，以及 Sub2API、CLIProxyAPI（CPA）和 grok2api 多目标导入。
 
+> v1.5.1 修复发布镜像的运行时漂移：正式镜像继承 v1.4.0 已验证的
+> Camoufox、浏览器和 Python 依赖层，再覆盖 v1.5 应用代码。开发用
+> `Dockerfile` 保持独立，正式发布使用 `Dockerfile.release`。
+
 ## 功能
 
 - 同页 same-session 注册（Castle mint + 页内 fetch，默认 CLEAN 主路径）
