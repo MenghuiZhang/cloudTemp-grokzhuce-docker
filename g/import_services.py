@@ -24,6 +24,7 @@ from typing import Any, Callable, Iterable
 import requests
 
 from g.bfs_service import inspect_token_bundle_bfs, token_fingerprint
+from g.account_check import CheckRegistry
 
 try:
     from filelock import FileLock
@@ -774,6 +775,7 @@ class ImportJobManager:
         self.base_dir = Path(base_dir).resolve()
         self.config_store = config_store
         self.targets = targets
+        self.check_registry = CheckRegistry(self.base_dir)
         self.sub2api_importer = sub2api_importer
         self.token_exchanger = token_exchanger
         self.register_proxy_getter = register_proxy_getter or (lambda: "")
@@ -864,6 +866,11 @@ class ImportJobManager:
         normalized: list[dict] = []
         seen: set[str] = set()
         for raw in accounts[:10000]:
+            if self.check_registry.blocked(raw):
+                continue
+            saved_check = self.check_registry.get(raw)
+            if saved_check:
+                raw = {**raw, "clean": saved_check.get("state") == "clean", "risk_status": saved_check.get("state")}
             sso = str(raw.get("sso") or "").strip()
             if not sso or sso in seen:
                 continue
@@ -1110,6 +1117,8 @@ class ImportJobManager:
         raise last or RuntimeError("导入失败")
 
     def _run_target(self, target: str, account: dict, token: dict | None, auth: dict | None, job: dict, register_proxy: str) -> tuple[dict, dict | None, dict | None]:
+        if self.check_registry.blocked(account):
+            raise RuntimeError("账号检测未通过，禁止导入；请先完成复检并应用结果")
         cfg = job["config_snapshot"]
         if account.get("_bfs_blocked"):
             path = Path(cfg["paths"]["cpa_dir"]) / "blocked.json"
@@ -1178,6 +1187,10 @@ class ImportJobManager:
         raise ValueError(f"未知目标: {target}")
 
     def _process_account(self, job: dict, account: dict, register_proxy: str, order: dict[str, int]) -> None:
+        if self.check_registry.blocked(account):
+            for target in account["targets"]:
+                self._set_target(job, account["id"], target, "skipped", "账号检测未通过，暂停导入")
+            return
         token = account.get("auth_token") if isinstance(account.get("auth_token"), dict) else None
         auth = None
         oauth_targets = {
@@ -1249,8 +1262,12 @@ class ImportJobManager:
             cancelled = bool(job.get("cancel_requested"))
             failed = int(job["progress"].get("failed") or 0)
             success = int(job["progress"].get("success") or 0)
+            skipped = int(job["progress"].get("skipped") or 0)
             job["status"] = "cancelled" if cancelled else ("partial" if failed and success else ("failed" if failed else "completed"))
             job["message"] = "任务已取消" if cancelled else ("部分目标失败" if failed else "导入完成")
+            if not cancelled and skipped:
+                job["status"] = "partial" if success else "failed"
+                job["message"] = "部分目标已跳过" if success else "全部目标未导入（检测阻断或已跳过）"
             job["finished_at"] = _utc_now()
             self._persist(job)
         self.log(f"导入任务 {job_id} 结束 · {job['message']}", "success" if job["status"] == "completed" else "warn")

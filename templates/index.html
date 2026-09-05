@@ -349,7 +349,7 @@
           <span>路径：<span id="statMode" class="text-ink-800">同会话 CLEAN</span></span>
           <span>创邮 <span id="statEmailCreateInline" class="text-leaf-600">0</span> / 目标 <span id="statTargetInline" class="text-ink-800">0</span></span>
           <span>邮箱 API 尝试 <span id="statAttemptInline" class="text-ink-800">0</span></span>
-          <span>CLEAN <span id="statCleanInline" class="text-leaf-600">0</span> · PENDING_BFS <span id="statPendingBfsInline" class="text-brand-600">0</span> · UNCHECKED <span id="statUncheckedInline" class="text-sun-500">0</span> · MARKED <span id="statMarked" class="text-rose-500">0</span></span>
+          <span>CLEAN <span id="statCleanInline" class="text-leaf-600">0</span> · 后台检测 <span id="statPendingBfsInline" class="text-brand-600">0</span> · UNCHECKED <span id="statUncheckedInline" class="text-sun-500">0</span> · MARKED <span id="statMarked" class="text-rose-500">0</span> · REVIEW <span id="statReview" class="text-sun-500">0</span></span>
           <span>输出：<span id="outputFile" class="text-ink-800">—</span></span>
           <span>Action：<span id="actionId" class="text-ink-800">—</span></span>
         </div>
@@ -440,6 +440,7 @@
                 <div class="flex justify-between gap-2"><span>Solver URL</span><span id="envSolver" class="font-mono text-brand-600">—</span></div>
                 <div class="flex justify-between gap-2"><span>注册代理</span><a href="/proxy-settings" id="envProxy" class="font-mono text-brand-600 truncate max-w-[58%] text-right">打开</a></div>
                 <div class="flex justify-between gap-2"><span>导入服务</span><a href="/import-services" class="font-mono text-brand-600">打开</a></div>
+                <div class="flex justify-between gap-2"><span>账号检测</span><a href="/account-checks" class="font-mono text-brand-600">打开</a></div>
               </div>
 
               <!-- Turnstile Solver 控制 -->
@@ -1201,6 +1202,7 @@
       if ($('statUnchecked')) $('statUnchecked').textContent = data.unchecked_count ?? 0;
       if ($('statUncheckedInline')) $('statUncheckedInline').textContent = data.unchecked_count ?? 0;
       if ($('statMarked')) $('statMarked').textContent = data.marked_count ?? 0;
+      if ($('statReview')) $('statReview').textContent = data.review_count ?? 0;
       if ($('statPendingBfsInline')) $('statPendingBfsInline').textContent = data.pending_bfs_count ?? 0;
       if ($('statAttemptInline')) $('statAttemptInline').textContent = data.attempt_count ?? 0;
       if ($('statEmailCreateInline')) $('statEmailCreateInline').textContent = data.email_create_count ?? 0;
@@ -1262,6 +1264,7 @@
           let cleanBadge = '<span class="text-sun-500 font-semibold">UNCHECKED</span>';
           if (it.clean === true) cleanBadge = '<span class="text-leaf-600 font-semibold">CLEAN</span>';
           else if (it.clean === false) cleanBadge = '<span class="text-rose-500 font-semibold">MARKED</span>';
+          if (['review', 'infra_retry', 'pending_check'].includes(it.risk_status)) cleanBadge = `<span class="text-sun-500 font-semibold">${escapeHtml(it.risk_status.toUpperCase())}</span>`;
           const tokenBadge = it.has_token
             ? '<span class="text-leaf-600 font-semibold">token✓</span>'
             : '<span class="text-ink-700/35">token·</span>';

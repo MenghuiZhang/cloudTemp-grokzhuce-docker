@@ -48,6 +48,9 @@ from g.proxy_pool import (
 )
 from g.domain_pool import DomainPoolError, get_domain_pool
 from g.bfs_scan_service import apply_scan_report, preview_scan, set_token_bound_override
+from g.account_check import CheckRegistry, fingerprints
+from g.account_check_jobs import CheckJobs, runtime_checker
+from g.account_check_api import create_check_blueprint
 import solver_manager
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -1102,6 +1105,8 @@ def sub2api_import_auth_entry(
     cfg = dict(cfg or get_sub2api_config())
     base = normalize_upstream_url(base_url or cfg.get("url"))
     credentials, name, auth_key, user_id, email = _entry_to_sub2api_credentials(entry, email_hint)
+    if CheckRegistry(BASE_DIR).blocked(credentials):
+        return {"ok": False, "error": "账号检测未通过，禁止导入"}
 
     if not token:
         login = sub2api_http_login(base_url=base, cfg=cfg)
@@ -1561,6 +1566,8 @@ def import_sso_to_upstream(
         sub2["group_id"] = str(group_id).strip()
 
     items = _normalize_import_accounts(sso_lines=sso_lines, accounts=accounts)
+    registry = CheckRegistry(BASE_DIR)
+    items = [item for item in items if not registry.blocked(item)]
     if not items:
         return {"ok": False, "message": "没有可导入的 SSO"}
     if not sub2.get("url"):
@@ -2044,7 +2051,7 @@ IMPORT_PREVIEW_LOCK = threading.RLock()
 
 
 def _queue_configured_auto_import(accounts: list[dict]) -> None:
-    accounts = [item for item in accounts if item.get("sso")]
+    accounts = [item for item in accounts if item.get("sso") and item.get("clean") is True and not CheckRegistry(BASE_DIR).blocked(item)]
     if not accounts:
         return
     cfg = IMPORT_CONFIG.load()
@@ -2067,6 +2074,46 @@ def _queue_configured_auto_import(accounts: list[dict]) -> None:
 
 
 engine.auto_import_callback = _queue_configured_auto_import
+
+
+def _apply_recent_check(account: dict, result: dict) -> None:
+    # Called with engine.file_lock held by historical Apply.
+    wanted = set(fingerprints(account)) | set(result.get("_fingerprints") or [])
+    for item in engine.recent_success:
+        if not wanted.intersection(fingerprints(item)):
+            continue
+        previous = item.get("risk_status") or "unchecked"
+        state = result["state"]
+        count_fields = {"clean": "clean_count", "marked": "marked_count", "review": "review_count",
+                        "infra_retry": "infra_retry_count", "unchecked": "unchecked_count"}
+        if previous != state:
+            old_field, new_field = count_fields.get(previous), count_fields.get(state)
+            if old_field:
+                setattr(engine, old_field, max(0, getattr(engine, old_field, 0) - 1))
+            if new_field:
+                setattr(engine, new_field, getattr(engine, new_field, 0) + 1)
+        item.update(clean=True if state == "clean" else False if state == "marked" else None,
+                    risk_status=state, account_check={k: result[k] for k in ("state", "reason", "checked_at")})
+        if isinstance(account.get("auth_token"), dict):
+            item["auth_token"] = dict(account["auth_token"])
+        if engine._classification_store is not None:
+            engine._classification_store.finalize(email=str(item.get("email") or ""), sso=str(item.get("sso") or ""),
+                                                  state=state, reason=result["reason"])
+        path = engine._accounts_json_path()
+        if path and path.is_file():
+            from g.bfs_service import atomic_write_json
+            records = json.loads(path.read_text(encoding="utf-8"))
+            for record in records:
+                if record.get("sso_token") == item.get("sso"):
+                    record.update(account_check=item["account_check"], risk_status=state, clean=state == "clean")
+            atomic_write_json(path, records)
+
+
+ACCOUNT_CHECKS = CheckJobs(BASE_DIR, runtime_checker(), recent=lambda: list(engine.recent_success),
+                          apply_recent=_apply_recent_check, file_lock=engine.file_lock, proxy_pool=proxy_pool)
+engine.account_check_callback = ACCOUNT_CHECKS.check_registration
+engine.account_check_observer = ACCOUNT_CHECKS.record_registration_observation
+app.register_blueprint(create_check_blueprint(ACCOUNT_CHECKS, require_monitor_token))
 
 
 def mask_secret(value: str, keep: int = 4) -> str:
@@ -3987,6 +4034,7 @@ def _account_from_json(data: dict, *, source: str = "") -> dict | None:
         "sso": sso,
         "auth_token": token if isinstance(token, dict) else None,
         "clean": clean if isinstance(clean, bool) else None,
+        "risk_status": str(data.get("risk_status") or (data.get("account_check") or {}).get("state") or ""),
         "source": source,
     }
 
@@ -4117,6 +4165,7 @@ def _preview_public(account: dict) -> dict:
         "id": account.get("id"),
         "email": account.get("email") or "",
         "clean": account.get("clean"),
+        "risk_status": CheckRegistry(BASE_DIR).get(account).get("state") or account.get("risk_status") or "",
         "has_token": isinstance(account.get("auth_token"), dict),
         "sso_preview": (sso[:10] + "…" + sso[-6:]) if len(sso) > 20 else "已读取",
         "source": account.get("source") or "",

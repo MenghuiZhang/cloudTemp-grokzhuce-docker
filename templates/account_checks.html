@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>账号检测</title>
+  <style>
+    :root{color-scheme:light;--ink:#172033;--muted:#64748b;--line:#dfe4ec;--brand:#5b5bd6}
+    [hidden]{display:none!important}*{box-sizing:border-box}body{margin:0;background:#f5f7fb;color:var(--ink);font:14px/1.6 system-ui,sans-serif}
+    main{max-width:1200px;margin:auto;padding:28px 20px 60px}header,.actions{display:flex;gap:12px;align-items:center;flex-wrap:wrap;justify-content:space-between}h1{margin:0;font-size:28px}h2{margin:0 0 12px;font-size:18px}p{color:var(--muted)}a{color:var(--brand)}
+    section{background:white;border:1px solid var(--line);border-radius:16px;padding:20px;margin-top:16px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}.field{display:flex;flex-direction:column;gap:6px;margin:12px 0}label{font-weight:600}input,select,button{font:inherit;border:1px solid var(--line);border-radius:8px;padding:9px 12px}select[multiple]{min-height:140px}button{cursor:pointer;background:white}button.primary{background:var(--brand);color:white}button:disabled{opacity:.45;cursor:not-allowed}.actions{justify-content:flex-start;margin-top:12px}.hint{font-size:12px;color:var(--muted)}#message{position:sticky;top:0;z-index:2;background:#eef2ff;border-radius:8px;padding:12px;white-space:pre-wrap}#message:empty{display:none}#message.error{background:#fff1f2;color:#b91c1c}
+    .scroll{overflow:auto;max-height:440px}table{width:100%;border-collapse:collapse;white-space:nowrap}th,td{padding:10px;text-align:left;border-bottom:1px solid var(--line);font-size:13px}th{color:var(--muted)}.badge{display:inline-block;padding:2px 8px;border-radius:8px;background:#eef2ff}.clean{background:#dcfce7;color:#166534}.marked{background:#ffe4e6;color:#9f1239}.review,.infra_retry{background:#fef3c7;color:#92400e}.job{padding:12px 0;border-bottom:1px solid var(--line)}progress{width:100%;accent-color:var(--brand)}.empty{color:var(--muted);padding:15px 0}.checks{display:flex;gap:8px;align-items:center}.checks input{width:17px;height:17px}details{margin-top:16px}summary{cursor:pointer;color:var(--brand)}
+    @media(max-width:760px){.grid{grid-template-columns:1fr}main{padding:18px 12px}section{padding:16px}}
+  </style>
+</head>
+<body><main>
+  <header><div><h1>账号检测</h1><p>风险与 BFS 初筛，再用真实回复检查可用性。</p></div><nav><a href="/">注册控制台</a> · <a href="/import-services">导入服务</a></nav></header>
+  <div id="message" role="status" aria-live="polite"></div>
+  <section id="authPanel"><h2>连接检测中心</h2><p>输入现有 MONITOR_TOKEN，令牌仅保留在本页内存中。若尚未设置，请在项目 .env 中添加 MONITOR_TOKEN 并重启 Web 服务。</p><div class="actions"><label for="monitor">管理令牌</label><input id="monitor" type="password" autocomplete="off"><button id="connect" class="primary">连接</button></div></section>
+  <div id="content" hidden>
+    <div class="grid">
+      <section><h2>账号来源</h2><div class="field"><label for="source">选择来源</label><select id="source"><option value="recent">最近注册账号</option><option value="keys">Keys TXT</option><option value="register_sso">注册 JSON</option><option value="accounts">批次账号 JSON</option><option value="cpa">CPA JSON</option><option value="upload">上传 TXT / JSON</option></select></div><div id="selection" class="field"><label for="files">选择账号或文件（可多选）</label><select id="files" multiple></select></div><div id="uploadBox" class="field" hidden><label for="upload">上传文件（UTF-8，最大 10 MB）</label><input id="upload" type="file" accept=".txt,.json"></div><button id="preview">解析并预览</button><div id="previewInfo" class="hint"></div><div id="previewRows" class="scroll"></div></section>
+      <section><h2>检测方式</h2><div class="field"><label for="mode">本次任务</label><select id="mode"><option value="full">完整检测 · 会调用真实聊天</option><option value="passive">仅本地 BFS · 不联网</option></select></div><p class="hint">完整检测默认每个通过初筛的账号生成最多 256 tokens，异常复核可能增加一次生成。thinking 与 TPS 是启发式信号，可疑结果归入 REVIEW。</p><label class="checks"><input id="automatic" type="checkbox">新注册账号自动检测</label><p class="hint">自动检测在 Risk / BFS 通过后执行，只有 CLEAN 可以自动导入。关闭后归入 UNCHECKED。</p><details><summary>可选设置（默认可直接测试）</summary><div class="field"><label for="base">聊天服务地址</label><input id="base" type="url"><span class="hint">OAuth token 会发送到这个地址；账号文件中的地址不会覆盖此设置。</span></div><div class="field"><label for="model">模型</label><input id="model"></div><div class="field"><label for="workers">并发</label><input id="workers" type="number" min="1" max="2"></div><div class="field"><label for="timeout">单次超时（秒）</label><input id="timeout" type="number" min="10" max="120"></div></details><div class="actions"><button id="save">保存设置</button><button id="start" class="primary" disabled>开始检测</button></div></section>
+    </div>
+    <section><div class="actions"><h2>检测任务</h2><button id="refresh">刷新</button></div><p class="hint">历史账号先生成报告，再点击“应用结果”更新本地状态。已导入的远端账号需在下游另行管理。报告保留最近 100 条，最长 30 天。</p><div id="jobs"><div class="empty">暂无检测任务</div></div></section>
+    <section id="detail" hidden><div class="actions"><h2 id="detailTitle">检测结果</h2><button id="export">下载脱敏报告</button></div><p>CLEAN 可导入；MARKED 明确异常；REVIEW 待复核；INFRA_RETRY 服务或网络异常；UNCHECKED 检测未完成。</p><div class="scroll"><table><thead><tr><th>账号 / 指纹</th><th>状态</th><th>原因</th><th>输出 tokens</th><th>TPS</th><th>thinking</th><th>应用</th></tr></thead><tbody id="results"></tbody></table></div></section>
+  </div>
+</main><script src="/static/account_checks.js" defer></script></body></html>

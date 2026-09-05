@@ -34,6 +34,7 @@ from g.proxy_pool import ProxyLease, get_proxy_pool, parse_proxy_line
 from g.domain_pool import DomainLease, get_domain_pool
 from g.bfs_service import atomic_write_json, inspect_token_bundle_bfs
 from g.classification_store import ClassificationStore
+from g.account_check import CheckRegistry, risk_state
 
 try:
     from g import AntibotService
@@ -1398,6 +1399,8 @@ class RegisterEngine:
         self.fail_count = 0
         self.clean_count = 0
         self.marked_count = 0
+        self.review_count = 0
+        self.infra_retry_count = 0
         self.unchecked_count = 0
         self.pending_bfs_count = 0
         self.oauth_infra_streak = 0
@@ -1433,6 +1436,8 @@ class RegisterEngine:
         # Web runtime may inject a non-blocking multi-target auto-import queue.
         # CLI/standalone modes leave it unset and keep their existing behavior.
         self.auto_import_callback = None
+        self.account_check_callback = None
+        self.account_check_observer = None
         self.on_run_start = None
         self.on_run_complete = None
         self._log_fn = log_fn or (lambda msg, level="info": print(msg))
@@ -1503,6 +1508,8 @@ class RegisterEngine:
             "fail_count": self.fail_count,
             "clean_count": int(getattr(self, "clean_count", 0) or 0),
             "marked_count": int(getattr(self, "marked_count", 0) or 0),
+            "review_count": int(getattr(self, "review_count", 0) or 0),
+            "infra_retry_count": int(getattr(self, "infra_retry_count", 0) or 0),
             "unchecked_count": int(getattr(self, "unchecked_count", 0) or 0),
             "pending_bfs_count": int(getattr(self, "pending_bfs_count", 0) or 0),
             "attempt_count": attempts,
@@ -1835,6 +1842,7 @@ class RegisterEngine:
         auth_token: Optional[dict] = None,
         proxy_audit: Optional[dict] = None,
         clean: Optional[bool] = None,
+        check_state: str = "",
     ) -> str:
         """
         写入 SSO 并计入成功。返回 success_id（空串表示未计入成功列表）。
@@ -1886,7 +1894,13 @@ class RegisterEngine:
                 email=email, sso=sso, proxy_audit=proxy_audit, **email_meta
             )
 
-            if clean is None:
+            if check_state in ("marked", "review", "infra_retry"):
+                clean = False if check_state == "marked" else None
+                field = {"marked": "marked_count", "review": "review_count", "infra_retry": "infra_retry_count"}[check_state]
+                setattr(self, field, getattr(self, field, 0) + 1)
+                if classification_store is not None:
+                    classification_store.finalize(email=email, sso=sso, state=check_state, reason="ACCOUNT_CHECK")
+            elif clean is None:
                 self.unchecked_count += 1
                 if classification_store is not None:
                     classification_store.finalize(
@@ -1900,7 +1914,7 @@ class RegisterEngine:
                     )
 
             self.success_count += 1
-            avg = (time.time() - self.start_time) / max(1, self.success_count)
+            avg = (time.time() - (self.start_time or time.time())) / max(1, self.success_count)
             nsfw_tag = "✓" if unhinged_ok else "…"
             # 浅拷贝 token，避免后续引用被外部改写
             cached_token = None
@@ -1915,9 +1929,10 @@ class RegisterEngine:
                     "auth_token": cached_token,
                     "nsfw": unhinged_ok,
                     "clean": clean,
-                    "risk_status": "clean" if clean is True else "unchecked",
+                    "risk_status": check_state or ("clean" if clean is True else "unchecked"),
                     "time": datetime.now().strftime("%H:%M:%S"),
                     "imported": False,
+                    "auto_queued": bool(check_state == "clean" and callable(self.auto_import_callback)),
                     "email_provider": email_meta.get("email_provider") or "",
                     "email_domain": email_meta.get("email_domain") or "",
                 }
@@ -1926,7 +1941,7 @@ class RegisterEngine:
             self.recent_success.appendleft(success_item)
             extra = f" | {note}" if note else ""
             created = int(getattr(self, "email_create_count", 0) or 0)
-            risk_label = "CLEAN" if clean is True else "UNCHECKED"
+            risk_label = check_state.upper() if check_state else ("CLEAN" if clean is True else "UNCHECKED")
             self.log(
                 f"{risk_label} · 成功 {self.success_count} · 创邮 {created}/{self.target_count} | {email} | "
                 f"SSO: {sso[:15]}... | 平均: {avg:.1f}s | NSFW: {nsfw_tag}{extra}",
@@ -2078,6 +2093,10 @@ class RegisterEngine:
             "tier": "basic",
             "cloudflare_cookies": "",
         }
+        # Upserts must preserve a completed check and its disabled provenance.
+        for key in ("account_check", "risk_status", "clean", "disabled", "account_check_disabled"):
+            if found and key in found:
+                record[key] = found[key]
         resolved_provider = email_provider or old_email_provider
         resolved_domain = email_domain or old_email_domain
         if resolved_provider:
@@ -2154,6 +2173,7 @@ class RegisterEngine:
             if AntibotService is None:
                 self.log(f"{email} risk 跳过：AntibotService 不可用", "warn")
                 return None
+            CheckRegistry(_BASE_DIR).put({"sso": sso}, {"state": "unchecked", "reason": "CHECK_PENDING"})
             self.log(f"{email} risk 探测开始…", "info")
             t0 = time.time()
             ab = AntibotService()
@@ -2188,7 +2208,14 @@ class RegisterEngine:
                         os.environ.pop("GROK_RISK_FORCE_DIRECT", None)
                     else:
                         os.environ["GROK_RISK_FORCE_DIRECT"] = prev_force
-            clean = bool(AntibotService.is_risk_clean(risk))
+            state = risk_state(risk)
+            if state == "marked":
+                time.sleep(1)
+                confirmation = ab.probe_account_risk(sso, sso_rw=sso_rw or sso,
+                    impersonate="chrome124", timeout=20, proxy_spec=proxy_spec)
+                if risk_state(confirmation) != "marked":
+                    state = "review"
+            clean = state == "clean"
             summary = AntibotService.risk_mark_summary(risk)
             elapsed = round(time.time() - t0, 1)
             # SSO JWT 通常只有 session_id；risk 接口拿到 user_id 后及时回填。
@@ -2208,6 +2235,16 @@ class RegisterEngine:
                     "success",
                 )
                 return True
+            CheckRegistry(_BASE_DIR).put({"sso": sso}, {"state": state, "reason": "RISK_" + state.upper()})
+            if callable(self.account_check_observer):
+                self.account_check_observer({"email": email, "sso": sso}, {"state": state, "reason": "RISK_" + state.upper()})
+            if state == "review":
+                with self.file_lock:
+                    self.review_count += 1
+                if self._classification_store is not None:
+                    self._classification_store.finalize(email=email, sso=sso, state="review", reason="RISK_REVIEW")
+                self.log(f"{email} risk REVIEW · 辅助信号或两次结果不一致 · 暂停导入", "warn")
+                return None
             # TLS/代理基建失败：SSO 可能仍是好号，禁止记 MARKED、不进 _marked
             if AntibotService.is_risk_infra_error(risk):
                 if self._classification_store is not None:
@@ -2444,6 +2481,9 @@ class RegisterEngine:
 
             if risk_gated:
                 if not isinstance(auth_token, dict) or not is_auth_token_usable(auth_token):
+                    CheckRegistry(_BASE_DIR).put({"sso": sso}, {"state": "infra_retry", "reason": "OAUTH_NO_TOKEN"})
+                    if callable(self.account_check_observer):
+                        self.account_check_observer({"email": email, "sso": sso}, {"state": "infra_retry", "reason": "OAUTH_NO_TOKEN"})
                     if self._classification_store is not None:
                         self._classification_store.finalize(
                             email=email,
@@ -2479,11 +2519,15 @@ class RegisterEngine:
                     auth = build_cpa_record(auth_token, email=email, sso=sso, disabled=True)
                     atomic_write_json(cpa_path, auth)
                     reason = "BFS_MARKED" if bfs.get("has_bfs") else "BFS_UNKNOWN"
+                    bfs_state = "marked" if bfs.get("has_bfs") else "review"
+                    CheckRegistry(_BASE_DIR).put({"sso": sso, "auth_token": auth_token}, {"state": bfs_state, "reason": reason})
+                    if callable(self.account_check_observer):
+                        self.account_check_observer({"email": email, "sso": sso, "auth_token": auth_token}, {"state": bfs_state, "reason": reason})
                     if self._classification_store is not None:
                         self._classification_store.finalize(
                             email=email,
                             sso=sso,
-                            state="marked",
+                            state=bfs_state,
                             reason=reason,
                             metadata={
                                 "source": "bfs",
@@ -2495,25 +2539,76 @@ class RegisterEngine:
                             },
                         )
                     with self._bfs_lock:
-                        self.marked_count += 1
+                        if bfs_state == "marked":
+                            self.marked_count += 1
+                        else:
+                            self.review_count += 1
                         self.oauth_infra_streak = 0
                     self.log(f"{email} {reason} · CPA 已本地禁用保存 · 不进入下游", "warn")
                     return
 
                 with self._bfs_lock:
                     self.oauth_infra_streak = 0
+                account = {"email": email, "sso": sso, "auth_token": auth_token,
+                           "_proxy_spec": proxy_lease.spec if proxy_lease else ""}
+                callback = self.account_check_callback
+                if callback is None:
+                    from g.account_check_jobs import CheckJobs, runtime_checker
+                    with self._bfs_lock:
+                        if not hasattr(self, "_standalone_checks"):
+                            self._standalone_checks = CheckJobs(_BASE_DIR, runtime_checker(), proxy_pool=self.proxy_pool)
+                    callback = self._standalone_checks.check_registration
+                self.log(f"{email} [后台] 账号检测开始 · Risk/BFS 初筛通过", "info")
+                try:
+                    outcome = callback(account)
+                except Exception:
+                    outcome = {"state": "infra_retry", "reason": "CHECK_FAILED"}
+                state = outcome.get("state", "infra_retry")
+                CheckRegistry(_BASE_DIR).put(account, {"state": state, "reason": outcome.get("reason", "ACCOUNT_CHECK")})
+                auth_token = account.get("auth_token") or auth_token
                 success_id = self._record_success(
                     email=email,
                     sso=sso,
                     unhinged_ok=False,
-                    note="risk=CLEAN · bfs=CLEAN",
+                    note=f"account_check={state.upper()} · {outcome.get('reason', '')}",
                     already_written=False,
                     auth_token=auth_token,
                     proxy_audit=self.proxy_pool.lease_audit(proxy_lease),
-                    clean=True,
+                    clean=True if state == "clean" else None,
+                    check_state=state,
                 )
                 if not success_id:
                     return
+                with self.file_lock:
+                    path = self._accounts_json_path()
+                    if path and path.is_file():
+                        records = json.loads(path.read_text(encoding="utf-8"))
+                        for record in records:
+                            if record.get("sso_token") == sso:
+                                record.update(account_check={"state": state, "reason": outcome.get("reason", "ACCOUNT_CHECK")},
+                                              risk_status=state, clean=state == "clean")
+                        atomic_write_json(path, records)
+                if state != "clean":
+                    from convert_sso_json import SSORecord, build_cpa_record, cpa_path_for_record
+                    cpa_path = cpa_path_for_record(_BASE_DIR / "converted_auth", SSORecord(source=Path("runtime.json"), email=email, sso=sso))
+                    auth = build_cpa_record(auth_token, email=email, sso=sso, disabled=True)
+                    auth.update(account_check={"state": state, "reason": outcome.get("reason", "ACCOUNT_CHECK")}, account_check_disabled=True)
+                    atomic_write_json(cpa_path, auth)
+                    return
+                callback = self.auto_import_callback
+                if callable(callback):
+                    try:
+                        callback([{**account, "id": success_id, "clean": True, "risk_status": "clean"}])
+                        with self.file_lock:
+                            for item in self.recent_success:
+                                if item.get("id") == success_id:
+                                    item["auto_queued"] = True
+                    except Exception:
+                        with self.file_lock:
+                            for item in self.recent_success:
+                                if item.get("id") == success_id:
+                                    item["auto_queued"] = False
+                        self.log("账号检测通过，但自动导入排队失败，可手动重试", "warn")
 
             unhinged_ok = False
             try:
@@ -2592,6 +2687,7 @@ class RegisterEngine:
         if risk_gated:
             with self._bfs_lock:
                 self.pending_bfs_count += 1
+            CheckRegistry(_BASE_DIR).put({"sso": sso}, {"state": "unchecked", "reason": "CHECK_PENDING"})
             if self._classification_store is not None:
                 self._classification_store.add_pending(
                     email=email, sso=sso, data={"state": "PENDING_BFS"}
@@ -3981,7 +4077,7 @@ class RegisterEngine:
                             "clean": it.get("clean"),
                         }
                         for it in list(self.recent_success)
-                        if it.get("sso") and it.get("clean") is True
+                        if it.get("sso") and it.get("clean") is True and not it.get("auto_queued")
                     ])
                 except Exception as auto_exc:
                     self.log(f"自动导入排队失败: {auto_exc}", "warn")
@@ -4170,7 +4266,7 @@ class RegisterEngine:
             # 线程还没跑到 initialize 时 status 也要立刻占位，防止重复启动
             if self.is_running() or (
                 self._worker_thread is not None and self._worker_thread.is_alive()
-            ):
+            ) or self._enrich_pending > 0:
                 return {"ok": False, "message": "任务已在运行中", **self.get_status()}
 
             workers = max(1, min(int(workers), 64))
@@ -4194,6 +4290,8 @@ class RegisterEngine:
             self.fail_count = 0
             self.clean_count = 0
             self.marked_count = 0
+            self.review_count = 0
+            self.infra_retry_count = 0
             self.unchecked_count = 0
             self.pending_bfs_count = 0
             self.oauth_infra_streak = 0

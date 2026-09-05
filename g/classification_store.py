@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-FINAL_STATES = ("clean", "marked", "unchecked", "infra_retry")
+FINAL_STATES = ("clean", "marked", "review", "unchecked", "infra_retry")
 
 
 def _private_atomic_text(path: Path, text: str) -> None:
@@ -126,4 +126,3 @@ class ClassificationStore:
     def pending(self) -> list[dict[str, Any]]:
         with self._lock:
             return self._read_pending()
-

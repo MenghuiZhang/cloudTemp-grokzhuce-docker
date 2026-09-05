@@ -20,7 +20,7 @@
 </head>
 <body>
 <main class="shell">
-  <header class="top"><div><h1>导入服务</h1><p>配置多个下游、预览账号来源，并用目标矩阵跟踪批量任务。</p></div><a href="/">← 返回注册控制台</a></header>
+  <header class="top"><div><h1>导入服务</h1><p>配置多个下游、预览账号来源，并用目标矩阵跟踪批量任务。</p></div><nav><a href="/account-checks">账号检测</a> · <a href="/">返回注册控制台</a></nav></header>
 
   <section id="serviceCards" class="cards"></section>
 
@@ -89,7 +89,7 @@
 
     <aside class="stack">
       <section class="panel"><h2>注册后自动导入</h2><p class="sub">服务测试通过后才能开启；默认全部关闭。</p><div id="autoTargets" class="checks" style="grid-template-columns:1fr"></div><div class="actions"><button id="saveAuto" class="btn primary">保存当前服务</button></div><div id="autoMessage" class="message"></div></section>
-      <section class="panel"><h2>运行规则</h2><div class="warning">CLEAN 可进入全部目标；MARKED 默认仅允许 grok2api Web/Console。OAuth 每账号最多换票一次，任务取消不会撤回正在执行的请求。</div><div class="path" style="margin-top:12px">CPA：converted_auth/cpa/<br>本地池：converted_auth/grok2api/token.json<br>任务：logs/import_jobs/</div></section>
+      <section class="panel"><h2>运行规则</h2><div class="warning">CLEAN 可进入全部目标；MARKED、REVIEW 和 INFRA_RETRY 暂停导入，请在账号检测页复检并应用结果。UNCHECKED 仅支持 Web/Console。任务取消不会撤回正在执行的请求。</div><div class="path" style="margin-top:12px">CPA：converted_auth/cpa/<br>本地池：converted_auth/grok2api/token.json<br>任务：logs/import_jobs/</div></section>
     </aside>
   </div>
 </main>

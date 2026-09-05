@@ -9,9 +9,10 @@ Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Cas
 - Cloudflare Temp 多基础域名顺序轮替、即时列表替换与随机子域
 - 本地 Camoufox Turnstile Solver（也可接 YesCaptcha）
 - 多线程并发；主流程 / Risk·Token·NSFW 双栏日志
-- Risk 开启时按 `Risk → PENDING_BFS → OAuth/BFS` 分类；Risk 关闭时不执行 Risk、OAuth 或 BFS，账号归入 `UNCHECKED`
+- Risk 开启时按 `Risk → PENDING_BFS → OAuth/BFS → 账号检测` 分类；Risk 关闭时不执行 Risk、OAuth、BFS 或真实聊天检测，账号归入 `UNCHECKED`
 - 批次目标统一按“成功创建邮箱数”计；创邮失败不占目标，已创邮的在途账号会继续完成分类
-- 统一互斥分类文件：`*_clean.txt` / `*_marked.txt` / `*_unchecked.txt` / `*_infra_retry.txt`
+- 统一互斥分类文件：`*_clean.txt` / `*_marked.txt` / `*_review.txt` / `*_unchecked.txt` / `*_infra_retry.txt`
+- 独立账号检测中心：新账号后台自动检测、历史账号多来源批量复检、脱敏报告与手动应用
 - Risk MARKED 节点阶梯冷却（1 / 5 / 15 / 30 分钟）；仅明确 Risk CLEAN 重置该节点阶梯
 - 独立导入中心：最近成功 / Keys / 注册 JSON / 上传文件，多目标预览、后台任务和失败重试
 - CPA/OIDC 本地生成与 CLIProxyAPI 上传；grok2api 本地池、chenyme Web/Console/Build、jiujiu 兼容
@@ -153,9 +154,9 @@ cp .env.example .env
 - 默认**不**自动导入；服务测试通过后，可在导入中心按目标开启注册后自动导入。
 - 导入配置和写入型密钥保存在 `data/import_services.json`，API 只返回掩码；旧版
   `converted_auth/import_services.json` 会在首次读取时自动迁移且保留原文件。
-- Risk CLEAN 后先异步换票并检查 JWT `bfs` claim；只有 BFS CLEAN 才归入 CLEAN 结果并进入敏感下游导入。
+- Risk CLEAN 后先异步换票并检查 JWT `bfs` claim，再执行账号检测；完整检测 CLEAN 后才自动导入。
 - JWT 中只要存在 `bfs` key（包括 `bfs: 0`）就是 MARKED；已取得但无法解码的 token 按 BFS UNKNOWN 处理。
-- BFS MARKED/UNKNOWN 的 CPA 仅保留在本地且强制 `disabled=true`，不进入任何下游。
+- BFS MARKED/UNKNOWN 的 CPA 仅保留在本地且强制 `disabled=true`，不进入任何下游；注册路径中 BFS UNKNOWN 归入 REVIEW。
 
 ## 使用
 
@@ -180,6 +181,7 @@ python start.py
 
 - **邮箱配置**：独立页面管理 provider、凭据、域名池、测试与启用
 - **导入服务**：独立页面管理 Sub2API、CLIProxyAPI 和 grok2api，地址为 `/import-services`
+- **账号检测**：独立页面选择来源、后台检测、查看与应用结果，地址为 `/account-checks`
 - **配置**：Solver 等通用参数 → 写入 `.env`
 - **日志与磁盘保护**：抓包默认关闭；可查看占用、调整保留上限并清理历史诊断抓包
 - **注册代理**：独立页面管理代理池、调度与健康状态 → 写入 `data/proxy_pool.json`
@@ -274,6 +276,45 @@ python scan_bfs_auth.py override converted_auth/cpa/xai-example.json --reason "m
 ```
 
 Risk MARKED 不允许这种放行；token 更换后旧指纹自动失效。
+
+## 账号检测中心
+
+打开 `/account-checks`，输入现有 `.env` 中的 `MONITOR_TOKEN`。首次未设置该值时，
+添加一个随机管理令牌并重启 Web 服务。页面令牌只在当前页内存保留，所有检测数据和写入 API 都要求鉴权。
+
+默认无需配置聊天服务：使用 `https://cli-chat-proxy.grok.com/v1/chat/completions`、
+模型 `grok-4.5` 和账号 OAuth token。模型及端点可在页面“可选设置”中调整。
+账号文件自带的 `base_url`、HTTP headers 不会覆盖管理员设置，跨域重定向不会携带凭据跟随。
+该端点的可达性和模型支持由 xAI 决定；404、模型不支持等进入 REVIEW，不作为账号封禁证据。
+
+1. 选择最近注册、Keys TXT、注册 JSON、批次 `*_accounts.json`、CPA JSON 或上传 TXT/JSON；预览会去重，每批最多 2000 个账号。
+2. “完整检测”对有 SSO 的账号先执行 Risk，必要时通过现有 OAuth 流程换票，再检查 BFS、网页辅助信号和真实流式回复。
+   只有 OAuth 的 CPA 可执行 BFS 和聊天检测；不把缺少 SSO 当成账号异常。
+3. 真实聊天默认并发 2、单次超时 90 秒、最多 256 输出 tokens。没有 thinking、输出不足 32 tokens、缺少 usage 或 TPS 异常只提示复核，不能证明模型降智。
+4. “仅本地 BFS”不会联网或换票。没有 bfs 仅表示本地检查未发现该字段，结果仍为 UNCHECKED；不会据此放行完整检测。
+5. 新注册账号在现有后台 enrich 池完成检测，CLEAN 后单独排队自动导入。批次结束后仍有后台工作时禁止启动新批次，避免串写输出文件。
+6. 历史任务先生成报告，点击“应用结果”后才更新本地状态。Apply 会验证原始凭据版本，跳过已换票、已应用或被更新报告覆盖的记录。
+
+| 状态 | 含义与处理 |
+| --- | --- |
+| CLEAN | 检测通过，可自动导入 |
+| MARKED | BFS 字段存在，或明确 deny / 账号权限错误得到确认；禁止导入 |
+| REVIEW | 单独 botFlag、样本不足、质量信号、额度/限流或结果不一致；暂停导入，复检后再应用 |
+| INFRA_RETRY | 网络、代理或服务错误；暂停导入，可稍后复检 |
+| UNCHECKED | 缺凭据、未完整检测或关闭自动检测；不自动导入 |
+
+401 尝试刷新一次 OAuth；明确账号权限 403 和质量异常复测一次；网络/5xx 最多重试两次。
+429 尊重 `Retry-After`：不超过 60 秒时等待后重试一次，较长时间交给后续复检；当前进程会阻止同账号在该等待期内再次发起检测。
+错误重试保持同一出口，不通过更换代理绕过限流或权限拒绝。选择出口时优先账号原代理（历史动态代理模板只能恢复配置，不能保证原会话出口），再使用当前池，无可用代理则直连。
+
+检测设置保存在 `data/account_checks_config.json`；脱敏报告在 `data/account_checks/`，
+最多保留 100 个已结束任务或 30 天；重启中的任务标为 `interrupted`，不自动重放请求。
+导入门禁状态保存在 `data/account_check_states.json`，以凭据 SHA-256 关联，不因报告过期而自动解除异常。
+检测期间换票/刷新得到的新凭据单独以 0600 权限保存于 `data/account_check_credentials/`，Apply 时用于更新原始账号记录，
+报告与 API 不包含完整邮箱、SSO/OAuth、代理密码或聊天正文。这些目录均已加入 Git 忽略规则。
+
+Apply 只修改本地记录和分类旁文件，不删除账号，不撤销已导入的远端账号。
+仅由本功能禁用的本地记录才会在后续 CLEAN 应用时恢复；已有的人工禁用会保留。
 
 ## 测试
 

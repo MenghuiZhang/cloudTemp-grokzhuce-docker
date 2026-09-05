@@ -47,6 +47,10 @@ data/proxy_pool.json
 data/domain_pool.json
 data/asn_blacklist.json
 data/bfs_scans/
+data/account_checks/
+data/account_checks_config.json
+data/account_check_states.json
+data/account_check_credentials/
 proxies/
 proxies*.txt
 *_proxy*.txt
