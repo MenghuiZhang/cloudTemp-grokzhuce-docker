@@ -18,6 +18,11 @@ from g.bfs_service import atomic_write_json, token_fingerprint
 from g.classification_store import ClassificationStore
 
 SOURCE_DIRS = {"keys": "keys", "register_sso": "register_sso", "cpa": "converted_auth/cpa", "accounts": "keys"}
+ACTIVE_JOB_STATUSES = frozenset({"running", "queued", "cancelling", "scheduled", "result_ready", "applying"})
+
+
+class ActiveJobError(ValueError):
+    pass
 
 
 def account_check_delay_seconds(raw=None) -> int:
@@ -350,9 +355,7 @@ class CheckJobs:
 
     def _prune(self):
         # Only generated, completed report files are subject to retention.
-        finished = sorted((j for j in self.jobs.values() if j["status"] not in (
-            "running", "queued", "cancelling", "scheduled", "result_ready", "applying"
-        )),
+        finished = sorted((j for j in self.jobs.values() if j["status"] not in ACTIVE_JOB_STATUSES),
                           key=lambda j: j["created_at"], reverse=True)
         cutoff = time.time() - 30 * 86400
         for index, job in enumerate(finished):
@@ -405,6 +408,32 @@ class CheckJobs:
             if job_id not in self.jobs:
                 raise KeyError("任务不存在")
             return self.public(self.jobs[job_id])
+
+    def delete(self, job_id):
+        with self.lock:
+            job = self.jobs.get(job_id)
+            if not job:
+                raise KeyError("任务不存在")
+            if job.get("status") in ACTIVE_JOB_STATUSES:
+                raise ActiveJobError("运行中或待应用的任务不能删除")
+            (self.directory / (job_id + ".json")).unlink(missing_ok=True)
+            self._remove_pending_account(job_id)
+            self.jobs.pop(job_id, None)
+            self.cancels.pop(job_id, None)
+            self._scheduled_inflight.discard(job_id)
+            return {"id": job_id}
+
+    def clear_history(self):
+        with self.lock:
+            job_ids = [job_id for job_id, job in self.jobs.items()
+                       if job.get("status") not in ACTIVE_JOB_STATUSES]
+            for job_id in job_ids:
+                (self.directory / (job_id + ".json")).unlink(missing_ok=True)
+                self._remove_pending_account(job_id)
+                self.jobs.pop(job_id, None)
+                self.cancels.pop(job_id, None)
+                self._scheduled_inflight.discard(job_id)
+            return len(job_ids)
 
     def _persist(self, job):
         atomic_write_json(self.directory / (job["id"] + ".json"), job)

@@ -13,7 +13,7 @@ from flask import Flask
 from g.account_check import (AccountChecker, CheckRegistry, chat_url, credential_version,
                              inspect_stream, now, parse_bot_page, risk_state)
 from g.account_check_api import create_check_blueprint
-from g.account_check_jobs import CheckJobs, account_check_delay_seconds
+from g.account_check_jobs import ActiveJobError, CheckJobs, account_check_delay_seconds
 from g.classification_store import ClassificationStore
 
 
@@ -519,22 +519,60 @@ class CheckJobTests(unittest.TestCase):
         self.jobs._prune()
         self.assertNotIn(job["id"], self.jobs.jobs)
 
+    def test_delete_finished_history_removes_report_but_keeps_registry(self):
+        job = self.run_upload()
+        self.jobs.registry.put(account(), {"state": "marked", "reason": "TEST"})
+        self.jobs._write_pending_account(job["id"], account())
+        report_path = self.jobs.directory / (job["id"] + ".json")
+        pending_path = self.jobs._pending_path(job["id"])
+
+        self.assertEqual(self.jobs.delete(job["id"]), {"id": job["id"]})
+
+        self.assertFalse(report_path.exists())
+        self.assertFalse(pending_path.exists())
+        self.assertTrue(self.jobs.registry.blocked(account()))
+        with self.assertRaises(KeyError):
+            self.jobs.get(job["id"])
+
+    def test_delete_rejects_active_jobs_and_clear_history_keeps_them(self):
+        active_job = self.jobs._new_job(1, "upload")
+        finished_job = self.jobs._new_job(1, "upload")
+        finished_job["status"] = "failed"
+        self.jobs._persist(finished_job)
+
+        with self.assertRaises(ActiveJobError):
+            self.jobs.delete(active_job["id"])
+        self.assertEqual(self.jobs.clear_history(), 1)
+        self.assertIn(active_job["id"], self.jobs.jobs)
+        self.assertNotIn(finished_job["id"], self.jobs.jobs)
+        self.assertTrue((self.jobs.directory / (active_job["id"] + ".json")).exists())
+
 
 class CheckAPITests(unittest.TestCase):
-    def test_all_data_and_write_routes_require_monitor_token(self):
-        import app as webapp
+    def test_routes_need_no_token_and_delete_only_finished_jobs(self):
         with tempfile.TemporaryDirectory() as temp:
             jobs = CheckJobs(Path(temp), Mock())
-            self.addCleanup(jobs.executor.shutdown)
+            self.addCleanup(jobs.shutdown)
             app = Flask(__name__)
-            app.register_blueprint(create_check_blueprint(jobs, webapp.require_monitor_token))
+            app.register_blueprint(create_check_blueprint(jobs))
             client = app.test_client()
-            with patch.object(webapp, "MONITOR_TOKEN", "test-only"):
-                for method, path in [("get", ""), ("get", "/jobs"), ("get", "/jobs/id"), ("post", "/config"),
-                                     ("post", "/preview"), ("post", "/jobs"), ("post", "/jobs/id/apply"), ("post", "/jobs/id/cancel")]:
-                    with self.subTest(path=path):
-                        self.assertEqual(getattr(client, method)("/api/account-checks" + path).status_code, 401)
-                self.assertEqual(client.get("/api/account-checks", headers={"X-Monitor-Token": "test-only"}).status_code, 200)
+            self.assertEqual(client.get("/api/account-checks").status_code, 200)
+
+            finished_job = jobs._new_job(1, "upload")
+            finished_job["status"] = "completed"
+            jobs._persist(finished_job)
+            response = client.delete("/api/account-checks/jobs/" + finished_job["id"])
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json()["job"]["id"], finished_job["id"])
+
+            active_job = jobs._new_job(1, "upload")
+            response = client.delete("/api/account-checks/jobs/" + active_job["id"])
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("不能删除", response.get_json()["message"])
+
+            response = client.delete("/api/account-checks/jobs")
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json()["deleted"], 0)
 
 
 class CheckRegistrationTests(unittest.TestCase):

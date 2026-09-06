@@ -2125,7 +2125,7 @@ ACCOUNT_CHECKS = CheckJobs(
 )
 engine.account_check_callback = ACCOUNT_CHECKS.check_registration
 engine.account_check_observer = ACCOUNT_CHECKS.record_registration_observation
-app.register_blueprint(create_check_blueprint(ACCOUNT_CHECKS, require_monitor_token))
+app.register_blueprint(create_check_blueprint(ACCOUNT_CHECKS))
 
 
 def mask_secret(value: str, keep: int = 4) -> str:

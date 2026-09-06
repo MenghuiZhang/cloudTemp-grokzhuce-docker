@@ -16,7 +16,7 @@ target_tag=""
 usage() {
   echo "用法: $0 <镜像标签> [--force]" >&2
   echo "      $0 --image-ref <完整镜像引用> [--force]" >&2
-  echo "示例: $0 v1.5.1" >&2
+  echo "示例: $0 v1.5.3" >&2
 }
 
 while (($#)); do

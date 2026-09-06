@@ -2,8 +2,8 @@
 
 Web 控制台 + same-session 注册引擎，支持临时邮箱、Turnstile、Castle 同页 mint，以及 Sub2API、CLIProxyAPI（CPA）和 grok2api 多目标导入。
 
-> v1.5.2 在 Risk / OAuth / BFS 通过 60 秒后异步执行一次真实对话检测，
-> 并新增 REVIEW 显式手动导入通道。正式镜像继续继承 v1.4.0 已验证的
+> v1.5.3 取消账号检测页的密钥输入，并新增独立历史 Grid、单条删除与清空功能。
+> BFS 运维写入 API 仍保留 `MONITOR_TOKEN` 鉴权。正式镜像继续继承 v1.4.0 已验证的
 > Camoufox、浏览器和 Python 依赖层，再覆盖 v1.5 应用代码。
 
 ## 功能
@@ -284,8 +284,8 @@ Risk MARKED 不允许这种放行；token 更换后旧指纹自动失效。
 
 ## 账号检测中心
 
-打开 `/account-checks`，输入现有 `.env` 中的 `MONITOR_TOKEN`。首次未设置该值时，
-添加一个随机管理令牌并重启 Web 服务。页面令牌只在当前页内存保留，所有检测数据和写入 API 都要求鉴权。
+打开 `/account-checks` 即可使用，账号检测页及其 API 不要求 `MONITOR_TOKEN`。
+`MONITOR_TOKEN` 仍用于保护 BFS 运维写入 API。请仅在受信网络中开放 Web 控制台。
 
 默认无需配置聊天服务：使用 `https://cli-chat-proxy.grok.com/v1/chat/completions`、
 模型 `grok-4.5` 和账号 OAuth token。模型及端点可在页面“可选设置”中调整。

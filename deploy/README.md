@@ -55,7 +55,7 @@ COMPOSE_PROJECT_NAME=grok-prod
 GROK_BIND_ADDRESS=127.0.0.1
 GROK_HOST_PORT=3333
 GROK_IMAGE_REPOSITORY=ghcr.io/menghuizhang/cloudtemp-grokzhuce-docker
-GROK_IMAGE_REF=ghcr.io/menghuizhang/cloudtemp-grokzhuce-docker:v1.5.1
+GROK_IMAGE_REF=ghcr.io/menghuizhang/cloudtemp-grokzhuce-docker:v1.5.3
 DEPLOY_HEALTH_TIMEOUT=180
 ```
 
@@ -86,7 +86,7 @@ UPSTREAM_URL=https://SUB2API_DOMAIN.example.com
 只安装一个正式实例时，可在完成 GHCR 机器账号授权后运行：
 
 ```bash
-./deploy/scripts/install-prod.sh v1.5.1
+./deploy/scripts/install-prod.sh v1.5.3
 ```
 
 脚本会创建缺失的 `.env`、`deploy/deploy.env` 和持久化目录，先复用当前 Linux
@@ -100,7 +100,7 @@ UPSTREAM_URL=https://SUB2API_DOMAIN.example.com
 
 ```bash
 # 正式环境：只部署已经由 CI 发布的版本标签
-./deploy/scripts/deploy.sh v1.5.1
+./deploy/scripts/deploy.sh v1.5.3
 
 # 测试环境
 ./deploy/scripts/deploy.sh main
@@ -113,7 +113,7 @@ docker network ls --filter name=grok-
 仅在已经接受任务中断时才可使用 `--force`。它不会安全保存内存中的任务状态：
 
 ```bash
-./deploy/scripts/deploy.sh v1.5.1 --force
+./deploy/scripts/deploy.sh v1.5.3 --force
 ```
 
 手动切回部署状态中记录的上一镜像：

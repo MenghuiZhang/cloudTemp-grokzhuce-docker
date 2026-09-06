@@ -1,10 +1,11 @@
-"""Authenticated account-check routes; all credentials stay on the server."""
+"""Account-check routes; all credentials stay on the server."""
 from flask import Blueprint, jsonify, render_template, request
 
 from g.account_check import masked_email
+from g.account_check_jobs import ActiveJobError
 
 
-def create_check_blueprint(jobs, authenticate):
+def create_check_blueprint(jobs):
     bp = Blueprint("account_checks", __name__)
 
     @bp.get("/account-checks")
@@ -30,20 +31,21 @@ def create_check_blueprint(jobs, authenticate):
     def missing(_exc):
         return jsonify(ok=False, message="任务不存在"), 404
 
+    @bp.errorhandler(ActiveJobError)
+    def active_job(exc):
+        return jsonify(ok=False, message=str(exc)), 409
+
     @bp.get("/api/account-checks")
-    @authenticate
     def overview():
         return jsonify(ok=True, config=jobs.config(), delay_seconds=jobs.delay_seconds,
                        sources=jobs.files(), jobs=jobs.list_jobs(),
                        recent=[{"id": r.get("id"), "email": masked_email(r.get("email"))} for r in jobs.recent()])
 
     @bp.post("/api/account-checks/config")
-    @authenticate
     def config():
         return jsonify(ok=True, config=jobs.save_config(body()))
 
     @bp.post("/api/account-checks/preview")
-    @authenticate
     def preview():
         if request.files:
             upload = request.files.get("file")
@@ -66,7 +68,6 @@ def create_check_blueprint(jobs, authenticate):
         return jsonify(ok=True, **result)
 
     @bp.post("/api/account-checks/jobs")
-    @authenticate
     def start():
         data = body()
         if not isinstance(data.get("passive", False), bool):
@@ -74,22 +75,26 @@ def create_check_blueprint(jobs, authenticate):
         return jsonify(ok=True, job=jobs.start(str(data.get("preview_id") or ""), passive=data.get("passive", False))), 202
 
     @bp.get("/api/account-checks/jobs")
-    @authenticate
     def listing():
         return jsonify(ok=True, jobs=jobs.list_jobs())
 
+    @bp.delete("/api/account-checks/jobs")
+    def clear_history():
+        return jsonify(ok=True, deleted=jobs.clear_history())
+
     @bp.get("/api/account-checks/jobs/<job_id>")
-    @authenticate
     def detail(job_id):
         return jsonify(ok=True, job=jobs.get(job_id))
 
+    @bp.delete("/api/account-checks/jobs/<job_id>")
+    def delete(job_id):
+        return jsonify(ok=True, job=jobs.delete(job_id))
+
     @bp.post("/api/account-checks/jobs/<job_id>/cancel")
-    @authenticate
     def cancel(job_id):
         return jsonify(ok=True, job=jobs.cancel(job_id))
 
     @bp.post("/api/account-checks/jobs/<job_id>/apply")
-    @authenticate
     def apply(job_id):
         return jsonify(ok=True, **jobs.apply(job_id))
 
